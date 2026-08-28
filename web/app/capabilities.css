@@ -1,0 +1,106 @@
+/*
+ * Hide the entries this build cannot back.
+ *
+ * The UI is agent-core's, used unmodified, and it renders its whole navigation
+ * unconditionally — there is no server-side switch for "this deployment has no
+ * releases". Everything else degrades on its own (an empty list draws an empty
+ * state), but four things would only ever lead somewhere broken:
+ *
+ *  - Releases, which lists what the agent published into a public directory;
+ *  - Backup and Restart, which export a data directory and bounce a process;
+ *  - Export, in the Runtime Cache card, which downloads a zip by navigating;
+ *  - Export logs, likewise, of a log file no page keeps.
+ *
+ * The Apps page is *not* hidden, though nothing here can install a service. Its
+ * installed list is empty, its repository answers 404 (which the UI reads as
+ * "there is none" and hides the tab), and the built-in Web Terminal card on it
+ * points at /terminal/ — which this build serves. An empty page with one card
+ * that works beats a missing entry.
+ *
+ * This is not a theme. It is loaded with the bundle, so it applies before the
+ * first paint and cannot be switched off from the themes page — and it lands in
+ * its own <style> tag, leaving the one theme CSS is injected into
+ * (`#acc-llm-style`) free to be replaced without taking these rules with it.
+ *
+ * Where the UI gives two handles, both are used: an icon class and the label.
+ * Icon classes come from lucide (`lucide-package`), which makes them
+ * independent of the interface language; the labels cover a lucide upgrade
+ * renaming one. Either half alone is enough, and both would have to break at
+ * once for an entry to reappear. Some controls have no label attribute to pin —
+ * their comments say what happens if the icon is renamed.
+ */
+
+/* Releases — Package, "Releases" / "发布内容". */
+[data-acc='nav-btn']:has(> svg.lucide-package),
+[data-acc='nav-btn'][aria-label='Releases'],
+[data-acc='nav-btn'][aria-label='发布内容'] {
+	display: none !important;
+}
+
+/*
+ * The settings panel's Backup card: a bundle of the agent's data directory,
+ * imported by restarting into it. Both halves are meaningless here — the data
+ * is in this browser profile, and the export the model can already write is a
+ * better answer than a zip of an IndexedDB.
+ *
+ * Matched by its header icon rather than its title, which is translated. The
+ * two-step child chain is what keeps this to the one card: `ConfigCard` puts
+ * the icon inside its header row, so only the card's own root has the icon at
+ * exactly `> div > svg`.
+ */
+div:has(> div > svg.lucide-archive) {
+	display: none !important;
+}
+
+/*
+ * Restart, in the settings footer. Upstream exits and lets its supervisor
+ * relaunch, which is how a saved config takes effect; here a saved config
+ * applies to the next turn and there is no process to bounce.
+ *
+ * Pinned to the icon alone — the button has no title or aria-label, only
+ * translated text. A lucide rename brings it back, and clicking it then does
+ * nothing at all, which is the mildest of the four failures here.
+ */
+button:has(> svg.lucide-rotate-cw) {
+	display: none !important;
+}
+
+/*
+ * Export logs, its neighbour in that footer: a `window.open` of
+ * /api/logs/export. A navigation does not pass through the fetch shim, so it
+ * leaves the page to ask the gateway for a route it has never had — and there
+ * is no log file behind it either. The engine's diagnostics go to the browser
+ * console, which is where a page's logs live.
+ *
+ * Scoped by the group Restart sits in rather than by the icon alone: FileText
+ * is also the icon of the composer's attachment row and of the chat export
+ * menu, both of which work. This couples the two — if lucide renames
+ * `rotate-cw`, this button comes back with Restart.
+ *
+ * The anchor is spelled `> button > svg` rather than `> button:has(> svg)`,
+ * which is the same thing to read and not the same thing to a browser: `:has()`
+ * may not be nested inside `:has()`, and a selector that does it is invalid and
+ * silently dropped along with the rule.
+ */
+div:has(> button > svg.lucide-rotate-cw) > button:has(> svg.lucide-file-text) {
+	display: none !important;
+}
+
+/*
+ * The one control inside the Runtime Cache card that cannot work. The card
+ * itself does: its categories are real directories in the workspace and
+ * /api/runtime/stat measures them. But Export is a `window.open` of
+ * /api/runtime/export, and a navigation does not pass through the fetch shim —
+ * it would leave the page and ask the gateway for a route it has never had.
+ *
+ * Scoped to the card, since Download is a common icon and the rest of the UI
+ * uses it for things that do work. `HardDrive` is the card's header icon, at
+ * the same `> div > svg` depth as the Backup card's above; the button's own
+ * icon is a direct child, which is what tells it apart from the `downloads`
+ * row, whose label icon is the same one inside a div.
+ */
+div:has(> div > svg.lucide-hard-drive) button:has(> svg.lucide-download),
+div:has(> div > svg.lucide-hard-drive) button[title='Export'],
+div:has(> div > svg.lucide-hard-drive) button[title='导出'] {
+	display: none !important;
+}

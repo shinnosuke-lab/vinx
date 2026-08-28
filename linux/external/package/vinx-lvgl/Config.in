@@ -1,0 +1,18 @@
+config BR2_PACKAGE_VINX_LVGL
+	bool "vinx-lvgl"
+	depends on BR2_i386
+	help
+	  LVGL v9 as a shared library for the machine's own C compilers:
+	  `tcc gui.c -llvgl` paints widgets on /dev/fb0 (the Bochs DRM
+	  framebuffer the screen panel shows) and reads the pointer and
+	  keyboard from evdev. Headers land in /usr/include/lvgl with the
+	  config at /usr/include/lv_conf.h, the layout both gcc and tcc
+	  resolve. Mainline Buildroot has no lvgl package; the vinx-
+	  prefix marks it as this tree's own. ~+1.3 MB compressed.
+
+	  Chinese text works out of the box: the rootfs overlay ships a
+	  GB2312 bitmap font at /usr/share/fonts/cjk16.bin and
+	  lv_binfont_create loads it at runtime -- see lvdemo(1) and the
+	  linux-vm skill.
+
+	  https://lvgl.io

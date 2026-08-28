@@ -1,0 +1,180 @@
+#!/bin/sh
+# bridge -- one LAN across browsers: drive the page's WebRTC room from here.
+#
+# `start` mints a six-character room code (the page publishes sealed SDP
+# under it through public Nostr relays -- nobody runs a server); `join`
+# takes a code a friend read to you. Either way the machines share one
+# ethernet segment: ping, nc, httpd across the internet -- and `say`,
+# whose words float across every bridged screen as an overlay: nothing
+# needs to be running on the receiving machines.
+#
+# The request rides the private OSC; the page answers through
+# /data/.bridge-status, a key=value file this script polls and `show`
+# pretty-prints. Console-only, like open(1) and camera(1): run_shell
+# output is not OSC-parsed.
+. /usr/lib/vinx.sh
+
+STATUS=/data/.bridge-status
+
+usage() {
+	cat >&2 <<'EOF'
+usage: bridge start [-n NAME]      host a room, print its code
+       bridge join CODE [-n NAME]  join a friend's room
+       bridge say [@NAME] WORDS    float a message on every screen (@NAME: just one)
+       bridge show                 who is on the bridge
+       bridge stop                 disconnect
+EOF
+	exit 2
+}
+
+self_host() { cat /run/inbrowser-host 2>/dev/null; }
+self_ip() { echo "10.0.2.$(self_host)"; }
+
+# NAME goes into JSON and the roster everyone sees: one word, safe charset.
+check_name() {
+	case "$1" in
+	'' | *[!a-zA-Z0-9._-]* )
+		echo 'bridge: NAME must be letters, digits, . _ -' >&2
+		exit 2
+		;;
+	esac
+}
+
+req() { printf '\033]7770;bridge;%s\a\n' "$(vm_b64s "$1")"; }
+
+field() { sed -n "s/^$1=//p" "$STATUS" 2>/dev/null; }
+
+# Wait for state=on (or failed, or silence) for $1 seconds.
+wait_on() {
+	i=0
+	while [ "$i" -lt "$1" ]; do
+		case "$(field state)" in
+		on) return 0 ;;
+		failed)
+			echo "bridge: $(field error)" >&2
+			return 1
+			;;
+		esac
+		sleep 1
+		i=$((i + 1))
+	done
+	echo 'bridge: no reply from the page (is this the console? still connecting?)' >&2
+	return 1
+}
+
+show() {
+	case "$(field state)" in
+	on) ;;
+	starting | joining)
+		echo 'bridge: still connecting...'
+		return 0
+		;;
+	failed)
+		echo "bridge: failed -- $(field error)" >&2
+		return 1
+		;;
+	*)
+		echo 'bridge: not connected (bridge start, or bridge join CODE)'
+		return 1
+		;;
+	esac
+	echo "bridge: room $(field room) ($(field role)) -- $(field members) machine(s)"
+	me=$(self_ip)
+	sed -n 's/^member=//p' "$STATUS" | while read -r name ip tag; do
+		mark=' '
+		[ "$ip" = "$me" ] && mark='*'
+		printf '  %s %-16s %-15s %s\n' "$mark" "$name" "$ip" "$tag"
+	done
+	echo "  (* this machine -- bridge say HELLO floats on every screen)"
+}
+
+cmd=$1
+[ $# -ge 1 ] && shift
+
+case "$cmd" in
+start)
+	name="vinx$(self_host)"
+	[ "${1:-}" = -n ] && { name=${2:?bridge: -n needs a NAME}; shift 2; }
+	[ $# -eq 0 ] || usage
+	check_name "$name"
+	rm -f "$STATUS"
+	req "{\"op\":\"start\",\"name\":\"$name\",\"ip\":\"$(self_ip)\"}"
+	echo 'bridge: opening a room...'
+	wait_on 25 || exit 1
+	echo ''
+	echo "bridge: the room is open. friends join it with:"
+	echo ''
+	echo "    bridge join $(field room)"
+	echo ''
+	echo 'bridge: chat with `bridge say HELLO` -- it floats on every screen'
+	;;
+join)
+	[ $# -ge 1 ] || usage
+	code=$1
+	shift
+	name="vinx$(self_host)"
+	[ "${1:-}" = -n ] && { name=${2:?bridge: -n needs a NAME}; shift 2; }
+	[ $# -eq 0 ] || usage
+	check_name "$name"
+	case "$code" in
+	*[!a-zA-Z0-9]*)
+		echo 'bridge: a room code is six letters and digits' >&2
+		exit 2
+		;;
+	esac
+	rm -f "$STATUS"
+	req "{\"op\":\"join\",\"code\":\"$code\",\"name\":\"$name\",\"ip\":\"$(self_ip)\"}"
+	echo "bridge: joining room $code (this can take a few seconds)..."
+	wait_on 45 || exit 1
+	# The frame channel can open a beat before the roster arrives; give the
+	# member list a moment to fill in so the first show is not just us.
+	i=0
+	while [ "$i" -lt 5 ]; do
+		m=$(field members)
+		[ "${m:-1}" -ge 2 ] 2>/dev/null && break
+		sleep 1
+		i=$((i + 1))
+	done
+	show
+	;;
+show)
+	show
+	;;
+say)
+	[ $# -ge 1 ] || usage
+	to=''
+	case "$1" in
+	@?*)
+		to=${1#@}
+		shift
+		check_name "$to"
+		[ $# -ge 1 ] || usage
+		;;
+	esac
+	case "$(field state)" in
+	on) ;;
+	*)
+		echo 'bridge: not connected (bridge start, or bridge join CODE)' >&2
+		exit 1
+		;;
+	esac
+	# One clean line into hand-built JSON: control characters out, the two
+	# JSON specials escaped, length capped so a paste cannot flood the room.
+	text=$(printf '%s' "$*" | tr -d '\000-\037' | cut -c1-256 |
+		sed 's/\\/\\\\/g; s/"/\\"/g')
+	[ -n "$text" ] || usage
+	if [ -n "$to" ]; then
+		req "{\"op\":\"say\",\"to\":\"$to\",\"text\":\"$text\"}"
+	else
+		req "{\"op\":\"say\",\"text\":\"$text\"}"
+	fi
+	echo 'bridge: sent'
+	;;
+stop)
+	req '{"op":"stop"}'
+	echo 'bridge: disconnected'
+	;;
+*)
+	usage
+	;;
+esac

@@ -1,0 +1,8 @@
+source "$BR2_EXTERNAL_VINX_PATH/package/btmon/Config.in"
+source "$BR2_EXTERNAL_VINX_PATH/package/tcc/Config.in"
+source "$BR2_EXTERNAL_VINX_PATH/package/termbox2/Config.in"
+source "$BR2_EXTERNAL_VINX_PATH/package/vinx-lvgl/Config.in"
+source "$BR2_EXTERNAL_VINX_PATH/package/vinx-nasm/Config.in"
+source "$BR2_EXTERNAL_VINX_PATH/package/micropython-pylib/Config.in"
+source "$BR2_EXTERNAL_VINX_PATH/package/nes/Config.in"
+source "$BR2_EXTERNAL_VINX_PATH/package/vol/Config.in"

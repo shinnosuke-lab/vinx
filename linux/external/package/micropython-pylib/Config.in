@@ -1,0 +1,17 @@
+config BR2_PACKAGE_MICROPYTHON_PYLIB
+	bool "micropython-pylib"
+	depends on BR2_PACKAGE_MICROPYTHON
+	help
+	  The pure-Python parts of micropython-lib's python-stdlib
+	  collection, installed to /usr/lib/micropython where the unix
+	  port's default sys.path finds them. Fills the gaps CPython
+	  habits stumble over: datetime, pathlib, argparse, logging,
+	  unittest, shutil, os.path, functools, itertools and more.
+
+	  Named -pylib, not -lib: mainline dropped its micropython-lib
+	  package but micropython.mk still carries a dormant
+	  BR2_PACKAGE_MICROPYTHON_LIB hook expecting a .built_pylib the
+	  dropped package used to make. Reusing that symbol arms the
+	  hook and breaks micropython's target install.
+
+	  https://github.com/micropython/micropython-lib

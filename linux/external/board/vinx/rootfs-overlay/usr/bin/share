@@ -1,0 +1,65 @@
+#!/bin/sh
+# share SCOPE FILE... -- copy files into a shared tier of /data. The scope is
+# a required first argument so every use says out loud how far the file goes:
+#
+#   share local FILE...   /data/share/local -- every tab and split pane of
+#                         THIS BROWSER on this site. Nothing touches the
+#                         network; it works offline, whatever the relay mode.
+#   share net FILE...     reserved for relay-backed sharing across systems;
+#                         not implemented yet.
+#
+# The page mirrors /data/share/local (IndexedDB) and announces changes, so
+# the other machines see the file within one snapshot round (~15 s at worst,
+# usually right away). Names are flattened to their basename -- the shared
+# directory is deliberately one level deep.
+#
+# 16 MiB per file: that is what the page-side mirror will carry. Bigger
+# artifacts go to the person via download(1) or the agent's download_file.
+
+usage() {
+	echo 'usage: share local FILE...' >&2
+	echo '  local: every tab/pane of this browser on this site (no network)' >&2
+	echo '  net:   reserved for relay-backed sharing; not implemented yet' >&2
+	exit 2
+}
+
+[ $# -ge 2 ] || usage
+SCOPE=$1
+shift
+case "$SCOPE" in
+	local) DEST=/data/share/local ;;
+	net)
+		echo 'share: the net scope is not implemented yet -- only local exists' >&2
+		exit 1
+		;;
+	*) usage ;;
+esac
+
+MAX=16777216
+
+if ! grep -q ' /data 9p ' /proc/mounts; then
+	echo 'share: /data is not mounted in this image' >&2
+	exit 1
+fi
+mkdir -p "$DEST" || exit 1
+
+rc=0
+for f in "$@"; do
+	if [ ! -f "$f" ]; then
+		echo "share: $f: no such file" >&2
+		rc=1
+		continue
+	fi
+	if [ "$(wc -c < "$f")" -gt "$MAX" ]; then
+		echo "share: $f: larger than 16 MB -- the mirror will not carry it" >&2
+		rc=1
+		continue
+	fi
+	base=$(basename "$f")
+	if cp -- "$f" "$DEST/$base"; then
+		echo "share: $f -> $DEST/$base (every tab of this browser sees it; nothing left your machine)"
+	else
+		rc=1
+	fi
+done
+exit $rc

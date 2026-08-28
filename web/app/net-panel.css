@@ -1,0 +1,508 @@
+/*
+ * The network control, dressed in the page's own copper-amber brand (the
+ * palette in vendor/ui/src/theme.css) instead of a foreign blue.
+ *
+ * The control mounts OUTSIDE the themed `.acc-root` subtree (the fab is a
+ * body-level sibling of the chat app), so it cannot inherit the theme's
+ * variables or its `.dark` class. Instead every rule reads a local `--np-*`
+ * palette: light by default, switched to the dark set by `:has()` when either
+ *   - the chat UI is in dark mode (`.acc-root.dark` somewhere in the page), or
+ *   - this is the terminal page (`.np-chip` only ever renders in the terminal
+ *     footer, `.console.shell` is the terminal's shell document hosting the
+ *     panes — both permanently dark).
+ */
+
+:root {
+	/* Light: warm paper, same values as theme.css's defaults. */
+	--np-panel: hsl(40 33% 99%);
+	--np-fg: hsl(24 30% 10%);
+	--np-muted: hsl(27 12% 44%);
+	--np-border: hsl(33 22% 89%);
+	--np-input-bg: hsl(40 33% 99%);
+	--np-primary: hsl(27 75% 40%);
+	--np-primary-hover: hsl(27 75% 34%);
+	--np-primary-fg: hsl(0 0% 100%);
+	--np-primary-wash: hsl(27 75% 40% / 0.07);
+	--np-hover-wash: hsl(24 30% 10% / 0.05);
+	--np-err: hsl(0 84% 60%);
+	--np-backdrop: hsl(24 30% 10% / 0.3);
+	--np-shadow: 0 16px 48px hsl(24 30% 10% / 0.18);
+}
+
+:root:has(.acc-root.dark),
+:root:has(.np-chip),
+:root:has(.console.shell) {
+	/* Dark: warm charcoal, one notch brighter copper (theme.css `.dark`). */
+	--np-panel: hsl(25 12% 13%);
+	--np-fg: hsl(36 30% 96%);
+	--np-muted: hsl(30 10% 62%);
+	--np-border: hsl(26 14% 20%);
+	--np-input-bg: hsl(24 12% 9%);
+	--np-primary: hsl(30 75% 46%);
+	--np-primary-hover: hsl(33 80% 56%);
+	--np-primary-fg: hsl(0 0% 100%);
+	--np-primary-wash: hsl(30 75% 46% / 0.1);
+	--np-hover-wash: hsl(36 30% 96% / 0.06);
+	--np-backdrop: hsl(0 0% 0% / 0.5);
+	--np-shadow: 0 16px 48px hsl(0 0% 0% / 0.5);
+}
+
+/* The terminal footer chip: only the colors live here — its chip shape is
+ * terminal.css's shared footer-chip rule, since it only ever renders in
+ * that footer. Copper from the page accent. */
+.np-chip {
+	color: var(--accent, var(--np-primary));
+}
+.np-chip.np-relay-down,
+.np-fab.np-relay-down {
+	color: var(--np-err);
+	background: hsl(0 55% 45% / 0.12);
+}
+.np-fab.np-relay-down {
+	border-color: var(--np-err);
+}
+
+/* The chat page's floating network control: the mascot badge plus a status
+ * glyph (LAN topology / globe) instead of words. */
+.np-fab {
+	position: fixed;
+	right: 16px;
+	bottom: 16px;
+	z-index: 2147483000;
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	border: 1px solid var(--np-border);
+	background: var(--np-panel);
+	color: var(--np-primary);
+	line-height: 1;
+	padding: 6px 10px;
+	border-radius: 999px;
+	cursor: pointer;
+	box-shadow: 0 4px 16px hsl(24 30% 10% / 0.15);
+}
+.np-fab:hover {
+	border-color: var(--np-primary);
+	background: var(--np-primary-wash);
+}
+.np-fab-logo {
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	display: block;
+}
+.np-fab svg {
+	display: block;
+}
+
+.np-backdrop {
+	position: fixed;
+	inset: 0;
+	z-index: 2147483001;
+	background: var(--np-backdrop);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+.np-panel {
+	width: 380px;
+	max-width: calc(100vw - 32px);
+	max-height: calc(100vh - 48px);
+	overflow-y: auto;
+	background: var(--np-panel);
+	color: var(--np-fg);
+	border: 1px solid var(--np-border);
+	border-radius: 12px;
+	box-shadow: var(--np-shadow);
+	padding: 16px;
+}
+
+.np-title {
+	font-size: 14px;
+	font-weight: 600;
+	margin-bottom: 10px;
+}
+
+.np-opt {
+	display: flex;
+	gap: 10px;
+	align-items: flex-start;
+	padding: 10px;
+	border: 1px solid var(--np-border);
+	border-radius: 8px;
+	margin-bottom: 8px;
+	cursor: pointer;
+}
+.np-opt.on {
+	border-color: var(--np-primary);
+	background: var(--np-primary-wash);
+}
+.np-opt input {
+	margin-top: 2px;
+	accent-color: var(--np-primary);
+}
+.np-opt-h {
+	font-size: 13px;
+	font-weight: 600;
+}
+.np-opt-d {
+	font-size: 11.5px;
+	color: var(--np-muted);
+	line-height: 1.5;
+	margin-top: 2px;
+}
+.np-opt-d a {
+	color: var(--np-primary);
+}
+/* The bridge panel's "your VM is not even on this hub" notice. */
+.np-offhub {
+	font-size: 11.5px;
+	line-height: 1.5;
+	margin-top: 8px;
+	padding: 8px 10px;
+	border-radius: 6px;
+	color: var(--np-warn, #e0af68);
+	border: 1px solid currentColor;
+	opacity: 0.9;
+}
+.np-tag {
+	font-size: 9.5px;
+	font-weight: 600;
+	text-transform: uppercase;
+	color: var(--np-primary-fg);
+	background: var(--np-primary);
+	border-radius: 4px;
+	padding: 1px 5px;
+	margin-left: 4px;
+	vertical-align: middle;
+}
+
+.np-url {
+	width: 100%;
+	margin-top: 8px;
+	box-sizing: border-box;
+	background: var(--np-input-bg);
+	border: 1px solid var(--np-border);
+	color: var(--np-fg);
+	border-radius: 6px;
+	padding: 7px 9px;
+	font: 12px/1.4 ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+.np-url:focus {
+	outline: none;
+	border-color: var(--np-primary);
+}
+
+.np-probe-row {
+	display: flex;
+	align-items: stretch;
+	gap: 7px;
+	margin-top: 8px;
+}
+.np-probe-row .np-url {
+	flex: 1 1 auto;
+	min-width: 0;
+	margin-top: 0;
+}
+.np-probe {
+	flex: 0 0 auto;
+	border: 1px solid var(--np-border);
+	border-radius: 6px;
+	padding: 0 10px;
+	background: var(--np-input-bg);
+	color: var(--np-fg);
+	font-size: 11.5px;
+	cursor: pointer;
+}
+.np-probe:hover:not(:disabled) {
+	border-color: var(--np-primary);
+	background: var(--np-primary-wash);
+}
+.np-probe:disabled {
+	opacity: 0.55;
+	cursor: wait;
+}
+.np-probe-status {
+	margin-top: 5px;
+	font-size: 11.5px;
+	color: var(--np-muted);
+}
+.np-probe-status.ok {
+	color: var(--np-primary);
+}
+.np-probe-status.bad {
+	color: var(--np-err);
+}
+
+.np-err {
+	color: var(--np-err);
+	font-size: 11.5px;
+	margin: 4px 0 0;
+}
+
+/* "Bridge to a friend": a quiet section under the modes, above the actions. */
+.np-bridge {
+	border-top: 1px solid var(--np-border);
+	margin-top: 12px;
+	padding-top: 10px;
+}
+.np-bridge code {
+	font: 11px ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+.np-bridge-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-top: 8px;
+}
+.np-bridge-row button {
+	border-radius: 6px;
+	padding: 6px 10px;
+	font-size: 12px;
+	cursor: pointer;
+	border: 1px solid var(--np-border);
+	background: transparent;
+	color: var(--np-fg);
+}
+.np-bridge-row button:hover:not(:disabled) {
+	background: var(--np-hover-wash);
+}
+.np-bridge-row button:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+.np-bridge-row .np-bridge-create,
+.np-bridge-row .np-bridge-answer,
+.np-bridge-row .np-bridge-connect {
+	background: var(--np-primary);
+	color: var(--np-primary-fg);
+	border-color: var(--np-primary);
+	font-weight: 600;
+}
+.np-bridge-row .np-bridge-create:hover,
+.np-bridge-row .np-bridge-answer:hover:not(:disabled),
+.np-bridge-row .np-bridge-connect:hover:not(:disabled) {
+	background: var(--np-primary-hover);
+	border-color: var(--np-primary-hover);
+}
+.np-bridge-code,
+.np-bridge-paste {
+	width: 100%;
+	margin-top: 8px;
+	box-sizing: border-box;
+	height: 56px;
+	resize: none;
+	background: var(--np-input-bg);
+	border: 1px solid var(--np-border);
+	color: var(--np-fg);
+	border-radius: 6px;
+	padding: 7px 9px;
+	font: 10.5px/1.4 ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+	word-break: break-all;
+}
+.np-bridge-code:focus,
+.np-bridge-paste:focus {
+	outline: none;
+	border-color: var(--np-primary);
+}
+.np-bridge-wait,
+.np-bridge-status {
+	font-size: 11.5px;
+	color: var(--np-muted);
+	flex: 1;
+}
+.np-bridge-status.on {
+	color: var(--np-primary);
+	font-weight: 600;
+}
+
+/* The room flow: a big friendly code, a joiner's input, the roster. */
+.np-bridge-row .np-room-host,
+.np-bridge-row .np-room-go {
+	background: var(--np-primary);
+	color: var(--np-primary-fg);
+	border-color: var(--np-primary);
+	font-weight: 600;
+}
+.np-bridge-row .np-room-host:hover,
+.np-bridge-row .np-room-go:hover:not(:disabled) {
+	background: var(--np-primary-hover);
+	border-color: var(--np-primary-hover);
+}
+.np-room-code {
+	flex: 1;
+	font: 600 20px/1.2 ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+	letter-spacing: 0.35em;
+	color: var(--np-primary);
+	user-select: all;
+}
+.np-room-code-input {
+	flex: 1;
+	min-width: 0;
+	background: var(--np-input-bg);
+	border: 1px solid var(--np-border);
+	color: var(--np-fg);
+	border-radius: 6px;
+	padding: 7px 9px;
+	font: 600 14px/1.2 ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+	letter-spacing: 0.2em;
+}
+.np-room-code-input:focus {
+	outline: none;
+	border-color: var(--np-primary);
+}
+.np-roster {
+	margin-top: 8px;
+	border: 1px solid var(--np-border);
+	border-radius: 6px;
+	padding: 4px 0;
+}
+.np-roster-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 3px 10px;
+	font-size: 11.5px;
+}
+.np-roster-name {
+	font-weight: 600;
+}
+.np-roster-ip {
+	color: var(--np-muted);
+	font: 11px ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+.np-roster-tag {
+	font-size: 9.5px;
+	font-weight: 600;
+	text-transform: uppercase;
+	color: var(--np-primary);
+	border: 1px solid var(--np-primary);
+	border-radius: 4px;
+	padding: 0 4px;
+}
+.np-roster-empty {
+	color: var(--np-muted);
+}
+.np-roster-empty code {
+	font: 10.5px ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+	color: var(--np-fg);
+}
+
+/* Folded corner: the room-code relay list. */
+.np-fold {
+	margin-top: 10px;
+}
+.np-fold summary {
+	font-size: 11.5px;
+	color: var(--np-muted);
+	cursor: pointer;
+	user-select: none;
+}
+.np-fold summary:hover {
+	color: var(--np-fg);
+}
+
+.np-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-top: 12px;
+}
+.np-actions button {
+	border-radius: 6px;
+	padding: 7px 12px;
+	font-size: 12px;
+	cursor: pointer;
+	border: 1px solid var(--np-border);
+}
+.np-cancel {
+	background: transparent;
+	color: var(--np-muted);
+}
+.np-cancel:hover {
+	background: var(--np-hover-wash);
+}
+.np-save {
+	background: var(--np-primary);
+	color: var(--np-primary-fg);
+	border-color: var(--np-primary);
+	font-weight: 600;
+}
+.np-save:hover {
+	background: var(--np-primary-hover);
+	border-color: var(--np-primary-hover);
+}
+
+/* The bridge's signalling choice (room code vs manual): the same card
+ * grammar as the modes above, one size smaller — these pick how the
+ * handshake codes travel, not where packets go. */
+.np-sig {
+	margin: 8px 0;
+}
+.np-sig-opt {
+	padding: 8px;
+	margin-bottom: 6px;
+}
+.np-sig-opt .np-opt-h {
+	font-size: 12px;
+}
+
+/* Per-mode schematics (ModeDiagram): muted ink so they read as marginalia,
+ * not chrome; currentColor keeps both themes honest. */
+.np-diagram {
+	display: block;
+	width: 100%;
+	max-width: 300px;
+	height: auto;
+	margin: 8px 0 2px;
+	color: var(--np-muted);
+}
+.np-diagram text {
+	font-family: inherit;
+}
+
+/* The first-run "go online?" nudge (NetPrompt): one slim bar floating above
+ * the panes in the shell document, low enough to leave the pane footers
+ * clear. Gone for good once answered. */
+.np-prompt {
+	position: fixed;
+	left: 50%;
+	bottom: 44px;
+	transform: translateX(-50%);
+	z-index: 2147482000;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	max-width: min(92vw, 620px);
+	padding: 8px 12px;
+	border: 1px solid var(--np-border);
+	border-radius: 10px;
+	background: var(--np-panel);
+	color: var(--np-fg);
+	font: 12px/1.5 system-ui, sans-serif;
+	box-shadow: var(--np-shadow);
+}
+.np-prompt button {
+	flex: none;
+	border: 1px solid var(--np-border);
+	border-radius: 7px;
+	padding: 4px 10px;
+	background: none;
+	color: var(--np-fg);
+	font: inherit;
+	cursor: pointer;
+	white-space: nowrap;
+}
+.np-prompt button:hover {
+	background: var(--np-hover-wash);
+}
+.np-prompt .np-prompt-go {
+	border-color: var(--np-primary);
+	background: var(--np-primary);
+	color: var(--np-primary-fg);
+}
+.np-prompt .np-prompt-go:hover {
+	background: var(--np-primary-hover);
+}

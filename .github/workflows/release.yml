@@ -1,0 +1,118 @@
+# The release: pushing a v* tag builds the page, runs every suite, and only
+# then updates GitHub Pages and creates the GitHub Release with self-hostable
+# archives. The site is therefore always a named version; day-to-day merges to
+# main never touch it (ci.yml is the gate for those).
+#
+# Rolling back is re-running this workflow for an older tag (workflow_dispatch
+# from that tag, or re-run from the Actions page): a static site has no data
+# to migrate, so the deploy is the whole story.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # version.sh is the single source of truth (the page's About popover
+      # shows its VER); a tag that disagrees with it would publish a site
+      # that misreports itself. Only meaningful for tag pushes -- a manual
+      # dispatch from a branch skips it.
+      - name: tag matches version.sh
+        if: github.ref_type == 'tag'
+        run: |
+          ver=$(sed -n 's/^VER=//p' version.sh)
+          tag=${GITHUB_REF_NAME#v}
+          if [ "$ver" != "$tag" ]; then
+            echo "FATAL: tag v$tag but version.sh says VER=$ver" >&2
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            web/runtime/package-lock.json
+            web/vendor/ui/package-lock.json
+
+      - name: rust wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            web/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('web/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # The same gate as ci.yml: a red suite means no Pages update and no
+      # Release. Ends with a clean production build in web/dist.
+      - name: build and test
+        run: ./web/deploy/ci.sh
+
+      # Pages runs the tree through Jekyll unless told not to; Jekyll drops
+      # underscore-prefixed paths. Nothing in dist starts with one today --
+      # this keeps it from ever mattering.
+      - name: archives
+        run: |
+          touch web/dist/.nojekyll
+          ver=$(sed -n 's/^VER=//p' version.sh)
+          mkdir -p release-assets
+          tar -czf "release-assets/vinx-$ver-site.tar.gz" -C web/dist .
+          tar -czf "release-assets/vinx-vm-images-$ver.tar.gz" \
+            -C web/app/public/vm bzImage rootfs.img
+          ls -la release-assets
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # enablement creates the Pages site on first run, so a fresh repo (or
+      # fork) needs no trip to Settings -> Pages.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/deploy-pages@v4
+        id: deployment
+
+  release:
+    needs: [build, deploy]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

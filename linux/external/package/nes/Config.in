@@ -1,0 +1,12 @@
+config BR2_PACKAGE_NES
+	bool "nes"
+	depends on BR2_i386
+	select BR2_PACKAGE_LUA
+	help
+	  The vinx NES console (../../nes): the agnes core plus a
+	  homegrown 2A03 APU, painting /dev/fb0, sounding through
+	  /dev/dsp, scripted by Lua. Built with the cross gcc at -O2 --
+	  comfortably past full NES speed inside v86 -- and installed
+	  as /usr/bin/nes, so a ROM dropped on the terminal just runs.
+
+	  https://github.com/kgabis/agnes (the vendored core)

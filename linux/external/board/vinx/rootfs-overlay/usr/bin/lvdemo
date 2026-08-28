@@ -1,0 +1,20 @@
+#!/bin/sh
+# lvdemo -- prove the GUI link: compile the shipped LVGL example with tcc,
+# in the machine, and run it on the VGA screen (the footer's screen chip).
+#
+# The source is /usr/share/lvgl/lvdemo.c -- copy it anywhere as a starting
+# point; `tcc yours.c -o app -llvgl` is the whole build. Ctrl-C quits.
+
+set -e
+src=/usr/share/lvgl/lvdemo.c
+bin=/tmp/.lvdemo
+
+# Pop the page's screen window: drawing on fb0 changes no video mode, so
+# the page cannot notice by itself. Best-effort -- js(1) needs the
+# hostcall channel, and an already-open window is a no-op.
+js -e 'window.vinxScreenShow?.()' >/dev/null 2>&1 || true
+
+if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
+	tcc "$src" -o "$bin" -llvgl
+fi
+exec "$bin" "$@"

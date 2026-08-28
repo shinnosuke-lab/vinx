@@ -1,0 +1,434 @@
+/*
+ * The assistant panel's clothes — a maintained copy, not an import.
+ *
+ * Upstream keeps these rules in ui/src/components/terminal/terminal.css,
+ * loaded only by its own terminal SPA entry and therefore absent from the
+ * library build's dist/styles.css. That sheet cannot be imported whole: it
+ * opens with `:root`, `html, body` and global scrollbar rules written for a
+ * page this is not. So the `tac-*` section (the panel itself) is copied here
+ * and kept by hand — after editing that section of the forked UI, diff this
+ * file against it. docs/UPSTREAM.md carries the reminder.
+ *
+ * Two deliberate departures:
+ * - The palette. Upstream's variables are zinc + electric blue; the panel
+ *   here floats over the console's Tokyo Night theme (see terminal.css), so
+ *   the variables — scoped to `.tac`, not `:root` — map onto that palette,
+ *   and the hardcoded rgba(59,130,246,…) blues became the accent's rgb.
+ * - The geometry. Upstream's `top: 33px; bottom: 36px` are its own toolbar
+ *   and status bar; here the panel lives inside a pane whose footer is 24px.
+ */
+
+.tac {
+	--bg-primary: #1a1b26;
+	--bg-secondary: #1f2335;
+	--bg-tertiary: #24283b;
+	--bg-elevated: #414868;
+
+	--border-color: #2f354d;
+	--border-active: #565f89;
+
+	--text-primary: #c0caf5;
+	--text-secondary: #a9b1d6;
+	--text-muted: #565f89;
+
+	--accent-color: #cd751d;
+	--accent-hover: #e99835;
+	--status-green: #9ece6a;
+	--status-red: #f7768e;
+	--status-yellow: #e0af68;
+
+	--radius-sm: 4px;
+	--radius-md: 8px;
+	--radius-lg: 12px;
+
+	--font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+
+	position: absolute;
+	top: 8px;
+	bottom: 32px;
+	right: 12px;
+	z-index: 100;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	justify-content: flex-end;
+	pointer-events: none;
+	font-family: var(--font-ui);
+	font-size: 13px;
+}
+.tac.tac-full { top: 0; left: 0; right: 0; bottom: 0; pointer-events: auto; align-items: stretch; }
+.tac-fab, .tac-panel { pointer-events: auto; }
+
+/* The mascot badge is the button: the logo is already a copper disc, so the
+ * fab only adds the ring, the shadow and the hover lift. Same logo and
+ * geometry as the pane's stand-in .ai-fab, so the handoff is invisible. */
+.tac-fab {
+	position: relative; /* anchors the attention dot */
+	width: 36px;
+	height: 36px;
+	padding: 0;
+	border-radius: 50%;
+	background: transparent;
+	border: 1px solid rgba(255, 255, 255, 0.1);
+	color: #1a1b26;
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+	transition: all 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+.tac-fab:hover { filter: brightness(1.12); transform: scale(1.08) translateY(-2px); box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5); }
+.tac-fab-logo { width: 100%; height: 100%; border-radius: 50%; display: block; }
+
+/* A minimized panel with a pending confirm/ask must not look asleep: the FAB
+ * wears a dot and pulses until someone answers. Busy (turn running) pulses
+ * without the dot. */
+.tac-fab-dot {
+	position: absolute;
+	top: -2px;
+	right: -2px;
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+	background: #f7768e;
+	border: 2px solid #1a1b26;
+}
+.tac-fab-attn { animation: tac-fab-pulse 1.1s ease-in-out infinite; }
+.tac-fab-busy { animation: tac-fab-pulse 1.6s ease-in-out infinite; }
+@keyframes tac-fab-pulse {
+	50% { box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), 0 0 0 5px rgba(205, 117, 29, 0.18); }
+}
+
+/* The mid-conversation composer: the shared ChatInput docked at the panel
+ * bottom, with the jump-to-bottom chip floating just above it. */
+.tac-composer {
+	position: relative;
+	padding: 4px 8px 8px;
+	border-top: 1px solid var(--border-color);
+}
+
+.tac-jump {
+	position: absolute;
+	top: -32px;
+	right: 14px;
+	z-index: 3;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 26px;
+	height: 26px;
+	padding: 0;
+	border-radius: 50%;
+	border: 1px solid var(--border-color);
+	background: var(--bg-secondary, #1f2335);
+	color: var(--text-secondary);
+	cursor: pointer;
+	box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+}
+.tac-jump:hover { color: var(--accent-color); border-color: var(--accent-color); }
+
+.tac-panel {
+	width: 420px;
+	max-width: calc(100vw - 24px);
+	min-height: 200px;
+	max-height: 100%;
+	display: flex;
+	flex-direction: column;
+	background: rgba(31, 35, 53, 0.97);
+	backdrop-filter: blur(16px);
+	-webkit-backdrop-filter: blur(16px);
+	border: 1px solid var(--border-color);
+	border-radius: var(--radius-lg);
+	box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+	overflow: hidden;
+	transform-origin: bottom right;
+	animation: tacOpen 0.2s cubic-bezier(0.165, 0.84, 0.44, 1);
+
+	/* Remap the reused chat components' Tailwind tokens (theme.css `.acc-root
+	   .dark` sets a navy palette) onto the terminal's palette so ConfirmBar,
+	   tool cards and code blocks blend into the panel instead of standing out. */
+	--color-background: var(--bg-secondary);
+	--color-foreground: var(--text-primary);
+	--color-card: var(--bg-secondary);
+	--color-card-foreground: var(--text-primary);
+	--color-popover: var(--bg-secondary);
+	--color-popover-foreground: var(--text-primary);
+	--color-muted: var(--bg-tertiary);
+	--color-muted-foreground: var(--text-secondary);
+	--color-secondary: var(--bg-tertiary);
+	--color-secondary-foreground: var(--text-secondary);
+	--color-accent: var(--bg-elevated);
+	--color-accent-foreground: var(--text-primary);
+	--color-border: var(--border-color);
+	--color-input: var(--border-color);
+	/* The `.acc-root.dark` ancestor (see terminal-assistant.tsx) brings
+	   upstream's electric blue with it; the panel's accent is the console's. */
+	--color-primary: var(--accent-color);
+	--color-primary-foreground: #1a1b26;
+	--color-ring: var(--accent-color);
+
+	/* Radius convergence (scoped): panel 6px, buttons/inputs 8px, cards 6px.
+	   Both the tac-* rules and the reused Tailwind components read these. */
+	--radius-lg: 6px;
+	--radius-md: 8px;
+	--radius-sm: 6px;
+}
+
+/* Hard-coded dark markdown fills in theme.css (`.dark .markdown-body pre`
+   etc.) are navy; same specificity, later file → terminal palette wins. */
+.tac-panel .markdown-body pre {
+	background: var(--bg-primary);
+	color: var(--text-primary);
+}
+.tac-panel .markdown-body :not(pre) > code { background: var(--bg-primary); }
+.tac-panel .markdown-body th { background: var(--bg-tertiary); }
+
+/* Thinner scrollbars inside the panel (theme.css's `.acc-root` default is
+   6px). WebKit-only on purpose — see the `scrollbar-width` caveat in
+   theme.css. */
+.tac-panel ::-webkit-scrollbar { width: 4px; height: 4px; }
+.tac-panel ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.08); border-radius: 10px; }
+.tac-panel ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.15); }
+.tac-full .tac-panel { width: 100%; height: 100%; max-height: 100%; border-radius: 0; border: none; box-shadow: none; }
+@keyframes tacOpen {
+	from { opacity: 0; transform: scale(0.95) translateY(8px); }
+	to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.tac-resize-handle {
+	height: 8px;
+	cursor: ns-resize;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	user-select: none;
+}
+.tac-resize-bar {
+	width: 36px;
+	height: 3px;
+	border-radius: 2px;
+	background: rgba(255, 255, 255, 0.12);
+	transition: background 0.15s ease;
+}
+.tac-resize-handle:hover .tac-resize-bar { background: rgba(255, 255, 255, 0.3); }
+
+.tac-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 6px 14px;
+	background: rgba(0, 0, 0, 0.25);
+	border-bottom: 1px solid var(--border-color);
+	user-select: none;
+}
+.tac-title { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.tac-title svg { color: var(--accent-color); }
+.tac-header-actions { display: flex; align-items: center; gap: 2px; }
+.tac-header-btn {
+	background: none;
+	border: none;
+	color: var(--text-muted);
+	cursor: pointer;
+	padding: 4px;
+	border-radius: var(--radius-sm);
+	transition: all 0.15s ease;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+.tac-header-btn:hover { background: rgba(255, 255, 255, 0.1); color: var(--text-primary); }
+
+.tac-messages {
+	flex: 1;
+	overflow-y: auto;
+	padding: 16px 14px;
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+
+/* Empty state: greeting + the shared centered ChatInput card + suggestion
+   chips, mirroring the main chat's welcome layout. ChatInput brings its own
+   horizontal padding (px-4), so the container stays slim. */
+.tac-empty {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 16px;
+	padding: 0 4px 10%;
+	overflow-y: auto;
+}
+/* ChatWelcome renders an h1 sized for the full page; scale it to the panel. */
+.tac-empty h1 { font-size: 18px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.01em; }
+
+.tac-welcome-chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.tac-welcome-chip {
+	background: rgba(255, 255, 255, 0.05);
+	border: 1px solid var(--border-color);
+	color: var(--text-secondary);
+	font-size: 12px;
+	padding: 5px 12px;
+	border-radius: 16px;
+	cursor: pointer;
+	transition: all 0.15s ease;
+	font-family: var(--font-ui);
+}
+.tac-welcome-chip:hover { background: rgba(205, 117, 29, 0.1); border-color: var(--accent-color); color: var(--accent-color); }
+
+.tac-msg { display: flex; flex-direction: column; gap: 4px; position: relative; }
+.tac-msg-user { align-items: flex-end; }
+.tac-msg-user-bubble {
+	background: var(--accent-color);
+	color: #1a1b26;
+	padding: 8px 12px;
+	border-radius: 12px 12px 2px 12px;
+	align-self: flex-end;
+	max-width: 90%;
+	white-space: pre-wrap;
+	word-break: break-word;
+	font-size: 13px;
+	line-height: 1.5;
+	box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+}
+.tac-msg-assistant-body {
+	font-size: 13px;
+	line-height: 1.6;
+	color: var(--text-primary);
+	word-break: break-word;
+}
+.tac-msg-status {
+	font-size: 12px;
+	color: var(--text-muted);
+	font-style: italic;
+	text-align: center;
+	padding: 2px 0;
+}
+.tac-msg-error {
+	font-size: 12px;
+	color: #f7768e;
+	background: rgba(247, 118, 142, 0.1);
+	border: 1px solid rgba(247, 118, 142, 0.2);
+	border-radius: var(--radius-sm);
+	padding: 6px 10px;
+}
+.tac-thinking {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	color: var(--text-muted);
+	font-style: italic;
+	font-size: 12px;
+}
+.tac-thinking::after {
+	content: '';
+	width: 12px;
+	height: 12px;
+	border: 2px solid var(--text-muted);
+	border-top-color: transparent;
+	border-radius: 50%;
+	animation: tac-spin 0.8s linear infinite;
+}
+@keyframes tac-spin { to { transform: rotate(360deg); } }
+
+/* Input row: aligned with the Copilot composer (8px radius, quiet border that
+   lights up as a focus ring, square primary send button). */
+.tac-input {
+	display: flex;
+	align-items: flex-end;
+	padding: 10px 12px;
+	gap: 8px;
+	background: rgba(0, 0, 0, 0.15);
+	border-top: 1px solid var(--border-color);
+}
+.tac-input textarea {
+	flex: 1;
+	background: var(--bg-primary);
+	border: 1px solid var(--border-color);
+	color: var(--text-primary);
+	border-radius: 4px;
+	padding: 8px 12px;
+	min-height: 36px;
+	font-size: 13px;
+	font-family: var(--font-ui);
+	resize: none;
+	max-height: 78px;
+	line-height: 1.5;
+	overflow-y: auto;
+	transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.tac-input textarea:focus { outline: none; border-color: var(--accent-color); box-shadow: 0 0 0 2px rgba(205, 117, 29, 0.2); }
+.tac-input textarea::placeholder { color: var(--text-muted); }
+
+.tac-send-btn {
+	width: 36px;
+	height: 36px;
+	padding: 0;
+	border-radius: 4px;
+	background: var(--accent-color);
+	border: none;
+	color: #1a1b26;
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	align-self: flex-end;
+	transition: all 0.15s ease;
+}
+.tac-send-btn:hover:not(:disabled) { background: var(--accent-hover); transform: translateY(-1px); }
+.tac-send-btn:disabled { background: var(--bg-elevated); color: var(--text-muted); cursor: not-allowed; transform: none; }
+.tac-stop-btn { background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-color); }
+.tac-stop-btn:hover { background: rgba(247, 118, 142, 0.15); border-color: var(--status-red); color: var(--status-red); transform: none; }
+/* Under session full-auto the stop button is red at rest — the alarming color
+   marks the elevated mode, not the everyday stop action. */
+.tac-stop-btn-red { background: var(--status-red); color: #1a1b26; border: 1px solid var(--status-red); }
+.tac-stop-btn-red:hover { background: #e0637e; border-color: #e0637e; color: #1a1b26; transform: none; }
+
+/* Session full-auto badge: docked left of the send/stop button; click = off. */
+.tac-auto-badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	padding: 2px 8px;
+	border-radius: 6px;
+	border: 1px solid rgba(247, 118, 142, 0.5);
+	background: rgba(247, 118, 142, 0.12);
+	color: var(--status-red);
+	font-size: 11px;
+	font-weight: 600;
+	cursor: pointer;
+	transition: background 0.15s ease;
+	flex-shrink: 0;
+	align-self: flex-end;
+	height: 36px; /* match the send/stop button so the bottom row lines up */
+}
+.tac-auto-badge:hover { background: rgba(247, 118, 142, 0.22); }
+.tac-auto-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--status-red); }
+
+.tac-input-active { position: relative; }
+.tac-input-active::before {
+	content: '';
+	position: absolute;
+	top: 0; left: 0; right: 0;
+	height: 2px;
+	pointer-events: none;
+	background-image: linear-gradient(90deg, transparent 0%, rgba(205, 117, 29, 0) 20%, var(--accent-color) 50%, rgba(205, 117, 29, 0) 80%, transparent 100%);
+	background-size: 40% 100%;
+	background-repeat: no-repeat;
+	background-position: -40% 0;
+	animation: tacInputBar 1.6s linear infinite;
+	z-index: 2;
+	opacity: 0.85;
+}
+.tac-input-active.is-waiting::before { animation-duration: 1.2s; opacity: 1; }
+@keyframes tacInputBar { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
+@media (prefers-reduced-motion: reduce) {
+	.tac-input-active::before { animation: none; opacity: 0.45; background: var(--accent-color); }
+}
+
+/* Give the reused chat renderers a compact, panel-friendly footprint. */
+.tac-msg-assistant-body .markdown-body { font-size: 13px; }

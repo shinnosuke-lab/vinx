@@ -1,0 +1,45 @@
+# The quality gate: every push to main and every pull request builds the page
+# and runs the full suites (unit, browser, and the E2E leg that boots the
+# emulated Linux). Nothing here deploys -- releases are cut by tag, see
+# release.yml.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            web/runtime/package-lock.json
+            web/vendor/ui/package-lock.json
+
+      # The runner image carries rustup; the wasm target is the only add-on.
+      # deploy/ci.sh installs wasm-pack itself when it is absent.
+      - name: rust wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            web/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('web/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # Builds the vendored chat UI, the wasm engine and the page, then runs
+      # every suite that can fail it. The runner image ships google-chrome,
+      # which the script detects and uses.
+      - name: build and test
+        run: ./web/deploy/ci.sh

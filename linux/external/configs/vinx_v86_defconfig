@@ -1,0 +1,139 @@
+# Vinx Linux: what the page boots inside v86.
+#
+# v86 emulates a 32-bit PC (up to roughly Pentium-4 era), so the target is
+# i686 and the kernel is uniprocessor. The whole system ships as two files --
+# bzImage and rootfs.img (an initramfs, installed under that neutral name by
+# container-build.sh) -- which v86 loads directly; there is no bootloader and
+# no disk. Everything lives in RAM and vanishes with the tab, which is the
+# point.
+
+BR2_x86_i686=y
+
+# musl keeps the initramfs small; nothing here needs glibc.
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+
+BR2_TARGET_GENERIC_HOSTNAME="vinx"
+BR2_TARGET_GENERIC_ISSUE="Vinx Linux (i686, in your browser)"
+
+# The overlay carries its own inittab: a passwordless root shell on ttyS0 for
+# the person, agentd on ttyS1 for the model. Buildroot's generated getty line
+# would fight it, so it is off.
+# BR2_TARGET_GENERIC_GETTY is not set
+BR2_TARGET_ENABLE_ROOT_LOGIN=y
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_VINX_PATH)/board/vinx/rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_VINX_PATH)/board/vinx/post-build.sh"
+
+# agentd bounds each command with timeout(1); enable that busybox applet.
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_VINX_PATH)/board/vinx/busybox.fragment"
+
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_USE_ARCH_DEFAULT_CONFIG=y
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_VINX_PATH)/board/vinx/linux.fragment"
+
+# TLS-capable curl (mbedtls keeps it small) plus the CA bundle. Pointless on
+# the default fetch network backend, whose translator cannot carry TLS -- but
+# behind a wisp relay the guest gets real outbound TCP, and this is what makes
+# `curl https://...` actually work there. Costs ~2 MB of initramfs.
+BR2_PACKAGE_LIBCURL=y
+BR2_PACKAGE_LIBCURL_CURL=y
+BR2_PACKAGE_LIBCURL_MBEDTLS=y
+BR2_PACKAGE_MBEDTLS=y
+BR2_PACKAGE_CA_CERTIFICATES=y
+
+# Things to program with. tcc (our own package, see package/tcc) compiles
+# real C on the target against the musl headers it ships; micropython and
+# quickjs cover "write a quick script" in Python and JavaScript. Together
+# with the development headers, about +3.8 MB compressed.
+BR2_PACKAGE_TCC=y
+BR2_PACKAGE_MICROPYTHON=y
+BR2_PACKAGE_QUICKJS=y
+
+# The pure-Python complement to micropython's built-ins (datetime, pathlib
+# and friends under /usr/lib/micropython). Directly softens the recorded
+# pain point "the model writes CPython, the imports fail". Mainline dropped
+# its micropython-lib package, so this is ours -- named -pylib because the
+# mainline symbol still arms a dormant hook in micropython.mk; see
+# package/micropython-pylib. ~+0.1 MB.
+BR2_PACKAGE_MICROPYTHON_PYLIB=y
+
+# sqlite3: the CLI for data wrangling, and libsqlite3.so + headers (staged
+# into the image by post-build.sh) so `tcc x.c -lsqlite3` works out of the
+# box. The single biggest "real work" enabler of the batch. The CLI links
+# the shared library rather than embedding the engine twice (external.mk
+# passes --disable-static-shell). ~+0.5 MB.
+BR2_PACKAGE_SQLITE=y
+
+# jq: JSON on the shell — with curl on a relay network it is the agent's
+# highest-frequency pairing. ~+0.3 MB.
+BR2_PACKAGE_JQ=y
+
+# GNU make: busybox has no make applet at all; with it, tcc graduates from
+# single files to small multi-file projects. ~+0.25 MB.
+BR2_PACKAGE_MAKE=y
+
+# Lua 5.4: the interpreter, and -- the point -- liblua.so plus headers, so
+# tcc can embed a scripting engine (`tcc host.c -llua`) or build C modules
+# for it (`tcc -shared`). Buildroot's shared-lib patch installs the .so and
+# its symlink; the headers ride into the image with the post-build staging
+# copy. 32BITS is off on purpose: Buildroot defaults it on for 32-bit
+# targets, which bends numbers to 32-bit floats/ints -- standard 64-bit
+# semantics keep outside Lua scripts (and the luaconf.h we ship to tcc)
+# honest. About +300 KB compressed.
+BR2_PACKAGE_LUA=y
+# BR2_PACKAGE_LUA_32BITS is not set
+
+# bluez's btmon without bluez (see package/btmon): offline btsnoop analysis
+# -- drop a capture on the terminal, `btmon -r` decodes HCI/L2CAP/ATT/SMP.
+# Built shim-first so glib2/dbus/bluetoothd stay out. ~+400 KB compressed.
+BR2_PACKAGE_BTMON=y
+
+# Assembly, first-class: this is a real i686, and Intel-syntax NASM is the
+# dialect the model writes best. ndisasm rides along as the disassembler;
+# tcc already assembles GNU-syntax .S and links nasm's ELF objects
+# (`nasm -f elf32 x.asm && tcc x.o -o x`). Mainline nasm is host-only,
+# hence the vinx- package (see package/vinx-nasm). ~+0.7 MB compressed.
+BR2_PACKAGE_VINX_NASM=y
+
+# strace: the debugger that fits a non-interactive channel -- run_shell can
+# read a syscall trace where it could never drive a gdb prompt. ~+0.5 MB.
+BR2_PACKAGE_STRACE=y
+
+# The repo's NES console (see package/nes and ../nes): cross-built at -O3,
+# installed as /usr/bin/nes -- drop a ROM on the terminal and play, full
+# speed, sound and all. A ~70 KB binary, ~35 KB compressed.
+BR2_PACKAGE_NES=y
+
+# LVGL as a system library (see package/vinx-lvgl): `tcc gui.c -llvgl`
+# paints widgets on /dev/fb0 and reads evdev -- real GUI apps, compiled
+# in the machine. The overlay ships a GB2312 binfont at
+# /usr/share/fonts/cjk16.bin (+0.6 MB compressed). ~+1.3 MB compressed.
+BR2_PACKAGE_VINX_LVGL=y
+
+# termbox2 (see package/termbox2): the single-header TUI library -- one
+# #include and a dozen calls, the API a model gets right first try.
+# ncurses already ships complete (library via vim, headers + terminfo via
+# the staging copy), so this is the lightweight second option. ~+30 KB.
+BR2_PACKAGE_TERMBOX2=y
+
+# The volume knob (see package/vol): ALSA brings the SB16 up muted and
+# there is no alsa-utils here to restore levels, so S25vol turns master
+# and PCM to 100 at boot through /dev/mixer. Without it, /dev/dsp plays
+# perfect silence. A ~10 KB binary.
+BR2_PACKAGE_VOL=y
+
+# A real vim (busybox's vi draws by bytes, not display cells, so CJK text
+# shears into misplaced spaces -- an upstream limitation, not a config one).
+# The runtime (syntax files, help) is ~5 MB of initramfs and stays out; the
+# editor itself handles UTF-8 widths natively. The busybox vi applet is off
+# (busybox.fragment) and the overlay symlinks vi -> vim. About +1 MB.
+# SHOW_OTHERS gates every package that shadows a busybox applet -- without
+# it kconfig drops BR2_PACKAGE_VIM silently.
+BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+BR2_PACKAGE_VIM=y
+# BR2_PACKAGE_VIM_RUNTIME is not set
+
+# An initramfs, not a disk image: v86's `initrd` option feeds it straight to
+# the kernel, and a root that is plainly RAM keeps "nothing persists" honest.
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+# BR2_TARGET_ROOTFS_TAR is not set

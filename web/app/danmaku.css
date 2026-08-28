@@ -1,0 +1,88 @@
+/*
+ * Danmaku: bridge chat floating across the window. Self-contained pills —
+ * dark glass with the brand's copper for the name — so a line reads the same
+ * over the black terminal, a light chat page, or a photo somebody opened.
+ * The layer is pure glass: no pointer events, ever.
+ */
+
+.danmaku {
+	position: fixed;
+	inset: 0;
+	overflow: hidden;
+	pointer-events: none;
+	/* Above panels and dialogs; it is only glass, nothing to steal focus. */
+	z-index: 2147483000;
+}
+
+.dmk-item {
+	position: absolute;
+	left: 0;
+	transform: translateX(100vw);
+	max-width: 60vw;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	padding: 6px 14px;
+	border-radius: 999px;
+	font:
+		500 15px/1.2 ui-monospace,
+		SFMono-Regular,
+		Menlo,
+		monospace;
+	color: hsl(36 30% 96%);
+	background: hsl(24 30% 10% / 0.78);
+	border: 1px solid hsl(30 75% 46% / 0.35);
+	box-shadow: 0 2px 12px hsl(0 0% 0% / 0.35);
+	animation: dmk-float 10s linear forwards;
+	will-change: transform;
+}
+
+.dmk-from {
+	color: hsl(33 80% 56%);
+	font-weight: 700;
+}
+
+/* Your own words, echoed: present but not shouting. */
+.dmk-self {
+	opacity: 0.85;
+	border-style: dashed;
+}
+
+/* A whisper (`bridge say @name`): marked, and a little warmer. */
+.dmk-direct {
+	background: hsl(27 40% 16% / 0.9);
+	border-color: hsl(33 80% 56% / 0.7);
+}
+.dmk-direct .dmk-from::before {
+	content: '@';
+	opacity: 0.8;
+}
+
+@keyframes dmk-float {
+	from {
+		transform: translateX(100vw);
+	}
+	to {
+		transform: translateX(-100%);
+	}
+}
+
+/* No scrolling text for those who asked motion to stop: the line rests in
+ * the corner and fades. animationend still fires, so cleanup is the same. */
+@media (prefers-reduced-motion: reduce) {
+	.dmk-item {
+		left: auto;
+		right: 12px;
+		transform: none;
+		animation: dmk-fade 6s linear forwards;
+	}
+	@keyframes dmk-fade {
+		0%,
+		75% {
+			opacity: 1;
+		}
+		100% {
+			opacity: 0;
+		}
+	}
+}

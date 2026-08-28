@@ -1,0 +1,9 @@
+config BR2_PACKAGE_VOL
+	bool "vol"
+	help
+	  The machine's volume knob. ALSA brings the SB16 up with every
+	  control at zero -- on real hardware alsactl restores levels at
+	  boot, but this image ships no alsa-utils, so the card stays
+	  muted and /dev/dsp plays silence. vol(1) sets master and PCM
+	  through the OSS mixer (/dev/mixer, CONFIG_SND_MIXER_OSS) and
+	  its S25vol init script turns the knob to 100 at boot.

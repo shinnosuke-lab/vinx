@@ -1,0 +1,13 @@
+config BR2_PACKAGE_VINX_NASM
+	bool "vinx-nasm"
+	depends on BR2_i386
+	help
+	  NASM running *on* the i686 target: Intel-syntax assembly as a
+	  first-class language on a machine that really is an i686.
+	  `nasm -f elf32 x.asm && tcc x.o -o x` builds and links; ndisasm
+	  rides along as the disassembler. Mainline Buildroot only ships
+	  nasm as a host tool (that is why this package carries the vinx-
+	  prefix -- the mainline name would collide), so this one is the
+	  same tarball cross-compiled for the target. ~+0.7 MB compressed.
+
+	  https://www.nasm.us

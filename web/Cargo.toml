@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/agent-web-core"]
+resolver = "2"
+
+# The whole reason this project exists is that the wasm blob ships over the
+# network, so size is the budget that matters. `opt-level = "z"` + fat LTO +
+# one codegen unit + no panic strings is worth roughly a third of the artifact.
+#
+# panic = "abort" is safe here in a way it is not for upstream agent-core:
+# there is no actix worker relying on unwinding to survive a handler panic.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

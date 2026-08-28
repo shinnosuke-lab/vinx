@@ -1,0 +1,111 @@
+#!/bin/sh
+# fetch -- HTTP through the hosting page's browser fetch(), zero setup.
+#
+# curl(1) needs a relay network to reach the internet; this does not, but it
+# obeys the browser's rules instead: cross-origin responses are readable only
+# when the server allows CORS. That covers a useful world -- public APIs,
+# same-origin assets, and CORS-friendly readers (https://r.jina.ai/<URL>
+# fetches arbitrary pages as text) -- and fails honestly on the rest.
+#
+# curl-shaped where it counts: body to stdout, -o for a file, -i to include
+# the status line and headers, non-2xx exits 22 (like curl -f), transport
+# failure exits 7. Rides the hostcall channel on /dev/ttyS3; big bodies come
+# back through /data (exact bytes, no UART crawl).
+
+. /usr/lib/hostcall.sh
+
+usage() {
+	cat >&2 <<'EOF'
+usage: fetch [-X METHOD] [-H 'Name: value']... [-d BODY | -d @FILE]
+             [-o FILE] [-i] [-t SECS] URL
+
+Runs the request in the HOSTING BROWSER PAGE: no relay needed, but
+cross-origin reads need the server to send CORS headers. For arbitrary
+hosts use `curl` on a relay network, or fetch https://r.jina.ai/<URL>.
+Bodies larger than 2 MB are truncated (and say so). Exit: 0 on 2xx,
+22 on other statuses, 7 when the request never got an answer.
+EOF
+	exit 2
+}
+
+method=
+hdrs='{}'
+body=
+have_body=
+out=
+include=
+tmo=30
+url=
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-X) [ $# -ge 2 ] || usage; method=$2; shift 2 ;;
+		-H)
+			[ $# -ge 2 ] || usage
+			k=${2%%:*}
+			v=${2#*:}
+			v=${v# }
+			hdrs=$(printf '%s' "$hdrs" | jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}')
+			shift 2 ;;
+		-d) [ $# -ge 2 ] || usage; body=$2; have_body=1; shift 2 ;;
+		-o) [ $# -ge 2 ] || usage; out=$2; shift 2 ;;
+		-i) include=1; shift ;;
+		-t) [ $# -ge 2 ] || usage; tmo=$2; shift 2 ;;
+		-h|--help) usage ;;
+		-*) usage ;;
+		*) [ -n "$url" ] && usage; url=$1; shift ;;
+	esac
+done
+[ -n "$url" ] || usage
+case "$tmo" in ''|*[!0-9]*) tmo=30 ;; esac
+[ "$tmo" -gt 120 ] && tmo=120
+[ "$tmo" -lt 1 ] && tmo=1
+
+# A body goes over as base64: exact bytes, no JSON-in-shell quoting traps,
+# and `-d @file` can carry binary. POST is implied, as curl does it.
+body_b64=
+if [ -n "$have_body" ]; then
+	case "$body" in
+		@*)
+			f=${body#@}
+			[ -f "$f" ] || { echo "fetch: $f: no such file" >&2; exit 1; }
+			body_b64=$(base64 "$f" | tr -d '\n') ;;
+		*)
+			body_b64=$(printf '%s' "$body" | base64 | tr -d '\n') ;;
+	esac
+	[ -n "$method" ] || method=POST
+fi
+[ -n "$method" ] || method=GET
+
+payload=$(jq -cn \
+	--arg url "$url" --arg method "$method" --argjson headers "$hdrs" \
+	--arg bodyB64 "$body_b64" --argjson t $((tmo * 1000)) \
+	'{url: $url, method: $method, headers: $headers, timeoutMs: $t}
+	 + (if $bodyB64 != "" then {bodyB64: $bodyB64} else {} end)')
+reply=$(hostcall fetch "$payload" "$tmo") || exit 7
+
+if [ "$(printf '%s' "$reply" | jq -r '.ok')" != "true" ]; then
+	echo "fetch: $(printf '%s' "$reply" | jq -r '.error // "failed"')" >&2
+	exit 7
+fi
+
+status=$(printf '%s' "$reply" | jq -r '.status')
+if [ -n "$include" ]; then
+	printf 'HTTP %s %s\n' "$status" "$(printf '%s' "$reply" | jq -r '.statusText // ""')"
+	printf '%s' "$reply" | jq -r '.headers | to_entries[] | "\(.key): \(.value)"'
+	echo
+fi
+
+if [ -n "$out" ]; then
+	hostcall_body "$reply" > "$out"
+	sz=$(wc -c < "$out")
+	echo "fetch: HTTP $status, $sz bytes -> $out" >&2
+else
+	hostcall_body "$reply"
+fi
+[ "$(printf '%s' "$reply" | jq -r '.truncated // empty')" = "true" ] \
+	&& echo "fetch: body truncated at 2 MB" >&2
+
+case "$status" in
+	2*) exit 0 ;;
+	*) echo "fetch: HTTP $status" >&2; exit 22 ;;
+esac

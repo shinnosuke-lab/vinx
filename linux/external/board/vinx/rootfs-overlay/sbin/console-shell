@@ -1,0 +1,18 @@
+#!/bin/sh
+# What getty starts on ttyS0 instead of login(1): the console of a VM that
+# lives inside your own browser tab needs no password. getty has already made
+# ttyS0 the controlling terminal, so the shell gets job control (Ctrl+C works).
+export HOME=/root
+export TERM=xterm-256color
+# musl is unconditionally UTF-8; saying so makes setlocale() callers
+# (micropython, quickjs) behave the same way. COLORTERM because xterm.js
+# really does 24-bit colour. iutf8 makes canonical-mode backspace erase a
+# character, not one byte of one.
+export LANG=C.UTF-8
+export COLORTERM=truecolor
+stty iutf8 2>/dev/null
+# Start where work survives: /data is the 9p share that outlives a page
+# reload, and it is where dropped files land. $HOME stays /root for the
+# dotfiles; the mount can only be missing if 9p failed, then fall back.
+cd /data 2>/dev/null || cd "$HOME"
+exec /bin/sh -l

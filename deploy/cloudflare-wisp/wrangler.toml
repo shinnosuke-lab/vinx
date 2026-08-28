@@ -1,0 +1,7 @@
+name = "vinx-wisp"
+main = "worker.js"
+# connect() from cloudflare:sockets needs a recent runtime.
+compatibility_date = "2026-04-07"
+
+# No bindings, no vars: the whole Worker is one stateless WebSocket handler.
+# Deploy with `npx wrangler deploy`; the free plan is enough (see README.md).

@@ -1,0 +1,11 @@
+config BR2_PACKAGE_TCC
+	bool "tcc"
+	depends on BR2_i386
+	help
+	  TinyCC: a small, fast C compiler that runs comfortably inside
+	  the browser VM. Installs the compiler, its runtime
+	  (/usr/lib/tcc) and -- so it can actually compile and link on
+	  the target -- the musl and kernel headers plus crt objects
+	  from staging.
+
+	  https://bellard.org/tcc/

@@ -1,0 +1,21 @@
+#!/bin/sh
+# open FILE|URL -- macOS-style: hand it to the browser and let it decide.
+#
+# A file goes out over a private OSC (7770) with its name and bytes; the page
+# gives it a MIME type from the extension and window.open()s a blob URL, so
+# PDFs, HTML, images, video and text render in a new tab and anything else
+# becomes a download. A URL just opens. Siblings: imgcat(1), download(1).
+. /usr/lib/vinx.sh
+
+[ $# -eq 1 ] || { echo 'usage: open FILE|URL' >&2; exit 2; }
+
+case "$1" in
+	http://* | https://*)
+		printf '\033]7770;url;%s\a\n' "$(vm_b64s "$1")"
+		exit 0
+		;;
+esac
+
+vm_file_ok open "$1" || exit 1
+printf '\033]7770;file;%s;%s\a\n' "$(vm_b64s "$(basename "$1")")" "$(vm_b64 "$1")"
+echo "open: sent $1 to the browser"

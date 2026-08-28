@@ -1,0 +1,222 @@
+#!/bin/sh
+# ble -- Web Bluetooth from the shell: the page speaks GATT, this end types.
+#
+# The browser exposes BLE at the GATT level only (no HCI), so this is a
+# command bridge, not an adapter: connect to one device, list its services,
+# read, write, subscribe. The device picker needs a human click -- `connect`
+# parks a request on the footer's ble chip and waits; a device Chrome already
+# remembers reconnects silently. Pairing has no API at all: a protected
+# read/write makes the OS pop its own dialog, and the operation then simply
+# succeeds -- unpairing lives in the system's Bluetooth settings.
+#
+# Requests ride the private OSC; answers come back through /data files this
+# script polls (.ble-status for the connection, .ble-reply per command,
+# .ble-notify as a rolling feed). Console-only, like bridge(1): run_shell
+# output is not OSC-parsed.
+. /usr/lib/vinx.sh
+
+STATUS=/data/.ble-status
+REPLY=/data/.ble-reply
+FEED=/data/.ble-notify
+
+usage() {
+	cat >&2 <<'EOF'
+usage: ble scan [SECONDS]        advertisements, rolling (needs a chrome flag)
+       ble connect [SERVICE]     pick a device -- the picker window is the scanner
+       ble show                  the device and its connection
+       ble services              GATT services and characteristics
+       ble read SVC CHR          one value, hex
+       ble write SVC CHR HEX     write bytes
+       ble notify SVC CHR [off]  subscribe; values roll in `ble watch`
+       ble watch                 follow subscribed values (ctrl-c stops)
+       ble disconnect            let the device go
+SVC/CHR: a full UUID, a 16-bit short like 180d, or a GATT name like heart_rate.
+Pairing is the OS's business: a protected read/write pops its dialog by itself.
+EOF
+	exit 2
+}
+
+req() { printf '\033]7770;ble;%s\a\n' "$(vm_b64s "$1")"; }
+field() { sed -n "s/^$1=//p" "$2" 2>/dev/null; }
+
+# One id per invocation: the reply file is shared, and a stale answer must
+# not be mistaken for ours.
+SEQ="$$-$(date +%s)"
+
+# UUIDs, GATT names and 16-bit shorts share one safe charset; anything else
+# would also need escaping into the hand-built JSON below, so refuse it.
+check_word() {
+	case "$1" in
+	'' | *[!a-zA-Z0-9._-]*)
+		echo "ble: $2 must be a UUID (180d, 00002a37-...) or a GATT name (heart_rate)" >&2
+		exit 2
+		;;
+	esac
+}
+
+# Send a request and print the reply body. The page answers fast -- connect,
+# the long one, goes through the status file instead.
+ask() {
+	rm -f "$REPLY"
+	req "$1"
+	i=0
+	while [ "$i" -lt 15 ]; do
+		if [ "$(field seq "$REPLY")" = "$SEQ" ]; then
+			if [ "$(field ok "$REPLY")" = 1 ]; then
+				grep -v -e '^seq=' -e '^ok=' "$REPLY"
+				return 0
+			fi
+			echo "ble: $(field err "$REPLY")" >&2
+			return 1
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+	echo 'ble: no reply from the page (is this the console?)' >&2
+	return 1
+}
+
+# Print feed lines as they appear: each is "N text", N ever-increasing.
+# $1 caps the run in seconds; empty runs until ctrl-c.
+watch_feed() {
+	deadline=$1
+	last=$(tail -n 1 "$FEED" 2>/dev/null | cut -d' ' -f1)
+	last=${last:-0}
+	t=0
+	while :; do
+		if [ -f "$FEED" ]; then
+			while read -r n rest; do
+				[ "${n:-0}" -gt "$last" ] 2>/dev/null || continue
+				last=$n
+				echo "$rest"
+			done <"$FEED"
+		fi
+		sleep 1
+		t=$((t + 1))
+		[ -n "$deadline" ] && [ "$t" -ge "$deadline" ] && break
+	done
+}
+
+stop_scan() { req '{"op":"scan","on":false}'; }
+
+cmd=$1
+[ $# -ge 1 ] && shift
+
+case "$cmd" in
+scan)
+	secs=${1:-15}
+	[ $# -le 1 ] || usage
+	case "$secs" in '' | *[!0-9]*) usage ;; esac
+	# The feed file stays: the page rewrites its whole ring on every push, so
+	# deleting it here would only reset watch_feed's baseline and replay old
+	# notification lines as "scan results". The trap is set before anything
+	# is asked, or a ctrl-c during the wait would leave the scan request
+	# parked on the chip forever.
+	trap 'stop_scan; exit 0' INT
+	ask "{\"op\":\"scan\",\"on\":true,\"seq\":\"$SEQ\"}" || exit 1
+	echo "ble: scanning for ${secs}s -- ctrl-c stops early"
+	watch_feed "$secs"
+	stop_scan
+	;;
+connect)
+	[ $# -le 1 ] || usage
+	svc=${1:-}
+	[ -n "$svc" ] && check_word "$svc" SERVICE
+	rm -f "$STATUS"
+	if [ -n "$svc" ]; then
+		req "{\"op\":\"connect\",\"service\":\"$svc\"}"
+	else
+		req '{"op":"connect"}'
+	fi
+	echo 'ble: asking the page for a device...'
+	i=0
+	hinted=0
+	while [ "$i" -lt 90 ]; do
+		case "$(field state "$STATUS")" in
+		connected)
+			echo "ble: connected to $(field device "$STATUS")"
+			exit 0
+			;;
+		failed)
+			echo "ble: $(field error "$STATUS")" >&2
+			exit 1
+			;;
+		picking)
+			# One hint, the first time the request is seen parked (silent
+			# reconnect attempts can delay that well past any fixed tick).
+			if [ "$hinted" -eq 0 ]; then
+				hinted=1
+				echo 'ble: click the ble chip in the footer to pick the device'
+			fi
+			;;
+		esac
+		sleep 1
+		i=$((i + 1))
+	done
+	echo 'ble: nothing arrived -- is this the console? was the picker dismissed?' >&2
+	exit 1
+	;;
+show)
+	case "$(field state "$STATUS")" in
+	connected) echo "ble: connected -- $(field device "$STATUS")" ;;
+	picking) echo 'ble: waiting for the footer chip click' ;;
+	failed)
+		echo "ble: failed -- $(field error "$STATUS")" >&2
+		exit 1
+		;;
+	*)
+		echo 'ble: no device (ble connect)'
+		exit 1
+		;;
+	esac
+	;;
+services)
+	[ $# -eq 0 ] || usage
+	ask "{\"op\":\"services\",\"seq\":\"$SEQ\"}"
+	;;
+read)
+	[ $# -eq 2 ] || usage
+	check_word "$1" SVC
+	check_word "$2" CHR
+	ask "{\"op\":\"read\",\"svc\":\"$1\",\"chr\":\"$2\",\"seq\":\"$SEQ\"}"
+	;;
+write)
+	[ $# -eq 3 ] || usage
+	check_word "$1" SVC
+	check_word "$2" CHR
+	hex=$3
+	case "$hex" in '' | *[!0-9a-fA-F]*) usage ;; esac
+	[ $((${#hex} % 2)) -eq 0 ] || usage
+	if [ "${#hex}" -gt 1024 ]; then
+		echo "ble: HEX is longer than 512 bytes (GATT's per-write cap)" >&2
+		exit 2
+	fi
+	ask "{\"op\":\"write\",\"svc\":\"$1\",\"chr\":\"$2\",\"hex\":\"$hex\",\"seq\":\"$SEQ\"}" &&
+		echo 'ble: written'
+	;;
+notify)
+	[ $# -eq 2 ] || { [ $# -eq 3 ] && [ "$3" = off ]; } || usage
+	check_word "$1" SVC
+	check_word "$2" CHR
+	if [ "${3:-}" = off ]; then
+		ask "{\"op\":\"notify\",\"svc\":\"$1\",\"chr\":\"$2\",\"off\":true,\"seq\":\"$SEQ\"}" &&
+			echo 'ble: unsubscribed'
+	else
+		ask "{\"op\":\"notify\",\"svc\":\"$1\",\"chr\":\"$2\",\"seq\":\"$SEQ\"}" &&
+			echo 'ble: subscribed -- ble watch shows the values'
+	fi
+	;;
+watch)
+	[ $# -eq 0 ] || usage
+	echo 'ble: watching -- ctrl-c stops the watch (ble notify SVC CHR off unsubscribes)'
+	trap 'exit 0' INT
+	watch_feed ''
+	;;
+disconnect)
+	[ $# -eq 0 ] || usage
+	ask "{\"op\":\"disconnect\",\"seq\":\"$SEQ\"}" && echo 'ble: disconnected'
+	;;
+*)
+	usage
+	;;
+esac

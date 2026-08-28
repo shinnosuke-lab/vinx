@@ -1,0 +1,129 @@
+[package]
+name = "agent-web-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# wasm-pack's bundled wasm-opt defaults to the MVP feature set and rejects the
+# module outright ("all used features should be allowed") because rustc now
+# emits `i32.trunc_sat_f64_u` and friends by default. The enables below are the
+# post-MVP proposals rustc assumes; they describe the input, they do not change
+# it.
+#
+# `-Oz` rather than wasm-pack's default `-O`: this artifact is downloaded over
+# the network, so size beats speed.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+	"-Oz",
+	"--enable-nontrapping-float-to-int",
+	"--enable-sign-ext",
+	"--enable-bulk-memory",
+	"--enable-mutable-globals",
+	"--enable-multivalue",
+	"--enable-reference-types",
+]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+# The skill tests build the packages they install, so they need the writing half
+# of the same crate the installer reads with.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[features]
+# Exports an entry point that touches the whole engine, so the artifact
+# measured by deploy/measure.sh is not one that LTO has hollowed out.
+size-probe = []
+
+# Session storage on real SQLite, keeping the two-table schema and the LIKE
+# search semantics of upstream's SqliteStore. Optional because it is a bundled
+# C library and therefore the single largest thing we might choose not to ship;
+# deploy/measure.sh prices it.
+sqlite = ["dep:sqlite-wasm-rs"]
+
+[dependencies]
+# ── the vendored engine's own dependencies ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+async-trait = "0.1"
+futures = "0.3"
+log = "0.4"
+base64 = "0.22"
+regex = "1"
+
+# Skill packages are zips, and installing one is the only thing here that has to
+# read a container format. Default features off because the rest of them are
+# encryption and the compression methods nothing produces; `deflate` is what a
+# skill package is written with, and `flate2` implements it in Rust (no C, so it
+# cross-compiles to wasm without a separate toolchain).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Only the five features tokio permits on wasm; naming `process`, `fs` or
+# `rt-multi-thread` (as upstream agent-core does) trips a compile_error!.
+tokio = { version = "1", features = ["sync", "macros", "io-util", "rt", "time"] }
+
+# reqwest's wasm backend is fetch-based, and `stream` is what gives us
+# `bytes_stream()` -- the exact call the engine's SSE parser is built on. The
+# native TLS/hyper stack sits behind cfg(not(wasm32)) upstream, so asking for
+# rustls here would be pointless rather than harmful; we simply don't.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+
+# std::time::Instant and tokio::time::sleep both panic on
+# wasm32-unknown-unknown (std's wasm layer maps time to `unsupported`). wasmtimer
+# reimplements them over performance.now() and setTimeout with the same API,
+# which is why the vendor patches are a one-line import swap per site.
+wasmtimer = "0.4"
+
+# ── browser bindings ──
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+# The vendored engine reports through `log`, and without an implementation every
+# one of those calls is discarded -- including the ones that explain why a turn
+# failed. Wired at Warn in `AgentHost`, so the engine's per-step `info!` traffic
+# stays off and what remains is worth reading.
+console_log = "1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["console", "Window", "WorkerGlobalScope"]
+
+[dependencies.uuid]
+version = "1"
+features = ["v4", "js"]
+
+[dependencies.chrono]
+version = "0.4"
+default-features = false
+features = ["clock", "wasmbind"]
+
+# Forced in so the `wasm_js` backend selected in .cargo/config.toml is actually
+# compiled; uuid pulls it transitively but without the feature it won't link.
+[dependencies.getrandom]
+version = "0.3"
+features = ["wasm_js"]
+
+# Of the three VFS options, `relaxed-idb` is the one that fits. None of them
+# need COOP/COEP, so that is not the deciding factor: the OPFS-backed
+# `sahpool` only runs inside a Dedicated Worker, which would pin the module to
+# a worker forever and rule out embedding it in a plain page -- the stated goal
+# of this project. relaxed-idb runs in any context and persists to IndexedDB.
+#
+# The trade is durability: relaxed-idb is relaxed-durability, so a tab killed
+# mid-write can lose the last commits. Acceptable for a chat transcript, and it
+# is why the store flushes on turn boundaries rather than trusting the VFS.
+#
+# `precompiled` rather than the default `bundled`: bundled shells out to a
+# clang that can emit wasm32 objects, which the Xcode toolchain on a Mac cannot,
+# so the build would only work on machines with a separate LLVM. precompiled
+# ships the same library prebuilt and keeps the build reproducible everywhere.
+[dependencies.sqlite-wasm-rs]
+version = "0.4"
+default-features = false
+features = ["relaxed-idb", "precompiled"]
+optional = true

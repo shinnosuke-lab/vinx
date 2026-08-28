@@ -1,0 +1,50 @@
+#!/usr/bin/env micropython
+# fbdemo -- paint the brand gradient on the VGA screen (/dev/fb0).
+#
+# The footer's "screen" chip shows the panel this lands on. Rows are built
+# with bytes-multiplication (no per-pixel Python loop on an emulated CPU) and
+# written in 16-row batches: page-sized writes tend to lose their fbdev
+# damage on the way to the emulated VRAM, 64 KB writes land reliably.
+
+
+def read(path):
+    f = open(path)
+    try:
+        return f.read()
+    finally:
+        f.close()
+
+
+try:
+    w, h = [int(x) for x in read("/sys/class/graphics/fb0/virtual_size").split(",")]
+    bpp = int(read("/sys/class/graphics/fb0/bits_per_pixel"))
+except OSError:
+    print("fbdemo: no /dev/fb0 -- this kernel has no Bochs DRM?")
+    raise SystemExit(1)
+if bpp != 32:
+    print("fbdemo: expected 32 bpp, found %d" % bpp)
+    raise SystemExit(1)
+
+# Copper fading down into cream; /dev/fb0 wants XRGB little-endian (B G R X).
+top = (0x1A, 0x5E, 0xB2)
+bot = (0xDC, 0xEC, 0xF5)
+fb = open("/dev/fb0", "wb")
+batch = b""
+for y in range(h):
+    t = y / (h - 1)
+    px = bytes(
+        (
+            int(top[0] + (bot[0] - top[0]) * t),
+            int(top[1] + (bot[1] - top[1]) * t),
+            int(top[2] + (bot[2] - top[2]) * t),
+            0,
+        )
+    )
+    batch += px * w
+    if len(batch) >= 16 * w * 4:
+        fb.write(batch)
+        batch = b""
+if batch:
+    fb.write(batch)
+fb.close()
+print("fbdemo: painted %dx%d -- the footer's screen chip shows it" % (w, h))

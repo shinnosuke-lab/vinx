@@ -1,1 +1,383 @@
 # vinx
+
+[![ci](https://github.com/shinnosuke-lab/vinx/actions/workflows/ci.yml/badge.svg)](https://github.com/shinnosuke-lab/vinx/actions/workflows/ci.yml)
+[![release](https://github.com/shinnosuke-lab/vinx/actions/workflows/release.yml/badge.svg)](https://github.com/shinnosuke-lab/vinx/actions/workflows/release.yml)
+
+An LLM agent and a Linux machine, both running entirely in a browser tab.
+
+The agent's tool-calling loop is [agent-core](#upstream) compiled to
+WebAssembly. The machine it operates is a real i686 Linux — a Buildroot kernel
+and a busybox userland — emulated by [v86](https://github.com/copy/v86). There
+is no server: open the page from any static host (or `file://`) and you get a
+chat agent that can run shell commands, plus a `/terminal` console into the
+same machine. The model provider is called straight from the browser; nothing
+you type leaves for a backend of ours, because there is no backend of ours.
+
+```
+┌─ browser tab ───────────────────────────────────────────┐
+│                                                          │
+│  chat page  ─┐                        ┌─ v86 ──────────┐ │
+│              ├─► WASM agent loop ──────► ttyS1: agentd  │ │
+│  terminal ───┘   (Web Worker)     run  │   (run_shell)  │ │
+│      │                            _shell│                │ │
+│      └── xterm.js ───────────────────────► ttyS0: shell │ │
+│                                         │  (busybox)     │ │
+│  settings: model endpoint + key ─┐      └────────────────┘ │
+│                                  │                        │
+└──────────────────────────────────┼────────────────────────┘
+                                   ▼
+                             LLM provider (CORS)
+```
+
+Two serial lines leave the VM. `ttyS0` is the person's console: xterm.js on the
+`/terminal` page is wired straight to it, and busybox's own shell does the line
+editing, history and Tab completion. `ttyS1` is `agentd`, a tiny line protocol
+behind the `run_shell` tool — so the model and the person are operating one
+machine, and a file the model writes is there at the prompt.
+
+## Quick start
+
+```bash
+# 1. The Linux images (once; needs Docker). Produces web/app/public/vm/.
+./linux/build.sh
+
+# 2. The page.
+cd web
+(cd vendor/ui && npm ci && npm run build)   # the chat UI, its own npm project
+npm install
+npm run build:wasm                          # Rust engine -> wasm (needs the Rust wasm toolchain)
+npm run dev                                  # or: npm run build && npx serve dist
+```
+
+Open the dev server, enter a model endpoint and key in settings (any
+OpenAI-compatible provider that sends CORS headers — DeepSeek and Zhipu GLM
+both do), and ask it to run something. The first command boots the VM; give it
+a few seconds the first time.
+
+If you only want to hack on the page and not rebuild Linux, the prebuilt images
+under [`web/app/public/vm/`](web/app/public/vm) are all `npm run dev` needs.
+
+### The Rust wasm toolchain
+
+`npm run build:wasm` needs `wasm-pack`, the `wasm32-unknown-unknown` target, and
+a `wasm-bindgen` CLI whose version matches [`web/Cargo.lock`](web/Cargo.lock).
+[`web/deploy/ci.sh --docker`](web/deploy/ci.sh) does the whole build inside a
+container that carries all of it (build the image with
+[`web/docker/build-image.sh`](web/docker/build-image.sh)), which is the
+reproducible path if you would rather not install the toolchain.
+
+## Layout
+
+```
+version.sh                name, version, model defaults (see the warning inside)
+LICENSE                   MIT
+
+linux/                    the guest Linux, built with Buildroot in Docker
+  build.sh                ./linux/build.sh -> web/app/public/vm/{bzImage,rootfs.img}
+  Dockerfile              the Buildroot build environment
+  external/               a Buildroot external tree
+    configs/vinx_v86_defconfig
+    package/              the tree's own packages: tcc, micropython-pylib, nes,
+                          btmon (bluez's analyzer, shim-built), vinx-nasm,
+                          vinx-lvgl (LVGL v9 as liblvgl.so), termbox2
+    board/vinx/
+      linux.fragment      kernel options: two 8250 UARTs, virtio-net, no SMP
+      rootfs-overlay/     inittab (getty on ttyS0, agentd on ttyS1), agentd,
+                          the guest's browser-facing commands (usr/bin)
+
+nes/                      a NES console spanning guest and page: agnes + a
+                          homegrown APU, framebuffer, /dev/dsp sound, Lua
+                          scripting; package/nes builds it into the image
+                          as /usr/bin/nes (see nes/README.md)
+
+skills/linux-vm/          the userland reference, shipped with the page
+
+deploy/cloudflare-wisp/   a serverless wisp relay: one Cloudflare Worker
+
+web/                      the page: agent-core in wasm, its worker, the UI, the VM
+  crates/agent-web-core/  Rust: the engine bindings and the browser host
+  runtime/src/            the worker RPC, the fetch shim, the VM device seam
+  app/                    the pages themselves
+    main.tsx              the chat page
+    terminal.tsx          the /terminal console (xterm.js on ttyS0)
+    vm.ts                 the v86 lifecycle, serial bridge and agentd channel
+    net-bridge.ts         the WebRTC LAN bridge (room codes, manual pairing)
+    run-shell-tool.tsx    the run_shell tool card
+  vendor/                 vendored agent-core engine + chat UI (see UPSTREAM.md)
+  deploy/                 build/test scripts -- see web/README.md
+  docker/                 the wasm build image
+```
+
+## How the pieces talk
+
+- **The console → the VM.** `web/app/terminal.tsx` opens an xterm.js terminal
+  and pipes its bytes to `ttyS0` through `web/app/vm.ts`. It is a dumb terminal
+  on purpose: the guest's getty and shell do everything a shell does.
+- **The agent → the VM.** The engine runs in a Web Worker and thinks its tools
+  are an HTTP device. `run_shell` calls are POSTed to an internal address the
+  worker's own `fetch` intercepts and bounces to the main thread
+  (`web/runtime/src/worker.ts`), where `web/runtime/src/device-vm.ts` runs them
+  on `ttyS1` and returns `{ok, output, exit_code}`.
+- **The agent → the model.** Everything under `/api/*` that the chat UI expects
+  from a server is answered inside the page by the fetch shim
+  (`web/runtime/src/shim.ts`); the only real network request is the engine's
+  own call to the model endpoint, which is why that endpoint must send CORS
+  headers.
+- **Sessions** live in the browser (SQLite in IndexedDB), not anywhere else.
+
+## The tools
+
+The device is the VM, and its tool surface is a small set of operations on
+that Linux rather than a bare shell (`web/runtime/src/device-vm.ts`):
+
+- `read_file` / `list_dir` — strictly read-only by construction, so they run
+  **without** the confirmation gate; exploration stops costing a click each.
+- `write_file` / `edit_file` — file changes with exact content transfer (no
+  busybox quoting traps); gated.
+- `run_shell` — everything else: `sh -c` as root, output capped at 64 KiB.
+  Gated behind the same approval prompt agent-core uses for anything
+  dangerous, and `/auto` turns the gate off for a session, knowingly.
+- `download_file` — hands a file (≤16 MB) to the person as a browser
+  download: the way compiled binaries get out of the VM. Files go the *other*
+  way by dropping them onto the terminal (or its footer's file button); they
+  land in `/data`.
+- `read_terminal` (terminal page only) — the last lines of the person's own
+  screen, so "look at this error" does not mean pasting it.
+
+Exact file bytes ride through `/data`'s 9p lane rather than the serial
+channel (which truncates at 64 KiB). What the model knows about the userland
+it is driving is [`skills/linux-vm/`](skills/linux-vm), not the system prompt:
+busybox is not GNU coreutils, the machine is RAM apart from `/data`, and what
+the network can do depends on which mode is live. The page installs that skill
+into its own workspace on first load; a skill is read on the turns that need
+it, where prompt text is paid for on every request.
+
+## The machine
+
+An i686 with 128 MB of RAM, running busybox on musl. Beyond the shell there is
+`curl` (TLS-capable, CA bundle included), and enough to actually program with:
+`tcc` compiles real C on the target (musl and kernel headers ship in the
+image) and GNU `make` drives it for multi-file projects, `lua` is standard
+Lua 5.4 with `liblua.so` and headers installed — so tcc can embed a scripting
+engine (`tcc host.c -llua`) or compile C modules for it (`tcc -shared`) — and
+`micropython` (plus micropython-lib's pure-Python add-ons: datetime, pathlib
+and friends) and `qjs` (QuickJS) cover Python- and JavaScript-shaped
+scripting. Assembly is native, not an exercise: `nasm` assembles Intel syntax
+(`nasm -f elf32 x.asm && tcc x.o -o x`), `ndisasm` reads binaries back, and
+`strace` shows the syscalls when something misbehaves. For data there are
+`sqlite3` — the CLI, and the library with its header, so `tcc app.c
+-lsqlite3` just links — `jq` for JSON on the shell, and `btmon` to decode
+btsnoop Bluetooth captures offline. There is a GUI runtime too: LVGL v9 as
+`liblvgl.so` with headers, so `tcc gui.c -llvgl` puts widgets on the VGA
+screen, with the mouse forwarded from the page's screen window (PS/2 →
+evdev) — `lvdemo` compiles and runs the shipped example in the machine
+itself, and a full GB2312 Chinese font ships at `/usr/share/fonts/cjk16.bin`,
+ready for `lv_binfont_create`. Terminal UIs get
+`ncurses` (with headers) and `termbox2` (single header, tcc-friendly).
+All of it fits in a ~13 MB compressed
+initramfs (about 36 MB unpacked in the VM's RAM). The whole pipe is UTF-8 — type 中文 at the prompt,
+name files with it, `ls` shows it (busybox is built with Unicode line editing
+and width tables; the terminal measures CJK and emoji with the Unicode 11
+tables). `vi` is a real vim (runtime-less, so no syntax files, but native
+multibyte — editing Chinese doesn't shear the screen the way busybox vi did).
+
+The machine also talks back to the browser it lives in, through the small
+commands the boot banner lists (`share local FILE` is described with `/data`
+below):
+
+- `open FILE|URL` — macOS-style: the browser renders what it can (PDF, HTML,
+  images, video, text) in a new tab and downloads the rest.
+- `imgcat [-w WIDTH] FILE` — the image, inline in the terminal (iTerm2's
+  protocol). Auto-fits by default — small images at their own size, big ones
+  scaled down to fill the viewport whole; `-w 60`/`-w 50%`/`-w 800px` pins
+  the width in cells, viewport share, or pixels (1:1). Inline images are
+  anchored to the character grid they were drawn on, so shrinking the window
+  or splitting the screen afterwards clips them — rerun imgcat to redraw, or
+  `open` the file for a full-size look in a browser tab.
+- `download FILE` — a browser download, no questions asked.
+- `js -e CODE` and `fetch URL` — the page, callable from the shell: `js`
+  runs JavaScript on the hosting page itself (DOM, browser `fetch`), and
+  `fetch` is HTTP through the browser with zero network setup (CORS
+  applies). Both also work from the agent's channel.
+- `notify`, `say`, `camera` — a browser notification, the tab speaking
+  through speech synthesis, a webcam frame as a file.
+- `microcom /dev/ttyS2` — a real serial device wired in from the footer's
+  serial chip (Web Serial).
+- `ble scan|connect|read|write|notify` — Web Bluetooth: the page speaks GATT
+  to a device the person picks, the shell reads, writes and subscribes.
+- `fbdemo` — paints `/dev/fb0`; the footer's screen chip shows the
+  framebuffer in a floating window.
+- `nes ROM.nes` — a NES console on that same screen, full speed with sound,
+  scriptable in Lua ([`nes/`](nes)). Ships in the image as `/usr/bin/nes`.
+- `bridge start|join CODE|say WORDS` — one LAN across browsers, below.
+- `alpine` — downloads Alpine's ~3.5 MB minirootfs (needs a relay network),
+  chroots in, and hands you `apk`: a real package manager with a 32-bit x86
+  repository, everything RAM-resident and gone on reload.
+
+Everything is RAM and vanishes on reload — except `/data`. That directory is
+a 9p filesystem whose bytes live on the page side: drop a file onto the
+terminal (or use its footer's file button) and it lands there; the page
+mirrors the directory into IndexedDB — incrementally, on a size/mtime
+fingerprint — and replays it on the next boot. So `/data` is where work
+survives, everything else is honest about being a fresh machine. Files
+deleted inside the VM stay deleted after a reload; work done in the final
+seconds before closing a tab may miss the last snapshot. A 64 MB quota per
+machine keeps the mirror (and the page) from growing without bound — past it,
+persistence pauses and the terminal says so.
+
+`/data` is private to its machine, with one shared spot inside it:
+`/data/share/local` holds the same files on every machine the person has open
+on this origin — the chat page's VM, each split pane's, other tabs'. Chat
+attachments land there, `share local FILE` (or the model's `share_local`
+tool) copies a file in, and the pages keep each other in step over a
+BroadcastChannel — browser-local mirroring, nothing over the network. The
+`local` in the name is the point: a future relay-backed `share net` would be
+the one that crosses systems.
+
+The terminal page can also **split**: the header's split buttons add a second,
+fully independent Linux beside (or below) the first — separate filesystems,
+separate `/data` mirrors (`/data/share/local` excepted), separate AI panels,
+one browser-side LAN between them. Each machine costs its own ~130 MB, which
+is why the second one starts only when asked for and the ceiling is two.
+
+## The network
+
+Pick the mode in the page's network control — the terminal footer's `net:` chip
+or the chat page's floating `net:` button — no scripts, no URL editing. The
+console and the tool channel are serial, not network, so they work in every
+mode. Inbound sockets never work in any mode. `ping` is honest only inside a
+shared segment (Host, Bridge, Relay — the peer's kernel answers for real);
+under Internet (wisp) and `fetch` every reply is forged locally and proves
+nothing.
+
+**Default — Host LAN, no server anywhere.** VMs in your tabs join one
+browser-internal L2 segment (v86's BroadcastChannel hub): each gets a
+`10.0.2.x` address and they can `ping`/`nc`/serve to each other, but nothing
+reaches the internet. Split the terminal (or open two tabs) to see two
+machines network. Zero backend, zero risk — which is why it is the default.
+
+**Bridge LAN — the same segment, joined to friends' over WebRTC.** The same
+in-browser hub, plus a bridge to other people's machines: every VM on both
+sides shares one ethernet segment — `ping`, `nc`, `httpd` across the
+internet — and `bridge say` floats chat messages across every bridged screen
+as an overlay. One host, many joiners (the host's tab switches frames
+between them). *Hidden from the panel by default:* WebRTC between arbitrary
+home networks proved too flaky to sell as a mode (AP isolation and mDNS
+candidates fail even on one router). The guest CLI (`bridge start`,
+`bridge join CODE`) still works everywhere, and setting
+`localStorage['vinx.bridge.ui'] = '1'` brings the panel surfaces back. Two
+ways to carry the handshake, neither carrying any traffic:
+
+- **Room code (default):** hosting mints a six-letter code; friends type it
+  (`bridge join CODE` at their prompt, or in their panel). The sealed SDP
+  handshake travels through public Nostr relays, a STUN server discovers
+  each side's address, and the connection itself is peer-to-peer.
+- **Manual:** no relays at all — the pairing codes are strings you carry
+  yourself (chat, email), one friend at a time. The result is the same
+  room, roster and `say`.
+
+**Relay LAN — one shared segment through a wsproxy, plus the internet.**
+A `ws(s)://` address selects v86's wsproxy backend: an L2 ethernet-frame
+relay. *Everyone* connected to the same server lands on one virtual segment —
+machines see each other, like `Host LAN` but spanning strangers — and the
+server NATs them out to the internet. v86's own public relay,
+`wss://relay.widgetry.org/`, is prefilled in the panel, and the terminal's
+first visit offers it once as the one-click way online. The guest's address
+comes from the relay's DHCP and lands a few seconds after boot — the network
+is ready once `ip route` shows a default route. Machines reach each other at
+those DHCP addresses (`ip -4 addr show eth0`; on the public relay a
+`10.5.x.x`): the self-assigned `10.0.2.x` alias does not cross this relay —
+the server drops source addresses it never leased. Two honest caveats
+about a public relay: unknown machines share your segment, and the in-page
+`bridge`/`say` features ride the in-browser hub, so they don't run here.
+Running your own is one Docker command (wsnic) — see
+[`deploy/self-host.md`](deploy/self-host.md).
+
+**Internet — pure outbound TCP over a wisp relay you run.** A `wisp(s)://`
+address selects the Wisp backend, which carries only TCP/UDP payloads, client
+to server: the guest gets `curl https://...`, WebSocket and raw TCP, and
+nobody on the relay ever sees anybody else. Run one yourself:
+
+```bash
+./web/deploy/relay.sh                     # local: wisp://127.0.0.1:5001/
+./web/deploy/relay.sh --tunnel            # + a free Cloudflare quick tunnel
+```
+
+`relay.sh` runs MercuryWorkshop's wisp-js and prints the address to paste;
+`--tunnel` also exposes it publicly via a `trycloudflare.com` quick tunnel (no
+account). The same server as a non-root Docker container — plus security
+notes for both relay flavors — is in
+[`deploy/self-host.md`](deploy/self-host.md). For a permanent, serverless
+relay there is a ~200-line Cloudflare
+Worker in [`deploy/cloudflare-wisp/`](deploy/cloudflare-wisp) (deploy it to
+**your own** account — free — with one caveat: Workers block outbound TCP to
+Cloudflare's own IP ranges, so sites behind Cloudflare are unreachable through
+it). The project ships no wisp relay of its own on purpose: a default one
+would be an open proxy for every visitor.
+
+There is also a legacy `fetch` mode (`?relay=fetch`): outbound plain HTTP
+replayed as browser `fetch()`, reachable only for http endpoints that send
+permissive CORS headers, no TLS — kept for compatibility, not offered in the
+control.
+
+## Rebuilding the Linux images
+
+[`./linux/build.sh`](linux/build.sh) runs Buildroot inside Docker (Buildroot
+only builds on Linux) and drops `bzImage` and `rootfs.img` (a gzipped cpio —
+the neutral extension keeps static servers from serving it with
+`Content-Encoding: gzip`, which would triple the initrd in flight) into
+`web/app/public/vm/`. The first build compiles a cross-toolchain and a kernel
+and takes a while; the download cache and build tree live in Docker volumes, so
+later builds are incremental. `--clean` drops the build volume;
+`--shell` opens a shell in the build container.
+
+To change what is in the machine — add packages, files, kernel options, or
+your own Buildroot package — see the recipes in
+[`linux/README.md`](linux/README.md); everything project-specific lives in the
+external tree under [`linux/external/`](linux/external). The command channel
+is a busybox `sh` script at
+[`linux/external/board/vinx/rootfs-overlay/usr/sbin/agentd`](linux/external/board/vinx/rootfs-overlay/usr/sbin/agentd);
+its protocol is documented at the top of that file.
+
+## Releasing
+
+Releases are cut by tag; pushes to `main` only run the quality gate
+([`ci.yml`](.github/workflows/ci.yml) runs
+[`web/deploy/ci.sh`](web/deploy/ci.sh) — every suite including the E2E leg
+that boots the VM — and deploys nothing). To publish:
+
+```bash
+# 1. Set the version. version.sh is the single source of truth; the tag
+#    must match or the release fails its consistency check.
+$EDITOR version.sh            # VER=0.2.0
+
+# 2. Commit, tag with the same number, push both.
+git commit -am 'release 0.2.0'
+git tag v0.2.0
+git push && git push --tags
+```
+
+The `v*` tag triggers [`release.yml`](.github/workflows/release.yml): it
+builds, runs the full suites, and only if everything is green deploys
+`web/dist` to GitHub Pages and creates a GitHub Release carrying
+`vinx-X.Y.Z-site.tar.gz` (the whole site, self-hostable on any static
+host — the build uses relative paths, so any subdirectory works) and
+`vinx-vm-images-X.Y.Z.tar.gz` (the `bzImage` + `rootfs.img` pair, for
+comparing against your own Buildroot output). The live site therefore always
+corresponds to a named tag; to roll back, re-run the release workflow from an
+older tag. Forks get all of this as-is after enabling Pages (repo Settings →
+Pages → Source: GitHub Actions).
+
+## Upstream
+
+The agent engine and chat UI under [`web/vendor/`](web/vendor) are a **fork**
+of `agent-core` (fork point recorded in
+[`web/vendor/VENDOR.json`](web/vendor/VENDOR.json)), edited directly like any
+other code in this repository — there is no sync script and no patch layer.
+See [`web/docs/UPSTREAM.md`](web/docs/UPSTREAM.md) for the fork's history,
+what was taken, and what is reimplemented for the browser.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Forked code under `web/vendor/` carries its
+upstream terms.

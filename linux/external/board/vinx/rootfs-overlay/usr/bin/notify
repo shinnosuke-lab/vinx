@@ -1,0 +1,11 @@
+#!/bin/sh
+# notify MESSAGE... -- a browser notification, for when a long job finishes.
+#
+# Rides the same private OSC as open(1); the page shows a system notification
+# when permission is granted and falls back to its corner toast otherwise.
+# Console-only, like its siblings: run_shell output is not OSC-parsed.
+. /usr/lib/vinx.sh
+
+[ $# -ge 1 ] || { echo 'usage: notify MESSAGE...' >&2; exit 2; }
+
+printf '\033]7770;notify;%s\a\n' "$(vm_b64s "$*")"

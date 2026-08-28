@@ -1,0 +1,170 @@
+/*
+ * The run_shell card (run-shell-tool.tsx).
+ *
+ * Its own prefixed classes rather than the vendored UI's Tailwind utilities:
+ * that stylesheet only contains the classes the vendored sources use, so a
+ * utility borrowed from over there works until an upstream refactor stops
+ * using it. The semantic `--color-*` variables are the stable surface — they
+ * are what the theme prop and dark mode are defined in terms of.
+ */
+
+.rp-tool {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin-top: 4px;
+	padding-bottom: 4px;
+}
+
+.rp-block {
+	overflow: hidden;
+	border: 1px solid var(--color-border);
+	border-radius: 6px;
+	background: var(--color-muted);
+}
+
+.rp-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 3px 4px 3px 10px;
+	border-bottom: 1px solid var(--color-border);
+	font-size: 10px;
+	letter-spacing: 0.05em;
+	color: var(--color-muted-foreground);
+}
+
+.rp-title {
+	text-transform: uppercase;
+	font-weight: 500;
+}
+
+.rp-dim {
+	opacity: 0.6;
+	text-transform: none;
+}
+
+.rp-actions {
+	display: flex;
+	gap: 2px;
+}
+
+.rp-btn {
+	display: inline-flex;
+	align-items: center;
+	padding: 4px;
+	border: 0;
+	border-radius: 4px;
+	background: transparent;
+	color: var(--color-muted-foreground);
+	cursor: pointer;
+}
+
+.rp-btn:hover {
+	background: var(--color-border);
+	color: var(--color-foreground);
+}
+
+.rp-code,
+.rp-out,
+.rp-err {
+	margin: 0;
+	padding: 8px 10px;
+	max-height: 320px;
+	overflow: auto;
+	font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+	font-size: 11px;
+	line-height: 1.6;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.rp-code {
+	color: var(--color-foreground);
+}
+
+.rp-prompt {
+	color: var(--color-primary);
+	user-select: none;
+}
+
+.rp-out {
+	color: var(--color-muted-foreground);
+}
+
+.rp-err {
+	color: var(--color-destructive);
+}
+
+.rp-err-title {
+	color: var(--color-destructive);
+}
+
+.rp-note {
+	padding: 2px 10px 6px;
+	font-size: 10px;
+	color: var(--color-muted-foreground);
+	opacity: 0.7;
+}
+
+/* A non-zero exit rides in the header; make it read as a signal, not decor. */
+.rp-exit {
+	color: var(--color-destructive);
+	text-transform: none;
+}
+
+/* Paths in headers can be long; keep the header one line. */
+.rp-subject {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	max-width: 60%;
+	display: inline-block;
+	vertical-align: bottom;
+}
+
+/* "N more lines" under a folded output. */
+.rp-more {
+	display: block;
+	width: 100%;
+	padding: 3px 10px 5px;
+	border: 0;
+	border-top: 1px dashed var(--color-border);
+	background: transparent;
+	color: var(--color-muted-foreground);
+	font-size: 10px;
+	text-align: left;
+	cursor: pointer;
+}
+
+.rp-more:hover {
+	color: var(--color-foreground);
+}
+
+/* edit_file's before/after: the old text struck in red, the new in green. */
+.rp-diff-old,
+.rp-diff-new {
+	margin: 0;
+	padding: 6px 10px;
+	max-height: 200px;
+	overflow: auto;
+	font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+	font-size: 11px;
+	line-height: 1.6;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.rp-diff-old {
+	color: var(--color-destructive);
+	background: color-mix(in srgb, var(--color-destructive) 8%, transparent);
+	text-decoration: line-through;
+	text-decoration-color: color-mix(in srgb, var(--color-destructive) 50%, transparent);
+}
+
+.rp-diff-new {
+	color: var(--color-success, #9ece6a);
+	background: color-mix(in srgb, #9ece6a 8%, transparent);
+	border-top: 1px dashed var(--color-border);
+}

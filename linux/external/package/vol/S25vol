@@ -1,0 +1,7 @@
+#!/bin/sh
+# ALSA brings the sound card up muted and nothing else in this image would
+# ever unmute it; one turn of the knob at boot is the whole "restore".
+case "$1" in
+stop) ;;
+*) /usr/bin/vol 100 > /dev/null 2>&1 || true ;;
+esac

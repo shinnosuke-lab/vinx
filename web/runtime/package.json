@@ -1,0 +1,21 @@
+{
+	"name": "@vinx/agent-web",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "agent-core's engine in a browser tab: worker host, RPC client, fetch shim",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"scripts": {
+		"build:wasm": "cd ../crates/agent-web-core && wasm-pack build --mode no-install --release --target web --out-dir ../../runtime/pkg --features sqlite",
+		"build": "npm run build:wasm && vite build",
+		"typecheck": "tsc --noEmit && tsc --noEmit -p test",
+		"test": "vitest run"
+	},
+	"devDependencies": {
+		"@types/node": "^22",
+		"typescript": "^5.9.3",
+		"vite": "^7.0.4",
+		"vitest": "^3.2.4"
+	}
+}

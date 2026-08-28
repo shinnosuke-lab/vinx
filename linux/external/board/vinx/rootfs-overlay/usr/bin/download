@@ -1,0 +1,18 @@
+#!/bin/sh
+# download FILE... -- save a file from this VM to the person's machine.
+#
+# The same OSC 1337 File sequence imgcat(1) sends, but inline=0, which is
+# iTerm2's "download this" disposition; the page catches it and triggers a
+# browser download. See also open(1), which lets the browser decide.
+. /usr/lib/vinx.sh
+
+[ $# -ge 1 ] || { echo 'usage: download FILE...' >&2; exit 2; }
+
+rc=0
+for f in "$@"; do
+	vm_file_ok download "$f" || { rc=1; continue; }
+	printf '\033]1337;File=name=%s;size=%s;inline=0:%s\a\n' \
+		"$(vm_b64s "$(basename "$f")")" "$(wc -c < "$f")" "$(vm_b64 "$f")"
+	echo "download: sent $f to the browser"
+done
+exit $rc

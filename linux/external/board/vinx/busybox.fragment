@@ -1,0 +1,44 @@
+# Applied on top of Buildroot's default busybox config.
+#
+# timeout(1) is what agentd bounds each command's wall-clock with; the default
+# busybox config leaves it out, and without it agentd would need a watchdog
+# subprocess (which leaks a sleep and risks killing a reused PID).
+CONFIG_TIMEOUT=y
+
+# nc(1), with listen (-l) and the extras (-p, -e): the natural tool for the
+# inbrowser LAN demo -- run a listener in one terminal tab and connect from
+# another. The default busybox config leaves nc out entirely.
+CONFIG_NC=y
+CONFIG_NC_SERVER=y
+CONFIG_NC_EXTRA=y
+
+# UTF-8 everywhere. musl is unconditionally UTF-8, but busybox's own line
+# editor and `ls` count bytes as columns unless this is on -- CJK input
+# misplaces the cursor and CJK filenames print as `???`. USING_LOCALE off
+# (with the env check also off) hard-wires Unicode on, no LANG needed.
+# LAST_SUPPORTED_WCHAR=0 means "the full table" (unicode.h clamps it to
+# 0x2ffff); WIDE and COMBINING make wcwidth right for CJK and accents.
+# The tables cost a few KB gzipped on a ~6 MB initramfs.
+CONFIG_UNICODE_SUPPORT=y
+# CONFIG_UNICODE_USING_LOCALE is not set
+# CONFIG_FEATURE_CHECK_UNICODE_IN_ENV is not set
+CONFIG_SUBST_WCHAR=63
+CONFIG_LAST_SUPPORTED_WCHAR=0
+CONFIG_UNICODE_COMBINING_WCHARS=y
+CONFIG_UNICODE_WIDE_WCHARS=y
+
+# vi is the real vim (BR2_PACKAGE_VIM; the overlay symlinks vi -> vim).
+# busybox's vi draws by bytes, not display cells, and shears CJK text; with
+# the applet off, `vi` cannot fall through to it.
+# CONFIG_VI is not set
+
+# microcom(1): the interactive end of the Web Serial pass-through. The page
+# can wire a real device (Arduino, USB adapter) to /dev/ttyS2, and microcom
+# is how a person talks to it from the console. Left out of the default
+# busybox config.
+CONFIG_MICROCOM=y
+
+# flock(1) serialises hostcall callers (js(1)/fetch(1) on /dev/ttyS3, see
+# /usr/lib/hostcall.sh): two CALLs in flight would interleave their DONE
+# reads. Not in the default busybox config, same story as timeout above.
+CONFIG_FLOCK=y

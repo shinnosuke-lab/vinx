@@ -1,0 +1,765 @@
+/*
+ * Self-contained styling for @vinx/agent-chat.
+ *
+ * Strategy (Tailwind v4): pull in only the `theme` (CSS variables) and
+ * `utilities` layers — NOT preflight — so the library never resets the host's
+ * base styles. Components keep their Tailwind class names; `@source` scans the
+ * library source so only used utilities are emitted.
+ *
+ * Theming: semantic colors are CSS variables. The `.acc-root` wrapper lets a
+ * host override them via the `theme` prop (mapped to `--acc-*`), cascading into
+ * every Tailwind color utility (`bg-primary`, `text-muted-foreground`, ...).
+ */
+
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+@source "./";
+
+/* Class-based dark mode (keys off a `.dark` ancestor, matching common hosts). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Scoped form-control reset ──
+   theme.css intentionally omits Tailwind's global preflight so the library never
+   touches the host's base styles. The trade-off is that raw <button>/<input>/
+   <select> inside the widget fall back to native UA chrome (gray borders +
+   `buttonface` fills) — the boxed look around the nav items. Re-apply just the
+   control normalization, scoped to the library's own `.acc-root` subtree, so the
+   host's base styles stay untouched. Utility classes still win (the `utilities`
+   layer ranks above `base`), so intentional `border`/`rounded`/`bg-*`/`px-*`
+   stay intact. */
+@layer base {
+  /* Restore border-box inside the library subtree. theme.css skips Tailwind's
+     preflight (to leave the host's base styles untouched), but preflight is also
+     what sets the global `box-sizing: border-box`. Without it, `.acc-root`
+     controls fall back to `content-box`, so a fixed `h-9` input gets inflated by
+     its padding + border (~50px instead of 36px). Re-apply just the box-sizing
+     reset, scoped to `.acc-root`, matching what preflight would have set. */
+  .acc-root,
+  .acc-root *,
+  .acc-root *::before,
+  .acc-root *::after {
+    box-sizing: border-box;
+  }
+  /* Default border color, same intent as Tailwind's v3-compat snippet: v4's
+     bare `border` utility sets width/style only, so the color falls back to
+     `currentColor` (≈ black in light mode, white in dark) on the tool cards
+     that don't pin a `border-*` color. Base layer ranks below utilities, so
+     explicit `border-border/60` etc. keep winning. */
+  .acc-root,
+  .acc-root *,
+  .acc-root *::before,
+  .acc-root *::after {
+    border-color: var(--color-border);
+  }
+  .acc-root :is(button, input, select, textarea, optgroup) {
+    font: inherit;
+    color: inherit;
+    background-color: transparent;
+    /* Color spelled out: the shorthand would reset it to `currentColor`, and
+       this `:is()` selector outranks the `.acc-root *` default above. */
+    border: 0 solid var(--color-border);
+    border-radius: 0;
+  }
+  .acc-root button {
+    padding: 0;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+  }
+  .acc-root button:disabled {
+    cursor: default;
+  }
+  /* Anchors, same as preflight: without this, action rows rendered as <a>
+     (e.g. the skill export row) pick up the UA's blue underlined link style.
+     `.markdown-body a` (unlayered) still opts prose links back in. */
+  .acc-root a {
+    color: inherit;
+    text-decoration: inherit;
+  }
+  /* Block-level margin reset, same as preflight: components were written
+     against it (e.g. the session-card <h3> title picked up ~11px UA margins,
+     inflating the row to ~37px). Prose stays intact: `.markdown-body h1..h6 /
+     p / ul / ...` rules are unlayered and set explicit margins, so they win
+     over this `base` layer. */
+  .acc-root :is(h1, h2, h3, h4, h5, h6, p, ol, ul, blockquote, pre, figure, dl, dd) {
+    margin: 0;
+  }
+  .acc-root :is(ol, ul) {
+    list-style: none;
+    padding: 0;
+  }
+}
+
+/* ── Custom checkbox checkmark / indeterminate (scoped) ──
+   `appearance-none` checkboxes get their fill from utilities (`checked:bg-primary`),
+   but the glyph is a background image. Scoped to `.acc-root` so it never touches
+   host checkboxes. Unlayered so it wins over the utilities layer. */
+.acc-root input[type="checkbox"].appearance-none:checked {
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='white' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M12.207 4.793a1 1 0 0 1 0 1.414l-5 5a1 1 0 0 1-1.414 0l-2.5-2.5a1 1 0 0 1 1.414-1.414L6.5 9.086l4.293-4.293a1 1 0 0 1 1.414 0z'/%3E%3C/svg%3E");
+  background-size: 100% 100%;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+.acc-root input[type="checkbox"].appearance-none:indeterminate {
+  background-color: var(--color-primary);
+  border-color: var(--color-primary);
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 16 16' fill='white' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='3' y='7' width='10' height='2' rx='1'/%3E%3C/svg%3E");
+  background-size: 100% 100%;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+/* ── Thin themed scrollbars + font smoothing (scoped) ── */
+.acc-root {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.acc-root ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.acc-root ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.acc-root ::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+.acc-root ::-webkit-scrollbar-thumb:hover {
+  background: var(--color-muted-foreground);
+}
+
+/* ── Scroll-on-hover (scoped) ──
+   Aligned with OnTrakBridge (the gateway host app this agent ships beside):
+   the thumb is always visible — same 6px track/thumb as the global rule —
+   with a stable gutter so layout never shifts. The class is kept for call
+   sites; it now only adds the gutter reservation. */
+.acc-root .scroll-on-hover {
+  scrollbar-gutter: stable;
+}
+
+/* ── Entrance fade (OnTrakBridge parity) ── */
+@keyframes acc-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.acc-root .animate-fade-in {
+  animation: acc-fade-in 0.3s ease-out;
+}
+
+/* ── Drawer slide-in (narrow-viewport overlay panels) ── */
+@keyframes acc-slide-in-left {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.acc-root .animate-slide-in-left {
+  animation: acc-slide-in-left 0.2s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .acc-root .animate-slide-in-left {
+    animation: none;
+  }
+}
+
+/* ── Attention pulse (skills: nudge toward the online repository tab) ── */
+@keyframes acc-attention-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.3;
+    transform: scale(0.65);
+  }
+}
+
+.acc-root .animate-attention-pulse {
+  animation: acc-attention-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .acc-root .animate-attention-pulse {
+    animation: none;
+  }
+}
+
+/* ── Top-right notification entrance ── */
+@keyframes acc-toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+.acc-root .animate-toast-in {
+  animation: acc-toast-in 0.2s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .acc-root .animate-toast-in {
+    animation: none;
+  }
+}
+
+/* ── Thin scrollbar variant (popovers / small panels) ──
+   Mirrors OnTrakBridge's `.scrollbar-thin`: width only; track/thumb inherit
+   the global rules. Deliberately NOT the standard `scrollbar-width` property —
+   it flips Chromium back to default scrollbars (dark background), breaking the
+   custom styling. */
+.acc-root .scrollbar-thin::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+@theme {
+  /* System font stacks only: no webfont is bundled (gateways run offline), so
+     naming unbundled families like Inter would silently fall through anyway. */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
+
+  /* The Vinx default look: copper-amber brand color (the mascot badge's
+     disc, dark enough for white text at ~4.6:1) over warm paper neutrals.
+     Hosts still override everything via the `theme` prop / `--acc-*`. */
+  --color-border: hsl(33 22% 89%);
+  --color-input: hsl(33 22% 89%);
+  --color-ring: hsl(27 75% 40%);
+
+  --color-background: hsl(40 33% 99%);
+  --color-foreground: hsl(24 30% 10%);
+
+  --color-primary: hsl(27 75% 40%);
+  --color-primary-foreground: hsl(0 0% 100%);
+
+  --color-secondary: hsl(36 24% 95%);
+  --color-secondary-foreground: hsl(27 12% 44%);
+
+  --color-muted: hsl(36 24% 95%);
+  --color-muted-foreground: hsl(27 12% 44%);
+
+  --color-accent: hsl(36 24% 95%);
+  --color-accent-foreground: hsl(24 30% 10%);
+
+  --color-destructive: hsl(0 84% 60%);
+  --color-destructive-foreground: hsl(0 0% 100%);
+
+  --color-success: hsl(142 71% 45%);
+  --color-success-foreground: hsl(0 0% 100%);
+
+  --color-warning: hsl(38 92% 50%);
+  --color-warning-foreground: hsl(0 0% 100%);
+
+  --color-card: hsl(40 33% 99%);
+  --color-card-foreground: hsl(24 30% 10%);
+
+  --color-popover: hsl(40 33% 99%);
+  --color-popover-foreground: hsl(24 30% 10%);
+
+  --color-sidebar: hsl(37 26% 96%);
+  --color-sidebar-foreground: hsl(24 30% 10%);
+  --color-sidebar-border: hsl(33 22% 89%);
+  --color-sidebar-accent: hsl(27 75% 40%);
+  --color-sidebar-muted: hsl(27 12% 44%);
+
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+}
+
+/* ── Scoped theming root ──
+   Maps host overrides (`--acc-*`, set inline by the `theme` prop) onto the
+   semantic color variables. Unset overrides fall back to the @theme defaults. */
+.acc-root {
+  --color-primary: var(--acc-accent, hsl(27 75% 40%));
+  /* Focus rings track the brand color too (a configured accent would
+     otherwise leave stale default-copper outlines behind). */
+  --color-ring: var(--acc-accent, hsl(27 75% 40%));
+  --color-background: var(--acc-bg, hsl(40 33% 99%));
+  --color-foreground: var(--acc-fg, hsl(24 30% 10%));
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+}
+
+/* Dark: warm charcoal under the same copper-amber brand, one notch brighter
+   so it carries on the dark ground. */
+.acc-root.dark,
+.dark .acc-root {
+  --color-border: hsl(26 14% 20%);
+  --color-input: hsl(26 14% 20%);
+  --color-ring: var(--acc-accent, hsl(30 75% 46%));
+  --color-background: var(--acc-bg, hsl(24 12% 9%));
+  --color-foreground: var(--acc-fg, hsl(36 30% 96%));
+  --color-primary: var(--acc-accent, hsl(30 75% 46%));
+  --color-secondary: hsl(25 12% 16%);
+  --color-secondary-foreground: hsl(33 15% 78%);
+  --color-muted: hsl(25 12% 16%);
+  --color-muted-foreground: hsl(30 10% 62%);
+  --color-accent: hsl(25 12% 16%);
+  --color-accent-foreground: hsl(36 30% 96%);
+  --color-card: hsl(24 12% 9%);
+  --color-card-foreground: hsl(36 30% 96%);
+  --color-popover: hsl(24 12% 9%);
+  --color-popover-foreground: hsl(36 30% 96%);
+  --color-sidebar: hsl(24 14% 8%);
+  --color-sidebar-foreground: hsl(36 30% 96%);
+  --color-sidebar-border: hsl(26 14% 20%);
+  --color-sidebar-accent: hsl(35 88% 58%);
+  --color-sidebar-muted: hsl(30 10% 62%);
+}
+
+/* ── Streaming border animation ── */
+
+@property --border-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes acc-border-flow {
+  from { --border-angle: 0deg; }
+  to { --border-angle: 360deg; }
+}
+
+.streaming-border {
+  position: relative;
+  border-color: transparent;
+  overflow: visible;
+}
+
+.streaming-border::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: conic-gradient(
+    from var(--border-angle),
+    var(--color-primary) 0%,
+    var(--color-primary) 30%,
+    var(--color-border) 45%,
+    var(--color-border) 55%,
+    var(--color-primary) 70%,
+    var(--color-primary) 100%
+  );
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: acc-border-flow 2.5s linear infinite;
+  pointer-events: none;
+}
+
+/* ── Markdown body typography ── */
+
+.markdown-body {
+  line-height: 1.6;
+  word-wrap: break-word;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  margin-top: 1.25em;
+  margin-bottom: 0.5em;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.markdown-body h1 { font-size: 1.5em; }
+.markdown-body h2 { font-size: 1.25em; }
+.markdown-body h3 { font-size: 1.125em; }
+.markdown-body h4 { font-size: 1em; }
+
+.markdown-body > *:first-child { margin-top: 0; }
+
+.markdown-body p { margin: 0.5em 0; }
+
+.markdown-body ul {
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+  list-style-type: disc;
+}
+
+.markdown-body ol {
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+  list-style-type: decimal;
+}
+
+.markdown-body ul ul { list-style-type: circle; }
+.markdown-body ul ul ul { list-style-type: square; }
+.markdown-body ol ol { list-style-type: lower-alpha; }
+
+.markdown-body li { margin: 0.25em 0; display: list-item; }
+.markdown-body li > p { margin: 0.25em 0; }
+
+.markdown-body blockquote {
+  border-left: 3px solid var(--color-primary);
+  padding-left: 1em;
+  margin: 0.75em 0;
+  color: var(--color-muted-foreground);
+}
+
+.markdown-body a {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-body pre {
+  margin: 0.75em 0;
+  padding: 0.75em 1em;
+  border-radius: var(--radius-md);
+  overflow-x: auto;
+  font-size: 0.8125em;
+  line-height: 1.6;
+  font-family: var(--font-mono);
+  background: var(--color-muted);
+  color: var(--color-foreground);
+}
+
+.markdown-body :not(pre) > code {
+  padding: 0.15em 0.4em;
+  border-radius: var(--radius-sm);
+  font-size: 0.85em;
+  font-family: var(--font-mono);
+  background: var(--color-muted);
+}
+
+.markdown-body .md-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 0.75em 0;
+}
+
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0;
+  font-size: 0.875em;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid var(--color-border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+}
+
+.markdown-body th { font-weight: 600; background: var(--color-muted); }
+
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--color-border);
+  margin: 1em 0;
+}
+
+.markdown-body img { max-width: 100%; border-radius: var(--radius-md); }
+
+/* ── Code highlight – light (GitHub Light) ── */
+
+.hljs-comment, .hljs-quote { color: #6a737d; }
+.hljs-keyword, .hljs-selector-tag { color: #d73a49; }
+.hljs-string, .hljs-doctag { color: #032f62; }
+.hljs-number, .hljs-literal { color: #005cc5; }
+.hljs-title, .hljs-section { color: #6f42c1; }
+.hljs-built_in { color: #005cc5; }
+.hljs-type, .hljs-params { color: #005cc5; }
+.hljs-attr, .hljs-attribute { color: #005cc5; }
+.hljs-meta { color: #005cc5; }
+.hljs-addition { color: #22863a; background: #f0fff4; }
+.hljs-deletion { color: #b31d28; background: #ffeef0; }
+.hljs-variable { color: #e36209; }
+.hljs-name { color: #22863a; }
+.hljs-regexp { color: #032f62; }
+.hljs-symbol { color: #005cc5; }
+.hljs-selector-class, .hljs-selector-id { color: #6f42c1; }
+
+/* ── Code highlight – dark ──
+   pre/code/th surfaces intentionally omitted here: they use var(--color-muted)
+   / var(--color-foreground), which already resolve to the dark palette under
+   `.dark` and stay overridable by set_chat_style themes. Only syntax token
+   colors (fixed GitHub Dark palette) are pinned below. */
+
+.dark .hljs-comment, .dark .hljs-quote { color: #8b949e; }
+.dark .hljs-keyword, .dark .hljs-selector-tag { color: #ff7b72; }
+.dark .hljs-string, .dark .hljs-doctag { color: #a5d6ff; }
+.dark .hljs-number, .dark .hljs-literal { color: #79c0ff; }
+.dark .hljs-title, .dark .hljs-section { color: #d2a8ff; }
+.dark .hljs-built_in { color: #ffa657; }
+.dark .hljs-type, .dark .hljs-params { color: #79c0ff; }
+.dark .hljs-attr, .dark .hljs-attribute { color: #79c0ff; }
+.dark .hljs-meta { color: #79c0ff; }
+.dark .hljs-addition { color: #aff5b4; background: transparent; }
+.dark .hljs-deletion { color: #ffdcd7; background: transparent; }
+.dark .hljs-variable { color: #ffa657; }
+.dark .hljs-name { color: #7ee787; }
+.dark .hljs-regexp { color: #a5d6ff; }
+.dark .hljs-symbol { color: #79c0ff; }
+.dark .hljs-selector-class, .dark .hljs-selector-id { color: #d2a8ff; }
+
+/* ── Pre wrapper: transparent when containing custom code/mermaid blocks ── */
+
+.markdown-body pre:has(> .code-block-wrapper),
+.markdown-body pre:has(> .mermaid-container) {
+  display: contents;
+}
+
+/* ── Code block wrapper ── */
+
+.code-block-wrapper {
+  margin: 0.75em 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem 0.25rem 0.75rem;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-secondary);
+}
+
+.code-block-lang {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.code-block-lang .lang-icon { width: 14px; height: 14px; flex-shrink: 0; }
+
+.code-block-actions { display: flex; gap: 2px; }
+
+.code-toolbar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: transparent;
+  color: var(--color-muted-foreground);
+  cursor: pointer;
+  transition: color 150ms, background-color 150ms, transform 100ms;
+  padding: 0;
+}
+
+.code-toolbar-btn:hover { color: var(--color-foreground); background: var(--color-accent); }
+.code-toolbar-btn:active { transform: scale(0.9); background: var(--color-accent); }
+
+.markdown-body .code-block-body {
+  margin: 0;
+  border-radius: 0;
+  max-height: 400px;
+  overflow: auto;
+}
+
+/* Compact markdown variant used inside the reasoning block. */
+.reasoning-markdown .markdown-body { font-size: 0.75rem; line-height: 1.55; }
+.reasoning-markdown .markdown-body h1,
+.reasoning-markdown .markdown-body h2,
+.reasoning-markdown .markdown-body h3,
+.reasoning-markdown .markdown-body h4,
+.reasoning-markdown .markdown-body h5,
+.reasoning-markdown .markdown-body h6 {
+  font-size: 1em;
+  margin: 0.4em 0 0.2em;
+  font-weight: 600;
+  color: inherit;
+}
+.reasoning-markdown .markdown-body p,
+.reasoning-markdown .markdown-body ul,
+.reasoning-markdown .markdown-body ol,
+.reasoning-markdown .markdown-body blockquote { margin: 0.35em 0; }
+.reasoning-markdown .markdown-body .code-block-body { max-height: 260px; font-size: 0.75rem; }
+
+/* ── Mermaid diagram ── */
+
+.mermaid-container {
+  position: relative;
+  margin: 0.75em 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-background);
+  overflow: hidden;
+}
+
+.mermaid-toolbar {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  display: flex;
+  gap: 2px;
+  padding: 0.25rem;
+  border-radius: var(--radius-sm);
+  background: var(--color-background);
+  border: 1px solid var(--color-border);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.1);
+  opacity: 0;
+  transition: opacity 150ms;
+  z-index: 10;
+}
+
+.mermaid-container:hover .mermaid-toolbar { opacity: 1; }
+
+/* ── Print to PDF: isolate the transcript ──
+   Hide all chrome (header, history panel, composer, host shell) and let only
+   the scrollable messages region paint full-flow so it paginates cleanly.
+   Triggered by the "PDF" export item via window.print(). */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  [data-chat-messages],
+  [data-chat-messages] * {
+    visibility: visible;
+  }
+  /* Hidden chrome must not contribute document height either: `visibility:
+     hidden` keeps layout boxes, and viewport-sized shell pieces (e.g. the
+     `h-screen` nav rail — 100vh resolves to the full page box in print) push
+     the flow past one page and emit trailing blank pages. Drop every branch
+     that neither contains nor belongs to the transcript from the flow. */
+  html,
+  body {
+    height: auto !important;
+    overflow: visible !important;
+  }
+  body *:not([data-chat-messages]):not(:has([data-chat-messages])):not([data-chat-messages] *) {
+    display: none !important;
+  }
+  /* The transcript's offsets must resolve against the page, not against a
+     positioned ancestor: the chat column sits inside `relative`/`fixed`
+     wrappers that are pushed right of the nav rail / history panel, and hidden
+     chrome keeps its layout box — so the print inherited that horizontal
+     offset (a sidebar-wide blank left margin, growing when expanded). Strip
+     positioning from every ancestor so the page becomes the containing block. */
+  body :has([data-chat-messages]) {
+    position: static !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+  /* top/left only (no `inset: 0`): anchoring bottom would stretch the box to
+     the full page height, which pads the tail of the document into an extra
+     blank page when the content is shorter. */
+  [data-chat-messages] {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+    /* Content inset. `handlePdf` drops the `@page` margin to 0 (so a themed
+       page background can bleed to the paper edge) and moves the breathing
+       room here instead. This 10mm MUST match `PAGE_MARGIN_MM` in
+       `handlePdf`, which sizes the single page around it. */
+    padding: 10mm;
+  }
+  /* Backgrounds and subtle borders (code-block headers, table header fills,
+     blockquote rules) are part of the transcript's look; without exact color
+     printing Chrome drops them and the PDF reads as a different style. */
+  [data-chat-messages],
+  [data-chat-messages] * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  /* The transcript is wrapped in `mx-auto max-w-3xl px-4`, which would center a
+     narrow column and leave a wide left margin on the printed page. Neutralize
+     it so the content block fills the page width with no left indent. */
+  [data-chat-messages] > div {
+    max-width: none !important;
+    margin: 0 !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+  }
+  /* ── Solo message export ──
+     The per-message "Save as PDF" button adds `.print-solo` to the container
+     and `data-print-solo` to the target answer body. Print only that body:
+     drop the session title, every other message row, and — inside the row that
+     holds the target — its siblings (the reasoning block, message actions). The
+     `:has()` guard keeps the target's ancestor row (and thus the target) alive. */
+  [data-chat-messages].print-solo [data-print-title] {
+    display: none !important;
+  }
+  [data-chat-messages].print-solo > div > *:not([data-print-solo]):not(:has([data-print-solo])) {
+    display: none !important;
+  }
+  [data-chat-messages].print-solo > div > * > *:not([data-print-solo]):not(:has([data-print-solo])) {
+    display: none !important;
+  }
+  /* Collapse the spacing around the solo body so the single page height matches
+     the measured body height. `printElementToPdf` sizes the page from the body
+     element alone; the inner column's `pt-6 pb-4`, the message row's top margin,
+     and the body's own `mt-4` (present when a reasoning block precedes it) are
+     not in that measurement, so leaving them would push the content past one
+     page height and spill onto a blank second page. */
+  [data-chat-messages].print-solo > div {
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+  }
+  [data-chat-messages].print-solo > div > * {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+  }
+  [data-chat-messages].print-solo [data-print-solo] {
+    margin: 0 !important;
+  }
+}
+
+/* ── Mobile viewport + safe areas ──
+   `dvh` tracks the *dynamic* viewport (URL bar / keyboard), avoiding the height
+   jump `vh` causes on mobile browsers. The `.acc-root` is `position:fixed;
+   inset:0` in the Copilot shell, so this mainly steadies the standalone
+   AgentChat and iOS Safari. Safe-area utilities inset content out from the
+   notch / home indicator (a no-op inside the Android WebView, which is already
+   padded to the safe area natively). */
+.acc-root {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+@supports (padding: env(safe-area-inset-top)) {
+  .acc-safe-top {
+    padding-top: env(safe-area-inset-top);
+  }
+  .acc-safe-bottom {
+    padding-bottom: max(env(safe-area-inset-bottom), 0px);
+  }
+}

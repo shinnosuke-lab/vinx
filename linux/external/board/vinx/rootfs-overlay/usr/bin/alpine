@@ -1,0 +1,51 @@
+#!/bin/sh
+# alpine -- drop into an Alpine Linux chroot, and with it apk, a real binary
+# package manager with a 32-bit x86 repository (same musl libc as this
+# system).
+#
+# Buildroot has no package feed, so this borrows Alpine's: download the
+# ~3.5 MB minirootfs once, unpack it to /alpine, chroot in. Everything lands
+# in RAM (this machine has no disk) and vanishes with the tab, so keep an eye
+# on free(1) before apk-adding anything heavy.
+#
+# Needs real internet, which only a wisp relay provides -- the default
+# in-browser LAN reaches nothing, and the fetch backend is CORS-bound (the
+# Alpine CDN answers, the browser refuses to show us). The page's network
+# control sets the relay.
+
+ROOT=/alpine
+MIRROR="${ALPINE_MIRROR:-http://dl-cdn.alpinelinux.org/alpine}"
+BRANCH="${ALPINE_BRANCH:-v3.21}"
+
+enter() {
+	grep -q " $ROOT/proc " /proc/mounts || mount -t proc proc "$ROOT/proc"
+	grep -q " $ROOT/sys " /proc/mounts || mount -t sysfs sysfs "$ROOT/sys"
+	grep -q " $ROOT/dev " /proc/mounts || mount -o bind /dev "$ROOT/dev"
+	cp /etc/resolv.conf "$ROOT/etc/resolv.conf" 2>/dev/null
+	echo 'alpine: entering the chroot -- try `apk add vim` (RAM-backed; gone on reload)'
+	exec chroot "$ROOT" /bin/sh -l
+}
+
+[ -x "$ROOT/bin/busybox" ] && enter
+
+echo "alpine: fetching the $BRANCH x86 minirootfs from $MIRROR ..."
+yaml="$MIRROR/$BRANCH/releases/x86/latest-releases.yaml"
+file=$(wget -q -O - "$yaml" 2>/dev/null | sed -n 's/^ *file: *\(alpine-minirootfs-.*\.tar\.gz\)$/\1/p' | head -n 1)
+if [ -z "$file" ]; then
+	cat >&2 <<'EOF'
+alpine: cannot reach the Alpine mirror.
+This needs real internet, which only a relay network gives the VM:
+open the page's network control, set a wisp relay, and run `alpine` again.
+EOF
+	exit 1
+fi
+
+if ! wget -O /tmp/.alpine.tar.gz "$MIRROR/$BRANCH/releases/x86/$file"; then
+	rm -f /tmp/.alpine.tar.gz
+	echo "alpine: download failed" >&2
+	exit 1
+fi
+mkdir -p "$ROOT"
+tar -xzf /tmp/.alpine.tar.gz -C "$ROOT" || { rm -f /tmp/.alpine.tar.gz; exit 1; }
+rm -f /tmp/.alpine.tar.gz
+enter

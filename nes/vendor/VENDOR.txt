@@ -1,0 +1,25 @@
+agnes -- NES emulation library, vendored with one tiny local patch.
+
+upstream:  https://github.com/kgabis/agnes
+commit:    0e4220b084c467e39c04805d955e78c463feadd0 (master, 2025-12-25)
+version:   0.2.0 (AGNES_VERSION_STRING)
+license:   MIT (see LICENSE here)
+files:     agnes.h (byte-identical to upstream)
+           agnes.c (upstream amalgamated build + local APU tap, see below)
+
+Local patch to agnes.c (NOT byte-identical to upstream anymore):
+  Upstream has no APU; the bus dispatcher's APU register branches are empty.
+  We add two hook calls guarded by #ifdef NES_APU, both marked with a
+  "vinx: APU tap" comment:
+    - cpu_write8: $4000-$4017 writes forwarded to nes_apu_reg_write()
+    - cpu_read8:  $4015 reads answered by nes_apu_reg_read_4015()
+  plus the two extern declarations above cpu_write8. The hooks are
+  implemented in ../src/apu.c. Without -DNES_APU the file compiles to the
+  same code as upstream. When updating the vendored copy, reapply this
+  patch (grep for "vinx:").
+
+The core's struct internals (the PPU's screen buffer of palette indices, the
+g_colors palette, cpu_read8/cpu_write8) are reached by compiling agnes.c
+*into* src/core.c with #include rather than linking it separately -- the
+amalgamation marks everything AGNES_INTERNAL=static, so that one translation
+unit sees the internals and nothing leaks out of it.

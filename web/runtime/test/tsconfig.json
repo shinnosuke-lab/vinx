@@ -1,0 +1,12 @@
+{
+	// The tests run under node (vitest), so node's types are honest here --
+	// while the parent config keeps `types: []`, so the browser-bound src/
+	// is still checked without node globals like Buffer leaking in.
+	"extends": "../tsconfig.json",
+	"compilerOptions": {
+		"types": ["node"],
+		"noEmit": true,
+		"declaration": false
+	},
+	"include": ["."]
+}

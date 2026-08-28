@@ -1,0 +1,12 @@
+config BR2_PACKAGE_BTMON
+	bool "btmon"
+	help
+	  bluez's protocol analyzer, alone: the one tool that turns a
+	  btsnoop capture into readable HCI/L2CAP/ATT/SMP traffic
+	  (btmon -r trace.btsnoop). Built straight from the bluez
+	  tarball without configure, so it does not drag in glib2,
+	  dbus or bluetoothd -- a ~400 KB compressed add instead of
+	  ~4 MB. There is no Bluetooth controller in this machine;
+	  offline analysis is the whole point.
+
+	  https://www.bluez.org

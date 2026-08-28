@@ -1,0 +1,7 @@
+" The system vimrc ($VIM/vimrc). The image carries vim without its runtime
+" (no defaults.vim, no syntax files -- ~5 MB saved), so the few settings that
+" defaults.vim would have supplied are named here.
+set nocompatible
+set encoding=utf-8
+set backspace=indent,eol,start
+set viminfo=

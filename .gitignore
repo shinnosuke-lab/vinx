@@ -1,0 +1,29 @@
+# Build outputs -- everything here is regenerated on a fresh checkout:
+#   web/vendor/ui/dist   built by ci.sh / Quick start step 2 ((cd vendor/ui && npm ci && npm run build))
+#   web/runtime/pkg      wasm-pack output (build:wasm); vite.config.ts guards the
+#                        vendor/ui side with an explicit error, ci.sh builds this
+#                        one before typecheck needs its generated types
+#   web/app/gen          build-skill.mjs output (mkdirSync recursive), built by
+#                        every npm run dev / npm run build
+#   web/dist             vite build
+#   web/target           cargo / wasm-pack scratch
+# NOTE: web/app/public/vm is deliberately NOT ignored -- the prebuilt Linux
+# images are an input to npm run dev and are packaged by release.yml.
+web/dist/
+web/target/
+web/app/gen/
+web/runtime/pkg/
+web/vendor/ui/dist/
+
+# Dependencies
+node_modules/
+
+# Build artifact: nes/nes is cc -o nes from nes/Makefile
+nes/nes
+
+# Test runner scratch (screenshots themselves go to $SHOTDIR or /tmp)
+test-results/
+playwright-report/
+
+# OS noise
+.DS_Store

@@ -1,0 +1,15 @@
+config BR2_PACKAGE_TERMBOX2
+	bool "termbox2"
+	depends on BR2_i386
+	help
+	  termbox2 is a single-header terminal UI library: one #include,
+	  a dozen calls (tb_init, tb_print, tb_poll_event), no terminfo
+	  parsing to get wrong -- the API a language model can use
+	  correctly on the first try, and the lightweight alternative to
+	  ncurses (whose headers ship here too, for vim's library).
+	  Header-only: installing termbox2.h into staging is the whole
+	  package; post-build.sh carries it into the target's
+	  /usr/include, where `tcc tui.c` (with #define TB_IMPL) finds
+	  it. ~+30 KB compressed.
+
+	  https://github.com/termbox/termbox2

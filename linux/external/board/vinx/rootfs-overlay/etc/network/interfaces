@@ -1,0 +1,20 @@
+auto lo
+iface lo inet loopback
+
+# eth0 serves every network mode from one config, because the guest cannot
+# tell which v86 backend the page picked:
+#   - Background DHCP: fetch/wisp/wsproxy backends answer it (address +
+#     default route); the inbrowser hub does not, so it fails quietly. `-b`
+#     backgrounds it and `-t 3 -T 1` keeps the boot from stalling on a
+#     backend that never replies. `-A 3` retries a failed round after 3s
+#     instead of busybox's 20: on a wsproxy relay the server's DHCP only
+#     answers once the WebSocket is up, which is usually moments *after*
+#     the boot-time round has already missed.
+#   - A static 10.0.2.x on the inbrowser segment (see inbrowser-ip), so two
+#     VMs can reach each other with no DHCP. Harmless in the other modes.
+auto eth0
+iface eth0 inet manual
+	up ip link set eth0 up
+	up /sbin/udhcpc -b -i eth0 -t 3 -T 1 -A 3 2>/dev/null || true
+	up /usr/sbin/inbrowser-ip
+	down /bin/true

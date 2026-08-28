@@ -1,0 +1,109 @@
+# Applied on top of the kernel's i386 defconfig (see the buildroot defconfig).
+#
+# v86 emulates one CPU on a PC chipset: SMP off buys boot time and image size.
+# PAE is off because 128 MB of guest RAM never needs it and not every emulated
+# CPU path likes it.
+# CONFIG_SMP is not set
+# CONFIG_X86_PAE is not set
+
+# The defconfig's 1000 Hz tick means 1000 fully emulated exception paths a
+# second stolen from whatever the guest is computing (nes at ~100% budget
+# feels every one). 100 Hz drops nine tenths of that; nothing here needs
+# finer scheduling -- the console and 9p are interrupt-driven, not polled.
+CONFIG_HZ_100=y
+CONFIG_HZ=100
+# CONFIG_HZ_1000 is not set
+
+# No loadable modules: whatever the defconfig marked =m disappears rather than
+# landing in the initramfs, which is how the rootfs stays a few megabytes.
+# CONFIG_MODULES is not set
+
+# Two 16550s: ttyS0 is the person's console, ttyS1 is agentd's command
+# channel. v86 emulates up to four; the kernel's default of 4 runtime uarts
+# is made explicit so nobody trims it.
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_NR_UARTS=4
+CONFIG_SERIAL_8250_RUNTIME_UARTS=4
+
+# The NIC v86's fetch/wisp backends present. virtio is the recommended type
+# for modern kernels; ne2k stays in as the fallback the same backends offer
+# (`type: "ne2k"`), so switching sides needs no rebuild.
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_PCI_LEGACY=y
+CONFIG_VIRTIO_NET=y
+CONFIG_NETDEVICES=y
+CONFIG_ETHERNET=y
+CONFIG_NET_VENDOR_8390=y
+CONFIG_NE2K_PCI=y
+
+# The page-side shared directory: v86 exposes a 9p filesystem over virtio,
+# the guest mounts it at /share (see the overlay's inittab). Drag-and-drop
+# uploads and reload-persistence both ride on it.
+CONFIG_NET_9P=y
+CONFIG_NET_9P_VIRTIO=y
+CONFIG_9P_FS=y
+
+# Boot from the cpio the page hands over.
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+
+# Sound: v86 emulates a SoundBlaster 16 at the ISA defaults (0x220, IRQ 5,
+# DMA 1/5), played through the page's AudioContext. ALSA drives it; the OSS
+# emulation is the point -- /dev/dsp lets `cat file.wav > /dev/dsp` make
+# noise with zero userspace (no alsa-utils on a busybox rootfs). PCSPKR digs
+# out the PIT beep for good measure.
+#
+# The card is not PnP: with CONFIG_PNP on, snd_sb16's isapnp parameter
+# defaults to 1 and its legacy ISA probe never runs, so the page's cmdline
+# (web/app/vm.ts) passes snd_sb16.isapnp=0 with the explicit resources.
+CONFIG_ISA=y
+CONFIG_SOUND=y
+CONFIG_SND=y
+CONFIG_SND_OSSEMUL=y
+CONFIG_SND_MIXER_OSS=y
+CONFIG_SND_PCM_OSS=y
+CONFIG_SND_PCM_OSS_PLUGINS=y
+CONFIG_SND_ISA=y
+CONFIG_SND_SB16=y
+CONFIG_INPUT_PCSPKR=y
+# What "CONFIG_SND=y" drags in by default and this machine can never have:
+# PCI/HDA, USB and PCMCIA cards, MIDI sequencing. (OPL3/MPU401 stay -- the
+# SB16 driver selects them.)
+# CONFIG_SND_PCI is not set
+# CONFIG_SND_USB is not set
+# CONFIG_SND_PCMCIA is not set
+# CONFIG_SND_X86 is not set
+# CONFIG_SND_SEQUENCER is not set
+# CONFIG_SND_DRIVERS is not set
+
+# Pointer input: v86 emulates the 8042's AUX port, the page forwards the
+# screen panel's pointer events onto it (web/app/vga-window.tsx), and these
+# make the guest side of that wire explicit rather than inherited from the
+# arch defconfig: psmouse decodes the PS/2 packets, evdev exposes them as
+# /dev/input/eventN (what LVGL reads), mousedev as /dev/input/mice.
+CONFIG_INPUT_EVDEV=y
+CONFIG_INPUT_MOUSEDEV=y
+CONFIG_INPUT_MOUSE=y
+CONFIG_MOUSE_PS2=y
+
+# The VGA head: v86 emulates the Bochs VBE display interface, and DRM_BOCHS
+# is its kernel driver. The fbdev emulation puts /dev/fb0 on top (write
+# pixels, see pixels -- fbdemo(1) does), and fbcon binds the virtual
+# terminals to it, which conveniently forces the modeset at boot so the
+# page's screen panel is live from the start. The serial console stays the
+# console: console=ttyS0 on the cmdline outranks the VTs.
+CONFIG_DRM_BOCHS=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+# The /dev/fb0 node itself: modern kernels split it out of FB_CORE, and its
+# default tracks legacy CONFIG_FB, which this pure-DRM config leaves off --
+# without this line the emulation registers fb0 but no device file appears.
+CONFIG_FB_DEVICE=y
+# The GPUs the defconfig carries and this machine does not have. i915 alone
+# is megabytes of kernel; AGP only existed to feed cards like it.
+# CONFIG_DRM_I915 is not set
+# CONFIG_DRM_VIRTIO_GPU is not set
+# CONFIG_AGP is not set

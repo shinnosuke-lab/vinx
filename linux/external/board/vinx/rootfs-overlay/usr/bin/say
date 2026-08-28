@@ -1,0 +1,10 @@
+#!/bin/sh
+# say TEXT... -- macOS-style: the browser speaks it (speechSynthesis).
+#
+# Same private OSC as open(1) and notify(1); no permission prompt, the voice
+# is whatever the browser's default is.
+. /usr/lib/vinx.sh
+
+[ $# -ge 1 ] || { echo 'usage: say TEXT...' >&2; exit 2; }
+
+printf '\033]7770;say;%s\a\n' "$(vm_b64s "$*")"

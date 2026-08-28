@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.agent.tsbuildinfo",
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noUncheckedSideEffectImports": false,
+    "paths": {
+      "@/*": ["src/*"],
+      "@vinx/agent-chat": ["../../agent-core/ui/src"],
+      "@agentchat/*": ["../../agent-core/ui/src/*"]
+    }
+  },
+  "include": ["agent"]
+}

@@ -1,0 +1,5 @@
+# getrandom 0.3 refuses to pick a backend for wasm32-unknown-unknown on its own
+# (the target has no OS entropy source), so it has to be told to use the browser
+# crypto API. Without this, uuid's v4 generator fails to link.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

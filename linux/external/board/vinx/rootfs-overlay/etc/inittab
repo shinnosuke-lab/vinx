@@ -1,0 +1,49 @@
+# Vinx Linux inittab (busybox init).
+#
+# Two serial lines, two audiences: ttyS0 is the person's console -- no login,
+# straight to a root shell, because the "machine" is a tab they already own.
+# ttyS1 is agentd, the line the page's run_shell tool speaks over; see
+# /usr/sbin/agentd for the protocol.
+#
+# devtmpfs is mounted first, before anything opens /dev/null or the serial
+# nodes -- getty and agentd need /dev/ttyS0 and /dev/ttyS1 to exist. Guarded
+# because some boot paths (v86's initramfs) mount it before init runs; the
+# `[ -e /dev/null ]` probe keeps this idempotent and quiet instead of printing
+# "mounting devtmpfs on /dev failed: Resource busy".
+
+::sysinit:/bin/sh -c '[ -e /dev/null ] || /bin/mount -t devtmpfs devtmpfs /dev'
+::sysinit:/bin/mount -t proc proc /proc
+::sysinit:/bin/mount -t sysfs sysfs /sys
+::sysinit:/bin/mkdir -p /dev/pts /dev/shm
+::sysinit:/bin/mount -t devpts devpts /dev/pts
+::sysinit:/bin/mount -t tmpfs tmpfs /dev/shm
+::sysinit:/bin/mount -t tmpfs tmpfs /tmp
+::sysinit:/bin/mount -t tmpfs tmpfs /run
+# The page's shared directory, a v86 9p filesystem: files dropped on the
+# terminal land here, and the page snapshots it so it survives reloads.
+# Guarded: a page that passes no `filesystem` option (or an old cached wasm)
+# simply leaves /data an empty directory.
+::sysinit:/bin/sh -c 'mkdir -p /data && mount -t 9p -o trans=virtio,version=9p2000.L host9p /data 2>/dev/null || true'
+# The WebRTC bridge and the BLE link live in the page and die with it, but
+# /data persists across reloads: stale status files would make bridge(1)
+# show a room, or ble(1) a device, that no longer exists. This boot starts
+# with neither, so say so. Hostcall overflow files (.hostcall-*) are the
+# same story: normally deleted by the CLI that made them, stranded only by
+# an interrupted call, and meaningless after a reload.
+::sysinit:/bin/rm -f /data/.bridge-status
+::sysinit:/bin/sh -c 'rm -f /data/.ble-* /data/.hostcall-*'
+# ttyS3 is the hostcall line (js(1), fetch(1) -- see /usr/lib/hostcall.sh):
+# raw and silent from the start, so the page's DONE replies are never cooked
+# or echoed back at it. No getty here on purpose; the CLIs own the port.
+::sysinit:/bin/sh -c 'stty -F /dev/ttyS3 raw -echo 2>/dev/null || true'
+::sysinit:/bin/hostname -F /etc/hostname
+::sysinit:/etc/init.d/rcS
+
+# -i: no /etc/issue -- the branding is /etc/profile.d/00-banner.sh, which can
+# do colour and knows the machine's extra commands.
+ttyS0::respawn:/sbin/getty -i -n -l /sbin/console-shell -L ttyS0 115200 vt100
+ttyS1::respawn:/usr/sbin/agentd
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/etc/init.d/rcK
+::shutdown:/bin/umount -a -r

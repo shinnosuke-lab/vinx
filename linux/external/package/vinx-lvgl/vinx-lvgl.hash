@@ -1,0 +1,4 @@
+# sha256 of the GitHub v9.3.0 tag archive, computed locally (tag archives
+# are served with stable bytes for a given commit).
+sha256  4933becfd3603b29158a5d04138139582836ef2bc17beb6c39dccda9cb0d32e7  vinx-lvgl-9.3.0.tar.gz
+sha256  27a80bd36832ab42d35ad60c08b2b230a807a9bc0d58e94ec1531543dc49cbe8  LICENCE.txt
