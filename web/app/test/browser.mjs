@@ -1768,11 +1768,13 @@ test('btmon decodes a btsnoop capture, no bluetoothd anywhere', async (page) => 
 	// Redirected, not straight to the tty: on a terminal btmon opens a pager
 	// whose screen would vanish again before the assertion reads it. The
 	// split grep pattern types as itself, so the joined match can only be
-	// btmon's decode.
+	// btmon's decode. The marker goes last: frameUntil returns on the first
+	// frame that shows it, so anything printed after it may not be on the
+	// screen yet.
 	await frameType(
 		page,
 		frame,
-		"printf 'btsnoop\\0\\0\\0\\0\\1\\0\\0\\3\\352\\0\\0\\0\\4\\0\\0\\0\\4\\0\\0\\0\\2\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\1\\3\\14\\0' > /tmp/t.btsnoop && btmon -r /tmp/t.btsnoop >/tmp/bt.out 2>&1; echo BTMON-RC=$?; grep 'HCI Comm''and' /tmp/bt.out",
+		"printf 'btsnoop\\0\\0\\0\\0\\1\\0\\0\\3\\352\\0\\0\\0\\4\\0\\0\\0\\4\\0\\0\\0\\2\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\1\\3\\14\\0' > /tmp/t.btsnoop && btmon -r /tmp/t.btsnoop >/tmp/bt.out 2>&1; rc=$?; grep 'HCI Comm''and' /tmp/bt.out; echo BTMON-RC=$rc",
 	);
 	const decoded = await frameUntil(frame, (t) => /BTMON-RC=\d/.test(t), 'the btmon run');
 	assert.match(decoded, /BTMON-RC=0/, `btmon exited non-zero:\n${decoded}`);
