@@ -55,11 +55,20 @@ echo "==> Toolchain"
 
 # The container has no nvm and uses the image's node; this is for the case where
 # someone runs the script outside one, the way the other deploy scripts do it.
-export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-if [ -s "$NVM_DIR/nvm.sh" ]; then
-	# shellcheck disable=SC1091
-	. "$NVM_DIR/nvm.sh"
-	nvm use 22 >/dev/null
+# Only when the node already on PATH will not do: a GitHub runner has nvm in
+# $HOME with nothing installed under it and Node 22 from setup-node on PATH --
+# `nvm use 22` there fails, and under set -e that ended the build before it
+# began. nvm.sh itself is not clean under set -u, hence the bracket.
+node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')
+if [ -z "$node_major" ] || [ "$node_major" -lt 20 ]; then
+	export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+	if [ -s "$NVM_DIR/nvm.sh" ]; then
+		set +u
+		# shellcheck disable=SC1091
+		. "$NVM_DIR/nvm.sh"
+		nvm use 22 >/dev/null 2>&1 || true
+		set -u
+	fi
 fi
 
 node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')
@@ -91,7 +100,19 @@ else
 		echo "    ./docker/build-image.sh" >&2
 		exit 1
 	fi
-	install -m 755 "/tmp/$pack/wasm-pack" /usr/local/bin/wasm-pack
+	# /usr/local/bin when this runs as root (the builder image); a GitHub
+	# runner is not root, so there it goes beside cargo's own binaries, which
+	# rustup already put on PATH, or failing that into ~/.local/bin.
+	if [ -w /usr/local/bin ]; then
+		bindir=/usr/local/bin
+	elif [ -d "${CARGO_HOME:-$HOME/.cargo}/bin" ] && [ -w "${CARGO_HOME:-$HOME/.cargo}/bin" ]; then
+		bindir="${CARGO_HOME:-$HOME/.cargo}/bin"
+	else
+		bindir="$HOME/.local/bin"
+		mkdir -p "$bindir"
+	fi
+	case ":$PATH:" in *":$bindir:"*) ;; *) export PATH="$bindir:$PATH" ;; esac
+	install -m 755 "/tmp/$pack/wasm-pack" "$bindir/wasm-pack"
 	wasm-pack --version
 fi
 
