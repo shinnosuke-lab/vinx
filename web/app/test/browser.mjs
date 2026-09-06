@@ -1400,10 +1400,10 @@ test('dropped and guest-created /data files survive a reload', async (page) => {
 		null,
 		{ timeout: 20_000 },
 	);
-	await frameType(page, frame, 'cat /data/hello_drop.txt; echo DROP-READ-DONE');
+	await frameType(page, frame, "cat /data/hello_drop.txt; echo DROP-READ-D''ONE");
 	const dropped = await frameUntil(frame, (t) => t.includes('DROP-READ-DONE'), 'the drop read');
 	assert.match(dropped, /drop-body/, 'the dropped bytes did not reach the guest');
-	await frameType(page, frame, 'ls /data && cat /data/中文名.txt; echo CJK-DROP-DONE');
+	await frameType(page, frame, "ls /data && cat /data/中文名.txt; echo CJK-DROP-D''ONE");
 	const cjk = await frameUntil(frame, (t) => t.includes('CJK-DROP-DONE'), 'the CJK drop read');
 	assert.match(cjk, /中文名\.txt/, 'ls did not show the Chinese name as dropped');
 	assert.match(cjk, /cjk-body/, 'the Chinese-named file did not read back');
@@ -1427,7 +1427,7 @@ test('dropped and guest-created /data files survive a reload', async (page) => {
 		null,
 		{ timeout: 20_000 },
 	);
-	await frameType(page, frame, 'ls /data; echo CJK-DROP-LS-DONE');
+	await frameType(page, frame, "ls /data; echo CJK-DROP-LS-D''ONE");
 	const cjkListed = await frameUntil(frame, (t) => t.includes('CJK-DROP-LS-DONE'), 'the CJK ls');
 	assert.match(cjkListed, /中文名\.txt/, 'the Chinese filename was flattened on the way in');
 
@@ -1484,7 +1484,7 @@ test('dropped and guest-created /data files survive a reload', async (page) => {
 	await frameType(
 		page,
 		frame,
-		'printf "<%s><%s><%s>\\n" "$(cat /data/hello_drop.txt)" "$(cat /data/guest.txt)" "$(cat /data/中文名.txt)"; echo SHARE-RESTORE-DONE',
+		'printf "<%s><%s><%s>\\n" "$(cat /data/hello_drop.txt)" "$(cat /data/guest.txt)" "$(cat /data/中文名.txt)"; echo SHARE-RESTORE-D\'\'ONE',
 	);
 	const restored = await frameUntil(
 		frame,
@@ -1498,7 +1498,7 @@ test('dropped and guest-created /data files survive a reload', async (page) => {
 	);
 
 	// Running the script (not just reading it) proves the exec bit came back.
-	await frameType(page, frame, '/data/run.sh; echo EXEC-CHECK-DONE');
+	await frameType(page, frame, "/data/run.sh; echo EXEC-CHECK-D''ONE");
 	const rerun = await frameUntil(frame, (t) => t.includes('EXEC-CHECK-DONE'), 'the script run');
 	assert.match(rerun, /EXEC-STILL-RUNS/, 'the exec bit did not survive reload');
 
@@ -1521,34 +1521,50 @@ test('a second machine splits in: isolated files, one LAN', async (page) => {
 	const one = await paneFrame(page);
 	await vmReady(one);
 	await page.click('.actions button[title*="Split right"]');
-	const two = await paneFrame(page, '2');
-	await vmReady(two);
+	try {
+		const two = await paneFrame(page, '2');
+		await vmReady(two);
 
-	// Separate machines: a file in one does not exist in the other.
-	await frameType(page, one, 'touch /tmp/only-in-1; echo T1-DONE');
-	await frameUntil(one, (t) => t.includes('T1-DONE'), 'the touch');
-	await frameType(page, two, 'ls /tmp/only-in-1 2>&1; echo LS-DONE');
-	const isolation = await frameUntil(two, (t) => t.includes('LS-DONE'), 'the ls');
-	assert.match(isolation, /No such file/, 'pane 2 saw pane 1 filesystem');
+		// Separate machines: a file in one does not exist in the other.
+		await frameType(page, one, "touch /tmp/only-in-1; echo T1-D''ONE");
+		await frameUntil(one, (t) => t.includes('T1-DONE'), 'the touch');
+		await frameType(page, two, "ls /tmp/only-in-1 2>&1; echo LS-D''ONE");
+		const isolation = await frameUntil(two, (t) => t.includes('LS-DONE'), 'the ls');
+		assert.match(isolation, /No such file/, 'pane 2 saw pane 1 filesystem');
 
-	// One LAN: machine 1 pings machine 2's derived address for real.
-	await frameType(page, two, 'cat /run/inbrowser-host; echo IP-DONE');
-	const ipScreen = await frameUntil(two, (t) => t.includes('IP-DONE'), 'the host number');
-	const host = ipScreen.match(/\n(\d{1,3})\s*\nIP-DONE/)?.[1];
-	assert.ok(host, `no inbrowser host number on screen:\n${ipScreen}`);
-	await frameType(page, one, `ping -c 1 -W 3 10.0.2.${host}; echo PING-DONE`);
-	const pinged = await frameUntil(one, (t) => t.includes('PING-DONE'), 'the ping');
-	assert.match(pinged, /1 packets received/, 'the two machines did not reach each other');
-
-	// Close machine 2 so later reloads of this page boot one VM, not two.
-	await page
-		.locator('.shell-frame', { has: page.locator('iframe[name="pane-2"]') })
-		.locator('.frame-close')
-		.click();
-	await page.waitForSelector('iframe[name="pane-2"]', {
-		state: 'detached',
-		timeout: 5_000,
-	});
+		// One LAN: machine 1 pings machine 2's derived address for real. The
+		// claim is reachability, not latency: both machines share one thread
+		// and machine 2 is still finishing its boot, so on a slow host (a CI
+		// runner) the first ARP round trip can outlast one ping's 3 s wait.
+		// Retry for up to ~30 s before calling the segment broken.
+		await frameType(page, two, "cat /run/inbrowser-host; echo IP-D''ONE");
+		const ipScreen = await frameUntil(two, (t) => t.includes('IP-DONE'), 'the host number');
+		const host = ipScreen.match(/\n(\d{1,3})\s*\nIP-DONE/)?.[1];
+		assert.ok(host, `no inbrowser host number on screen:\n${ipScreen}`);
+		await frameType(
+			page,
+			one,
+			`i=0; while [ $i -lt 10 ] && ! ping -c 1 -W 3 10.0.2.${host} >/tmp/ping.out 2>&1; do i=$((i+1)); done; tail -2 /tmp/ping.out; echo "tries=$i"; echo PING-D''ONE`,
+		);
+		const pinged = await frameUntil(one, (t) => t.includes('PING-DONE'), 'the ping');
+		assert.match(
+			pinged,
+			/1 packets received/,
+			`the two machines did not reach each other; machine 1's screen:\n${pinged}`,
+		);
+	} finally {
+		// Close machine 2 so later reloads of this page boot one VM, not two —
+		// also when an assertion above failed, or every later test that
+		// expects a single pane would fail after it.
+		const frame2 = page.locator('.shell-frame', { has: page.locator('iframe[name="pane-2"]') });
+		if (await frame2.count()) {
+			await frame2.locator('.frame-close').click();
+			await page.waitForSelector('iframe[name="pane-2"]', {
+				state: 'detached',
+				timeout: 5_000,
+			});
+		}
+	}
 });
 
 test('share local(1) puts a file on every machine: mirror, fresh boot, live sync', async (page) => {
@@ -1731,7 +1747,7 @@ test('the console starts in /data, like everything the model runs', async (page)
 	const frame = await paneFrame(page);
 	await vmReady(frame);
 	await frameUntil(frame, (t) => /#\s*$/.test(t), 'a prompt');
-	await frameType(page, frame, 'echo "CWD=$(pwd)"');
+	await frameType(page, frame, 'echo "CW""D=$(pwd)"');
 	const cwd = await frameUntil(frame, (t) => /CWD=\S+/.test(t), 'the pwd answer');
 	assert.match(cwd, /CWD=\/data/, `the login shell does not start in /data:\n${cwd}`);
 });
