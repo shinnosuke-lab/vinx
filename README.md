@@ -63,11 +63,14 @@ under [`web/app/public/vm/`](web/app/public/vm) are all `npm run dev` needs.
 ### The Rust wasm toolchain
 
 `npm run build:wasm` needs `wasm-pack`, the `wasm32-unknown-unknown` target, and
-a `wasm-bindgen` CLI whose version matches [`web/Cargo.lock`](web/Cargo.lock).
+a `wasm-bindgen` CLI whose version matches [`web/Cargo.lock`](web/Cargo.lock)
+(`wasm-pack` runs with `--mode no-install`, so it will not fetch one itself).
 [`web/deploy/ci.sh --docker`](web/deploy/ci.sh) does the whole build inside a
 container that carries all of it (build the image with
 [`web/docker/build-image.sh`](web/docker/build-image.sh)), which is the
-reproducible path if you would rather not install the toolchain.
+reproducible path if you would rather not install the toolchain. On a Linux
+x86_64 host — the GitHub Actions runner — `ci.sh` fetches whichever of the
+pinned tools is missing on its own.
 
 ## Layout
 
