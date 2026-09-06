@@ -13,6 +13,11 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    # A green run is well under half an hour. The browser suite boots the
+    # emulated Linux many times over, and when it goes wrong it goes wrong
+    # slowly -- one 30 s click timeout after another -- so cap it well short
+    # of the six hours a job gets by default.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
@@ -26,7 +31,8 @@ jobs:
             web/vendor/ui/package-lock.json
 
       # The runner image carries rustup; the wasm target is the only add-on.
-      # deploy/ci.sh installs wasm-pack itself when it is absent.
+      # deploy/ci.sh installs wasm-pack, wasm-bindgen and wasm-opt itself when
+      # they are absent.
       - name: rust wasm target
         run: rustup target add wasm32-unknown-unknown
 

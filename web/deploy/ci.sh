@@ -245,11 +245,15 @@ npm ci
 echo ""
 echo "==> Engine"
 # Before the suites, not as part of them: the TypeScript half imports the types
-# wasm-pack generates into runtime/pkg, and on a fresh checkout that directory
-# does not exist -- `tsc --noEmit` then fails on an import, which reads like a
-# broken source file rather than a missing build. browser.sh builds it again,
-# by then against a warm cargo cache.
+# wasm-pack generates into runtime/pkg and the JSON that build-skill.mjs and
+# build-apps.mjs generate into app/gen, and on a fresh checkout none of that
+# exists -- `tsc --noEmit` then fails on an import (TS2307), which reads like a
+# broken source file rather than a missing build. A Jenkins workspace kept the
+# generated files between runs and hid this; a GitHub runner starts empty.
+# browser.sh builds all of it again, by then against a warm cargo cache.
 npm run build:wasm
+npm run build:skill
+npm run build:apps
 
 echo ""
 echo "==> Chrome"
