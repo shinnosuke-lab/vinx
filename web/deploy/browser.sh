@@ -16,11 +16,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-if [ -s "$NVM_DIR/nvm.sh" ]; then
-	# shellcheck disable=SC1091
-	. "$NVM_DIR/nvm.sh"
-	nvm use 22 >/dev/null
+# Only when the node already on PATH will not do: a GitHub runner has nvm in
+# $HOME with nothing installed under it and Node 22 from setup-node on PATH,
+# and `nvm use 22` there fails, which under set -e ended the suite before it
+# began. nvm.sh itself is not clean under set -u, hence the bracket.
+node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || true)  # missing node: reported below, not a pipefail exit
+if [ -z "$node_major" ] || [ "$node_major" -lt 20 ]; then
+	export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+	if [ -s "$NVM_DIR/nvm.sh" ]; then
+		set +u
+		# shellcheck disable=SC1091
+		. "$NVM_DIR/nvm.sh"
+		nvm use 22 >/dev/null 2>&1 || true
+		set -u
+	fi
 fi
 # The wasm build looks for its tools on PATH; a laptop keeps them under cargo.
 export PATH="$HOME/.cargo/bin:$PATH"

@@ -61,7 +61,7 @@ echo "==> Toolchain"
 # $HOME with nothing installed under it and Node 22 from setup-node on PATH --
 # `nvm use 22` there fails, and under set -e that ended the build before it
 # began. nvm.sh itself is not clean under set -u, hence the bracket.
-node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')
+node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || true)  # missing node: reported below, not a pipefail exit
 if [ -z "$node_major" ] || [ "$node_major" -lt 20 ]; then
 	export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 	if [ -s "$NVM_DIR/nvm.sh" ]; then
@@ -73,7 +73,7 @@ if [ -z "$node_major" ] || [ "$node_major" -lt 20 ]; then
 	fi
 fi
 
-node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')
+node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || true)  # missing node: reported below, not a pipefail exit
 if [ -z "$node_major" ] || [ "$node_major" -lt 20 ]; then
 	echo "FATAL: need Node 20+ for vite (have ${node_major:-none})." >&2
 	echo "In the container that means the image's node is too old to build this" >&2

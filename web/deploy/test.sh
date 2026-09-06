@@ -13,15 +13,24 @@ cd "$ROOT/crates/agent-web-core"
 
 # The test runner's harness is an ES module using `node:` specifiers, so an old
 # node fails with a bare "Cannot find module 'node:process'" that gives no hint
-# about the real cause. Prefer nvm when it is around.
-export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-if [ -s "$NVM_DIR/nvm.sh" ]; then
-	# shellcheck disable=SC1091
-	. "$NVM_DIR/nvm.sh"
-	nvm use 22 >/dev/null
+# about the real cause. Prefer nvm when it is around -- but only when the node
+# already on PATH will not do: a GitHub runner has nvm in $HOME with nothing
+# installed under it and Node 22 from setup-node on PATH, and `nvm use 22`
+# there fails, which under set -e ended the suites before they began. nvm.sh
+# itself is not clean under set -u, hence the bracket.
+node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || true)  # missing node: reported below, not a pipefail exit
+if [ -z "$node_major" ] || [ "$node_major" -lt 18 ]; then
+	export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+	if [ -s "$NVM_DIR/nvm.sh" ]; then
+		set +u
+		# shellcheck disable=SC1091
+		. "$NVM_DIR/nvm.sh"
+		nvm use 22 >/dev/null 2>&1 || true
+		set -u
+	fi
 fi
 
-node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')
+node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || true)  # missing node: reported below, not a pipefail exit
 if [ -z "$node_major" ] || [ "$node_major" -lt 18 ]; then
 	echo "FATAL: need Node 18+ for the wasm-bindgen test harness (have ${node_major:-none});"
 	echo "       try 'nvm install 22'."

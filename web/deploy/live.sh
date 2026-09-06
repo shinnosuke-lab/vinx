@@ -28,11 +28,19 @@ if [ -z "${LIVE_BASE_URL:-}" ] || [ -z "${LIVE_MODEL:-}" ]; then
 	exit 1
 fi
 
-export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-if [ -s "$NVM_DIR/nvm.sh" ]; then
-	# shellcheck disable=SC1091
-	. "$NVM_DIR/nvm.sh"
-	nvm use 22 >/dev/null
+# Only when the node already on PATH will not do (see deploy/test.sh): an nvm
+# with nothing installed under it makes `nvm use 22` fail, and under set -e that
+# is the end of the run. nvm.sh itself is not clean under set -u, hence the bracket.
+node_major=$(node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/' || true)  # missing node: reported below, not a pipefail exit
+if [ -z "$node_major" ] || [ "$node_major" -lt 18 ]; then
+	export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+	if [ -s "$NVM_DIR/nvm.sh" ]; then
+		set +u
+		# shellcheck disable=SC1091
+		. "$NVM_DIR/nvm.sh"
+		nvm use 22 >/dev/null 2>&1 || true
+		set -u
+	fi
 fi
 
 echo "==> live turn against $LIVE_BASE_URL ($LIVE_MODEL)"
