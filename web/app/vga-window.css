@@ -1,0 +1,260 @@
+/*
+ * The machine's VGA screen window (see vga-window.tsx), imported by the
+ * component so every host page brings the styles with it. The terminal page
+ * defines the --line/--panel/--muted/--fg/--accent palette on :root; the
+ * chat page's machine console does not, so every var() carries the terminal
+ * page's dark values as fallback — the window is a dark artifact wherever
+ * it floats.
+ */
+
+.vga-window {
+	position: absolute;
+	z-index: 20; /* over the xterm; transient overlays (drop, open-chip) and the AI panel stay above */
+	display: flex;
+	flex-direction: column;
+	min-width: 240px;
+	min-height: 180px;
+	/* No background of its own: each tenant paints its ground (the VGA
+	 * panel letterboxes on black, consoles sit on Tokyo Night #1a1b26) —
+	 * per-tenant colour without selector wars. */
+	background: transparent;
+	border: 1px solid var(--line, #2f354d);
+	border-radius: 6px;
+	box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+	overflow: hidden;
+	/* --win-alpha is the title-bar droplet's glass depth. Whole-window
+	 * opacity, not background alpha: the WebGL text renderer cannot paint
+	 * on transparent, so the glass fades the window as one piece. */
+	opacity: var(--win-alpha, 1);
+}
+
+.vga-window.max {
+	border-radius: 0;
+}
+
+/* Resize handles: thin invisible strips just inside each edge (the window
+ * clips its overflow, so they cannot hang outside), fatter squares on the
+ * corners, layered over the edge strips. */
+.vga-resize {
+	position: absolute;
+	z-index: 5;
+	touch-action: none; /* pointer capture must win over scroll gestures */
+}
+
+.vga-resize-n,
+.vga-resize-s {
+	left: 10px;
+	right: 10px;
+	height: 5px;
+	cursor: ns-resize;
+}
+
+.vga-resize-e,
+.vga-resize-w {
+	top: 10px;
+	bottom: 10px;
+	width: 5px;
+	cursor: ew-resize;
+}
+
+.vga-resize-n {
+	top: 0;
+}
+.vga-resize-s {
+	bottom: 0;
+}
+.vga-resize-e {
+	right: 0;
+}
+.vga-resize-w {
+	left: 0;
+}
+
+.vga-resize-ne,
+.vga-resize-nw,
+.vga-resize-se,
+.vga-resize-sw {
+	z-index: 6;
+	width: 10px;
+	height: 10px;
+}
+
+.vga-resize-ne {
+	top: 0;
+	right: 0;
+	cursor: nesw-resize;
+}
+.vga-resize-nw {
+	top: 0;
+	left: 0;
+	cursor: nwse-resize;
+}
+.vga-resize-se {
+	bottom: 0;
+	right: 0;
+	cursor: nwse-resize;
+}
+.vga-resize-sw {
+	bottom: 0;
+	left: 0;
+	cursor: nesw-resize;
+}
+
+.vga-title {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 26px;
+	padding: 0 4px 0 10px;
+	background: var(--panel, #1f2335);
+	border-bottom: 1px solid var(--line, #2f354d);
+	color: var(--muted, #565f89);
+	font-size: 10.5px;
+	cursor: grab;
+	user-select: none;
+	touch-action: none; /* pointer capture must win over scroll gestures */
+}
+
+.vga-title:active {
+	cursor: grabbing;
+}
+
+.vga-title-text {
+	flex: 1;
+}
+
+/* Extra title-bar controls (the machine console's status dot and network
+ * chip live here); clicks inside never start a window drag. */
+.vga-title-extra {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.vga-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 20px;
+	height: 20px;
+	padding: 0;
+	border: 0;
+	border-radius: 4px;
+	background: transparent;
+	color: var(--muted, #565f89);
+	cursor: pointer;
+}
+
+.vga-btn:hover {
+	background: var(--line, #2f354d);
+	color: var(--fg, #c0caf5);
+}
+
+/* The window's content: the same panel (and selectors, and PS/2 keyboard
+ * focus semantics) it was when it lived as a strip above the xterm. */
+.vga-panel {
+	flex: 1;
+	min-height: 0;
+	overflow: hidden;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	/* The letterbox wears the family ground (#1a1b26, same as every
+	 * console), not black: the guest's fixed-mode picture keeps its own
+	 * colours, and the faint outline below marks where it ends. */
+	background: #1a1b26;
+}
+
+/* Focused, the panel is the machine's PS/2 keyboard; show the handoff. */
+.vga-panel:focus {
+	outline: 1px solid var(--accent, #cd751d);
+	outline-offset: -1px;
+}
+
+/* Size and image-rendering are set inline by VgaPanel's fit logic: whole
+ * device pixels (pixelated) when blowing up, smooth contain when shrinking.
+ * The outline traces the picture's edge against the letterbox. */
+.vga-panel canvas {
+	display: block;
+	image-rendering: pixelated;
+	outline: 1px solid rgb(255 255 255 / 0.08);
+}
+
+/* v86's text-mode layer: BIOS output before the first modeset. */
+.vga-screen > div {
+	white-space: pre;
+	font:
+		12px/12px ui-monospace,
+		monospace;
+	color: #ddd;
+}
+
+/* A web app window's tenant: the sandboxed cross-site frame (§10.3),
+ * filling the window under the shared title bar. */
+.app-frame {
+	flex: 1;
+	min-height: 0;
+	width: 100%;
+	border: 0;
+	background: #1a1b26;
+}
+
+/* A PTY window's tenant (§6.9): the xterm fills the window body. Tokyo
+ * Night's ground, the same #1a1b26 every console wears — one family, so
+ * the banner's transparent logo sits on the same colour everywhere. */
+.tty-term {
+	flex: 1;
+	min-height: 0;
+	overflow: hidden;
+	background: #1a1b26;
+}
+
+.tty-term .xterm,
+.tty-term .terminal {
+	height: 100%;
+}
+
+/* The fit addon subtracts the terminal's own padding, not the parent's. */
+.tty-term .xterm {
+	padding: 6px 4px 6px 8px;
+}
+
+/* The macOS floating-scrollbar trick, same as terminal.css: an 8px lane,
+ * a 4px bar in the family's line colour — the browser's stock scrollbar
+ * glared white against the Tokyo Night ground. */
+.tty-term .xterm-viewport {
+	scrollbar-width: thin;
+	scrollbar-color: #2f354d transparent;
+}
+
+.tty-term .xterm-viewport::-webkit-scrollbar {
+	width: 8px;
+}
+
+.tty-term .xterm-viewport::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+.tty-term .xterm-viewport::-webkit-scrollbar-thumb {
+	background: #2f354d;
+	border: 2px solid transparent;
+	border-radius: 6px;
+	background-clip: padding-box;
+}
+
+.tty-term .xterm-viewport::-webkit-scrollbar-thumb:hover {
+	background: #414868;
+	background-clip: padding-box;
+}
+
+.app-frame-missing {
+	flex: 1;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 12px;
+	text-align: center;
+	color: var(--muted, #565f89);
+	font: 12px system-ui, sans-serif;
+}

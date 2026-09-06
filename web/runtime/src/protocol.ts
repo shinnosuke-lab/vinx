@@ -21,6 +21,7 @@ export const PROTOCOL_VERSION = 2;
 export type Method =
 	| 'configure'
 	| 'installTools'
+	| 'uninstallTools'
 	| 'attach'
 	| 'detach'
 	| 'send'
@@ -34,12 +35,14 @@ export type Method =
 	| 'askActivity'
 	| 'queueRemove'
 	| 'queueEdit'
+	| 'queuePromote'
 	| 'cancelTask'
 	| 'sessionArchive'
 	| 'sessionArchiveGet'
 	| 'setReasoningEffort'
 	| 'upload'
 	| 'readUpload'
+	| 'readWorkspaceFile'
 	| 'skills'
 	| 'skillText'
 	| 'skillIcon'
@@ -97,7 +100,20 @@ export interface VmResult {
 	body: string;
 }
 
-export type ToWorker = Init | Request | VmResult;
+/**
+ * The main thread answering an `InstallApp`.
+ *
+ * `ok` with the line the model reads, or a refusal in the machine's own
+ * finding codes — the tool result on the engine's side is whichever came back.
+ */
+export interface InstallAppResult {
+	installAppResult: true;
+	installId: number;
+	ok: boolean;
+	text: string;
+}
+
+export type ToWorker = Init | Request | VmResult | InstallAppResult;
 
 export function isInit(m: ToWorker): m is Init {
 	return 'init' in m;
@@ -105,6 +121,10 @@ export function isInit(m: ToWorker): m is Init {
 
 export function isVmResult(m: ToWorker): m is VmResult {
 	return 'vmResult' in m;
+}
+
+export function isInstallAppResult(m: ToWorker): m is InstallAppResult {
+	return 'installAppResult' in m;
 }
 
 /** A method returned normally. `result` is already-decoded JSON. */
@@ -149,7 +169,55 @@ export interface VmCall {
 	body: string;
 }
 
-export type FromWorker = Reply | Frame | Ready | VmCall;
+/**
+ * Bytes the engine hands to the person as a browser download.
+ *
+ * The workspace `download_file` tool's second half: the worker holds the
+ * file, the main thread holds the DOM that can click an `<a download>`. One
+ * way, like a `Frame` — the tool call it belongs to was already answered on
+ * the engine's side once the bytes left.
+ */
+export interface Download {
+	download: true;
+	/** The name the browser saves the file under (the draft's own). */
+	filename: string;
+	bytes: Uint8Array;
+}
+
+/**
+ * The parts of a pure web app the model wrote, on their way to the Apps page.
+ *
+ * The workspace `install_app` tool's second half. The worker holds the drafts;
+ * the machine's mirror, its live `/data` and the Apps page are all on the main
+ * thread, which packs and installs them and answers with an `InstallAppResult`
+ * — the tool waits for it, because the model must hear whether the app is on
+ * the page or why not.
+ */
+export interface InstallApp {
+	installApp: true;
+	installId: number;
+	app: WebAppSource;
+}
+
+/** What `install_app` hands over: manifest fields and the window's parts. */
+export interface WebAppSource {
+	/** `^[a-z0-9][a-z0-9-]{0,31}$`, checked by the installer, not here. */
+	id: string;
+	title?: string;
+	description?: string;
+	/** The body fragment app-run(8) stages as index.html. */
+	html: Uint8Array;
+	/** style.css, when the model wrote one. */
+	css?: Uint8Array;
+	/** app.js, when the model wrote one. */
+	js?: Uint8Array;
+	/** Put it on the autostart list (`/data/apps/enabled`): the page opens
+	 * its window whenever it loads. The person's policy — set only when they
+	 * asked; absent leaves the list as it is (an update keeps the choice). */
+	autostart?: boolean;
+}
+
+export type FromWorker = Reply | Frame | Ready | VmCall | Download | InstallApp;
 
 export function isFrame(m: FromWorker): m is Frame {
 	return 'frame' in m;
@@ -161,6 +229,14 @@ export function isReady(m: FromWorker): m is Ready {
 
 export function isVmCall(m: FromWorker): m is VmCall {
 	return 'vmCall' in m;
+}
+
+export function isDownload(m: FromWorker): m is Download {
+	return 'download' in m;
+}
+
+export function isInstallApp(m: FromWorker): m is InstallApp {
+	return 'installApp' in m;
 }
 
 /**

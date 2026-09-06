@@ -6,8 +6,18 @@
  * this hands them to the chat UI exactly as the HTTP server would have.
  */
 
-import type { FromWorker, Init, Method, Ready, Reply, Request, VmResult } from './protocol';
-import { isFrame, isReady, isVmCall, PROTOCOL_VERSION } from './protocol';
+import type {
+	FromWorker,
+	Init,
+	InstallAppResult,
+	Method,
+	Ready,
+	Reply,
+	Request,
+	VmResult,
+	WebAppSource,
+} from './protocol';
+import { isDownload, isFrame, isInstallApp, isReady, isVmCall, PROTOCOL_VERSION } from './protocol';
 
 export interface ClientOptions {
 	/**
@@ -33,6 +43,23 @@ export interface ClientOptions {
 	 * Unset, such calls answer 502, which the engine reports as a failed tool.
 	 */
 	onVmCall?: (body: string) => Promise<{ status: number; body: string }>;
+	/**
+	 * Hands a workspace file to the person as a browser download — the second
+	 * half of the engine's `download_file` while the workspace (not a machine)
+	 * is the model's filesystem. The worker has the bytes; only page code can
+	 * click an `<a download>`. Unset, the download is dropped on the floor and
+	 * the tool's success is a lie — pages with a DOM should always set it.
+	 */
+	onDownload?: (filename: string, bytes: Uint8Array) => void;
+	/**
+	 * Puts a pure web app the model wrote on this page's Apps page — the second
+	 * half of the engine's `install_app`, the workspace's third door beside
+	 * download_file and open_file. Resolves with the line the model reads
+	 * ("Installed … on the Apps page"); rejects with the refusal, which the
+	 * engine hands the model verbatim, so make it the machine's own finding
+	 * codes. Unset, the tool reports that this page cannot install apps.
+	 */
+	onInstallApp?: (app: WebAppSource) => Promise<string>;
 }
 
 /** Per-turn overrides, mirroring the fields `POST /api/chat` carries. */
@@ -151,10 +178,14 @@ export class AgentClient {
 	private streams = new Map<string, (frame: string) => void>();
 	private ready: Promise<HostStatus>;
 	private onVmCall?: ClientOptions['onVmCall'];
+	private onDownload?: ClientOptions['onDownload'];
+	private onInstallApp?: ClientOptions['onInstallApp'];
 
 	constructor(options: ClientOptions = {}) {
 		const url = options.workerUrl ?? new URL('./worker.js', import.meta.url);
 		this.onVmCall = options.onVmCall;
+		this.onDownload = options.onDownload;
+		this.onInstallApp = options.onInstallApp;
 		const started = spawn(url);
 		this.worker = started.worker;
 		this.objectUrl = started.objectUrl;
@@ -181,6 +212,15 @@ export class AgentClient {
 			}
 			if (isVmCall(message)) {
 				this.answerVmCall(message.vmId, message.body);
+				return;
+			}
+			if (isDownload(message)) {
+				// One way: the engine already told the model the file went out.
+				this.onDownload?.(message.filename, message.bytes);
+				return;
+			}
+			if (isInstallApp(message)) {
+				this.answerInstallApp(message.installId, message.app);
 				return;
 			}
 			this.settleCall(message);
@@ -245,6 +285,27 @@ export class AgentClient {
 		this.worker.postMessage({ vmResult: true, vmId, status, body: reply } satisfies VmResult);
 	}
 
+	/** The model's `install_app` reaching the page; see `ClientOptions.onInstallApp`. */
+	private async answerInstallApp(installId: number, app: WebAppSource) {
+		let ok = false;
+		let text = 'this page cannot install apps';
+		const handler = this.onInstallApp;
+		if (handler) {
+			try {
+				text = await handler(app);
+				ok = true;
+			} catch (e) {
+				text = e instanceof Error ? e.message : String(e);
+			}
+		}
+		this.worker.postMessage({
+			installAppResult: true,
+			installId,
+			ok,
+			text,
+		} satisfies InstallAppResult);
+	}
+
 	/** Resolves once the engine has loaded, or rejects if it cannot. */
 	whenReady(): Promise<HostStatus> {
 		return this.ready;
@@ -283,6 +344,16 @@ export class AgentClient {
 	 */
 	installTools(payload: unknown, endpoint: string): Promise<string[]> {
 		return this.call('installTools', { payload: JSON.stringify(payload), endpoint });
+	}
+
+	/**
+	 * Take device tools back by name — the inverse of `installTools`, for a
+	 * device that comes and goes (the in-page machine a person may leave
+	 * powered off). The turn in flight keeps what it already holds; the next
+	 * one is briefed without the device. Resolves with the names removed.
+	 */
+	uninstallTools(names: string[]): Promise<string[]> {
+		return this.call('uninstallTools', { names });
 	}
 
 	/**
@@ -465,6 +536,15 @@ export class AgentClient {
 	}
 
 	/**
+	 * "Send now" for a parked message: move it to the queue front and wind
+	 * the running turn down (queue kept) so it starts next. Resolves `false`
+	 * when the id names nothing — already started, or removed by another tab.
+	 */
+	queuePromote(session: string, id: number): Promise<boolean> {
+		return this.call('queuePromote', { session, id });
+	}
+
+	/**
 	 * Put a file the user attached into the workspace.
 	 *
 	 * `mime` is what the browser said the blob was; it decides whether this is
@@ -481,6 +561,18 @@ export class AgentClient {
 	 */
 	readUpload(id: string): Promise<{ bytes: Uint8Array; mime: string } | null> {
 		return this.call('readUpload', { id });
+	}
+
+	/**
+	 * The bytes behind a workspace path the model offered with `open_file` —
+	 * the page half of that tool: its chat card reads the file back through
+	 * here when the person clicks Open, so the tab shows the file as it is
+	 * now, and a card in an old session still works. A bare filename names a
+	 * draft, exactly as it did for the model. Resolves null when nothing is
+	 * there any more (or it is a directory, or over the hand-over cap).
+	 */
+	readWorkspaceFile(path: string): Promise<Uint8Array | null> {
+		return this.call('readWorkspaceFile', { path });
 	}
 
 	/** What is installed, and what the last scan could not make sense of. */
@@ -583,8 +675,12 @@ export class AgentClient {
 		return this.call('runtimeClear', { categories });
 	}
 
-	sessions<T = unknown[]>(): Promise<T> {
-		return this.call('sessions');
+	/**
+	 * The session list; `scope` is `active` (default) | `archived` | `all`.
+	 * Rejects (invalid_scope) for anything else.
+	 */
+	sessions<T = unknown[]>(scope?: string): Promise<T> {
+		return this.call('sessions', { scope });
 	}
 
 	session<T = unknown>(session: string): Promise<T> {
@@ -605,8 +701,16 @@ export class AgentClient {
 		return this.call('search', { query, limit, exclude });
 	}
 
-	updateSession(session: string, title?: string, pinned?: boolean): Promise<void> {
-		return this.call('updateSession', { session, title, pinned });
+	/**
+	 * `PATCH /api/sessions/{id}`: every field optional, absent = unchanged.
+	 * `category` is tri-state — `undefined` unchanged, `null` clear, else the
+	 * label (at most 64 characters; the host rejects longer as a no-op).
+	 */
+	updateSession(
+		session: string,
+		patch: { title?: string; pinned?: boolean; archived?: boolean; category?: string | null } = {},
+	): Promise<void> {
+		return this.call('updateSession', { session, ...patch });
 	}
 
 	deleteSession(session: string): Promise<void> {

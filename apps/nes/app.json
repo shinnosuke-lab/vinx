@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "kind": "window",
+  "ui": { "type": "tty" },
+  "exec": "./run",
+  "title": "NES",
+  "description": "红白机：把 .nes ROM 拖到页面上（它落在 /data），在这里选一个，游戏画在屏幕窗口里。The NES console — drop a .nes ROM onto the page, pick it here, and the game plays on the screen window."
+}

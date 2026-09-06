@@ -18,7 +18,7 @@ joiner needs no ROM). The machine itself ships in the image too:
 │                                            256x224 dumb buffer │
 │  speakers ◄───────────── v86 SB16 ◄── /dev/dsp ◄── apu.c       │
 │  xterm console  ──────────── ttyS0 ──► timed-hold input        │
-│  agent run_shell ─────────── ttyS1 ──► echo … > /tmp/nes.ctl   │
+│  agent run_shell ─────────── ttyS3 ──► echo … > /tmp/nes.ctl   │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -173,8 +173,8 @@ are the safe playground.
 Snapshots restore only onto the same ROM. Save into `/data` and they
 survive a page reload; everything else in the VM is RAM.
 
-**For the vinx agent** sitting on ttyS1: the person plays on the console
-while you drive the same machine --
+**For the vinx agent** on the run_shell channel: the person plays on the
+console while you drive the same machine --
 
 ```sh
 # a cheat, injected mid-game

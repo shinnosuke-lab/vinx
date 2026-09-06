@@ -1,11 +1,11 @@
 #!/bin/sh
 # camera snap [NAME] -- one frame from the machine's webcam, into /data.
 #
-# The request goes out over the private OSC; the page asks getUserMedia for a
-# frame (the browser shows its camera prompt), PNG-encodes it and drops it in
-# /data, where this script is waiting for it. The wait is generous because
-# the first use includes a human clicking "Allow".
-. /usr/lib/vinx.sh
+# One control-plane call (media.camera.capture): the page asks getUserMedia
+# for a frame (the browser shows its camera prompt), PNG-encodes it, drops
+# it in /data and answers with the file's path and size -- no polling. The
+# deadline is generous because the first use includes a human clicking
+# "Allow".
 
 usage() { echo 'usage: camera snap [NAME.png]' >&2; exit 2; }
 
@@ -19,17 +19,6 @@ case "$NAME" in
 		;;
 esac
 
-printf '\033]7770;camera;%s\a\n' "$(vm_b64s "$NAME")"
-echo "camera: asked the browser for a frame; waiting for /data/$NAME"
-
-i=0
-while [ "$i" -lt 30 ]; do
-	if [ -s "/data/$NAME" ]; then
-		echo "camera: /data/$NAME ($(wc -c < "/data/$NAME") bytes)"
-		exit 0
-	fi
-	sleep 1
-	i=$((i + 1))
-done
-echo 'camera: no frame arrived -- permission denied, or no camera?' >&2
-exit 1
+echo 'camera: asking the browser for a frame (first use pops the permission prompt)...'
+res=$(jq -cn --arg name "$NAME" '{name: $name}' | rpc call media.camera.capture - -t 60) || exit 1
+echo "camera: /data/$NAME ($(printf '%s' "$res" | jq -r '.image.size') bytes)"

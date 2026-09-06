@@ -54,9 +54,11 @@ pub mod web {
     pub use crate::sse;
 
     /// The engine's `store` field is declared as
-    /// `Option<Arc<crate::web::store::SqliteStore>>`, and it calls two methods
-    /// on it: `archive_messages` before a compaction, `save_async` for a
-    /// sub-agent transcript. Both are [`crate::store::SessionStore`]'s.
+    /// `Option<Arc<crate::web::store::SqliteStore>>`, and it calls a few
+    /// methods on it: `archive_messages` before a compaction, `save_async` +
+    /// `set_title_async` for a sub-agent transcript,
+    /// `lookup_archived_tool_result` for `recall_result`. All are
+    /// [`crate::store::SessionStore`]'s.
     pub mod store {
         #[cfg(feature = "sqlite")]
         pub use crate::store::SessionStore as SqliteStore;
@@ -96,6 +98,10 @@ pub mod web {
             ) {
                 match *self {}
             }
+
+            pub fn set_title_async(&self, _id: &str, _title: &str) {
+                match *self {}
+            }
         }
     }
 }
@@ -125,8 +131,8 @@ pub mod config {
 }
 
 // ── the browser side ──
-pub mod bridge;
 pub mod answer;
+pub mod bridge;
 pub mod files;
 /// The theme half of upstream's `releases`, under its own name: the vendored
 /// `set_chat_style` addresses it as `crate::releases` and so compiles unpatched.

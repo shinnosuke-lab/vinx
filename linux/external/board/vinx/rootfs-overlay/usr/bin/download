@@ -1,18 +1,35 @@
 #!/bin/sh
 # download FILE... -- save a file from this VM to the person's machine.
 #
-# The same OSC 1337 File sequence imgcat(1) sends, but inline=0, which is
-# iTerm2's "download this" disposition; the page catches it and triggers a
-# browser download. See also open(1), which lets the browser decide.
+# Each file is staged into the session tmp namespace and handed to the page
+# as a resource.download ref (system-v2 §6.8); the page triggers a browser
+# download under the file's own name. See also open(1), which lets the
+# browser decide, and imgcat(1), which stays a terminal escape (rendering,
+# not a capability).
 . /usr/lib/vinx.sh
 
 [ $# -ge 1 ] || { echo 'usage: download FILE...' >&2; exit 2; }
 
+grep -q ' /data 9p ' /proc/mounts || {
+	echo 'download: no /data mount to stage through (this boot has no data plane)' >&2
+	exit 1
+}
+
 rc=0
+n=0
 for f in "$@"; do
+	n=$((n + 1))
 	vm_file_ok download "$f" || { rc=1; continue; }
-	printf '\033]1337;File=name=%s;size=%s;inline=0:%s\a\n' \
-		"$(vm_b64s "$(basename "$f")")" "$(wc -c < "$f")" "$(vm_b64 "$f")"
-	echo "download: sent $f to the browser"
+	REF="/data/.vinx/tmp/dl-$$-$n.bin"
+	cp -- "$f" "$REF" || { rc=1; continue; }
+	if jq -cn --arg name "$(basename "$f")" --arg path "$REF" \
+		--argjson size "$(wc -c < "$REF")" \
+		'{name: $name, ref: {path: $path, size: $size}}' |
+		rpc call resource.download - -t 30 >/dev/null; then
+		echo "download: sent $f to the browser"
+	else
+		rc=1
+	fi
+	rm -f "$REF"
 done
 exit $rc

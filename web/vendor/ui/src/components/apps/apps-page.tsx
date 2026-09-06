@@ -5,14 +5,12 @@ import {
   useRef,
   useState,
   type ChangeEvent,
-  type ComponentType,
   type DragEvent,
   type ReactNode,
   type RefObject,
 } from "react"
 import {
   Box,
-  Terminal,
   ExternalLink,
   MessageSquare,
   Play,
@@ -34,11 +32,11 @@ import {
   FileText,
   Package,
   Zap,
+  ZapOff,
   Upload,
-  type LucideIcon,
 } from "lucide-react"
 import { createPortal } from "react-dom"
-import { createChatClient, type ReleaseRecord } from "@agentchat/client"
+import { AppsError, createChatClient, type ReleaseRecord } from "@agentchat/client"
 import type { AppsMarket, MarketAppInfo } from "@agentchat/types"
 import { t, tf } from "@agentchat/lib/i18n"
 import { cn, portalContainer } from "@agentchat/lib/utils"
@@ -127,54 +125,6 @@ function MetaChip({ children }: { children: ReactNode }) {
     <span className="shrink-0 rounded bg-muted/60 px-1 py-px text-[10px] text-muted-foreground">
       {children}
     </span>
-  )
-}
-
-interface BuiltinApp {
-  icon: LucideIcon | ComponentType<{ size?: number; strokeWidth?: number; className?: string }>
-  iconClassName?: string
-  title: string
-  description: string
-  href: string
-}
-
-/** Built-in tool card: a plain external link (no backing release record, so no
- *  detail panel / selection). Restyled to match the grid's other cards. */
-function AppCard({ icon: Icon, iconClassName, title, description, href }: BuiltinApp) {
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      aria-label={title}
-      className="group relative flex min-w-0 cursor-pointer overflow-hidden rounded-[6px] border border-border bg-card no-underline transition-colors hover:border-primary/30"
-    >
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2 px-3 py-3.5">
-        <div className="flex items-center gap-2">
-          <Icon
-            size={14}
-            strokeWidth={1.75}
-            className={cn("shrink-0", iconClassName ?? "text-muted-foreground")}
-          />
-          <h3
-            className="flex-1 truncate text-[11px] font-medium leading-snug text-foreground"
-            title={title}
-          >
-            {title}
-          </h3>
-          <ExternalLink
-            size={11}
-            className="shrink-0 text-muted-foreground/40 transition-colors group-hover:text-muted-foreground/70"
-          />
-        </div>
-        <p
-          className="line-clamp-1 text-[11px] leading-snug text-muted-foreground"
-          title={description}
-        >
-          {description}
-        </p>
-      </div>
-    </a>
   )
 }
 
@@ -276,7 +226,9 @@ function InstalledAppCard({
             className="min-w-0 flex-1 truncate text-[11px] font-medium leading-snug text-foreground"
             title={release.name}
           >
-            {release.name}
+            {/* Vinx: the manifest's title when it has one; the id stays the
+                tooltip and the name the system knows the app by. */}
+            {release.title || release.name}
           </h3>
           <div className="flex shrink-0 items-center justify-end gap-0.5">
             <button
@@ -287,7 +239,17 @@ function InstalledAppCard({
                 else onStart()
               }}
               disabled={busy}
-              title={active ? t("appStop") : t("appStart")}
+              title={
+                active
+                  ? release.app_kind === "window"
+                    ? t("appCloseWindow")
+                    : t("appStop")
+                  : release.app_kind === "window"
+                    ? t("appOpenWindow")
+                    : release.app_kind === "command"
+                      ? t("appRunOnce")
+                      : t("appStart")
+              }
               className={cn(
                 "flex h-5 w-5 items-center justify-center rounded transition-colors disabled:opacity-50",
                 active
@@ -365,6 +327,13 @@ function InstalledAppCard({
           </div>
         </div>
 
+        {/* Vinx: one line of the manifest's description, when it has one. */}
+        {release.description && (
+          <p className="truncate text-[10px] leading-snug text-muted-foreground/70" title={release.description}>
+            {release.description}
+          </p>
+        )}
+
         <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/50 transition-colors group-hover:text-muted-foreground/70">
           <span className="flex shrink-0 items-center gap-1">
             <span
@@ -373,8 +342,15 @@ function InstalledAppCard({
             />
             {release.version ? <span className="tabular-nums">v{release.version}</span> : null}
           </span>
-          {release.runtime && <MetaChip>{release.runtime}</MetaChip>}
-          {release.oneshot && <MetaChip>{t("appOneshot")}</MetaChip>}
+          {/* Vinx: a machine app's kind is the chip (window / service /
+              command); upstream's runtime chip (native/python/node) has no
+              meaning for one, and is left to upstream apps. */}
+          {release.app_kind ? (
+            <MetaChip>{t(`appsKind_${release.app_kind}`)}</MetaChip>
+          ) : (
+            release.runtime && <MetaChip>{release.runtime}</MetaChip>
+          )}
+          {release.oneshot && !release.app_kind && <MetaChip>{t("appOneshot")}</MetaChip>}
           {release.port ? <MetaChip>:{release.port}</MetaChip> : null}
           {release.created_at && (
             <span className="ml-auto shrink-0 tabular-nums">{relativeTime(release.created_at)}</span>
@@ -490,6 +466,7 @@ function InstalledAppDetailPanel({
   onClose,
   onStart,
   onStop,
+  onToggleAutostart,
   onOpenSession,
   onDelete,
 }: {
@@ -499,6 +476,8 @@ function InstalledAppDetailPanel({
   onClose: () => void
   onStart: () => void
   onStop: () => void
+  /** Vinx: flip boot autostart (upstream renders the state read-only). */
+  onToggleAutostart: () => void
   onOpenSession?: (id: string) => void
   onDelete: () => void
 }) {
@@ -570,9 +549,23 @@ function InstalledAppDetailPanel({
           {tab === "overview" && (
             <>
               <DetailCard icon={Info} title={t("skillsInfoTitle")} defaultOpen>
-                <DefRow label={t("skillsMarketVersionLabel")}>
-                  <span className="tabular-nums">{release.version ? `v${release.version}` : "—"}</span>
-                </DefRow>
+                {/* Vinx: a machine app (app_kind set) has no version, runtime
+                    or owning session in its model — those rows are upstream's
+                    (systemd apps installed by a session) and stay theirs. It
+                    has a kind, and a title when the manifest gave one. */}
+                {release.app_kind ? (
+                  <>
+                    {release.title && <DefRow label={t("appsTitleLabel")}>{release.title}</DefRow>}
+                    <DefRow label={t("appsKindLabel")}>{t(`appsKind_${release.app_kind}`)}</DefRow>
+                    <DefRow label={t("appsIdLabel")}>
+                      <code className="rounded-[4px] bg-muted px-1.5 py-0.5 font-mono text-[10px]">{release.name}</code>
+                    </DefRow>
+                  </>
+                ) : (
+                  <DefRow label={t("skillsMarketVersionLabel")}>
+                    <span className="tabular-nums">{release.version ? `v${release.version}` : "—"}</span>
+                  </DefRow>
+                )}
                 <DefRow label={t("skillsStatusLabel")}>
                   <Pill
                     tone={active ? "success" : "muted"}
@@ -582,17 +575,21 @@ function InstalledAppDetailPanel({
                     {statusLabel(release.status)}
                   </Pill>
                 </DefRow>
-                {release.runtime && (
+                {release.runtime && !release.app_kind && (
                   <DefRow label={t("appsRuntimeLabel")}>{release.runtime}</DefRow>
                 )}
                 {release.enabled && (
-                  <DefRow label={t("appsAutostartLabel")}>
+                  // Vinx: a pure web app's autostart is the page loading, not
+                  // the machine booting — its own words for the same list.
+                  <DefRow label={t(release.web ? "appsOpenOnLoadLabel" : "appsAutostartLabel")}>
                     {release.enabled === "enabled" ? t("appsYes") : t("appsNo")}
                   </DefRow>
                 )}
-                <DefRow label={t("appsOneshotLabel")}>
-                  {release.oneshot ? t("appsYes") : t("appsNo")}
-                </DefRow>
+                {!release.app_kind && (
+                  <DefRow label={t("appsOneshotLabel")}>
+                    {release.oneshot ? t("appsYes") : t("appsNo")}
+                  </DefRow>
+                )}
                 {release.port ? (
                   <DefRow label={t("appsPortLabel")}>
                     {pageUrl ? (
@@ -617,6 +614,7 @@ function InstalledAppDetailPanel({
                 {release.created_at && (
                   <DefRow label={t("appsCreatedLabel")}>{relativeTime(release.created_at)}</DefRow>
                 )}
+                {!release.app_kind && (
                 <DefRow label={t("releaseFromSession")}>
                   {release.session_id && onOpenSession ? (
                     <button
@@ -631,6 +629,7 @@ function InstalledAppDetailPanel({
                     <span className="text-muted-foreground/70">{sessionLabel}</span>
                   )}
                 </DefRow>
+                )}
               </DetailCard>
 
               {release.description && (
@@ -647,8 +646,8 @@ function InstalledAppDetailPanel({
                 {active ? (
                   <ActionRow
                     icon={Square}
-                    title={t("appStop")}
-                    hint={t("appsStopHint")}
+                    title={release.app_kind === "window" ? t("appCloseWindow") : t("appStop")}
+                    hint={release.app_kind === "window" ? t("appsCloseWindowHint") : t("appsStopHint")}
                     busy={busy}
                     disabled={busy}
                     onClick={onStop}
@@ -656,13 +655,56 @@ function InstalledAppDetailPanel({
                 ) : (
                   <ActionRow
                     icon={Play}
-                    title={t("appStart")}
-                    hint={t("appsStartHint")}
+                    title={
+                      release.app_kind === "window"
+                        ? t("appOpenWindow")
+                        : release.app_kind === "command"
+                          ? t("appRunOnce")
+                          : t("appStart")
+                    }
+                    hint={
+                      release.app_kind === "window"
+                        ? t("appsOpenWindowHint")
+                        : release.app_kind === "command"
+                          ? t("appsRunOnceHint")
+                          : t("appsStartHint")
+                    }
                     busy={busy}
                     disabled={busy}
                     onClick={onStart}
                   />
                 )}
+                {/* Vinx: the autostart switch — boot policy only, the row
+                    above owns the running instance. One list, two clocks:
+                    a service starts when the machine boots, a command runs
+                    once per boot, and a pure web window opens when this
+                    page loads (the desktop's boot; the machine may be off).
+                    A window app with a backend is a service that shows a
+                    window: the machine's boot, like any service. */}
+                <ActionRow
+                  icon={release.enabled === "enabled" ? ZapOff : Zap}
+                  title={
+                    release.enabled === "enabled"
+                      ? t(release.web ? "appsDisableOpenOnLoad" : "appsDisableAutostart")
+                      : release.web
+                        ? t("appsEnableOpenOnLoad")
+                        : release.app_kind === "command"
+                          ? t("appsEnableRunOnBoot")
+                          : t("appsEnableAutostart")
+                  }
+                  hint={
+                    release.enabled === "enabled"
+                      ? t(release.web ? "appsDisableOpenOnLoadHint" : "appsDisableAutostartHint")
+                      : release.web
+                        ? t("appsEnableOpenOnLoadHint")
+                        : release.app_kind === "command"
+                          ? t("appsEnableRunOnBootHint")
+                          : t("appsEnableAutostartHint")
+                  }
+                  busy={busy}
+                  disabled={busy}
+                  onClick={onToggleAutostart}
+                />
                 {pageUrl && (
                   <ActionRow
                     icon={ExternalLink}
@@ -911,6 +953,33 @@ interface AppsPageProps {
   onOpenSession?: (id: string) => void
 }
 
+// Vinx: the installed list is the in-page Linux machine's app.list when the
+// machine runs and its mirrored /data/apps otherwise, so this page listens
+// for the machine's state — only to ask the list again when it changes. It
+// reads that off the document: vm.ts mirrors the machine's state onto <html
+// data-vm-state> exactly so that UI outside the app tree (this vendored one)
+// needs no import. Nothing here shows or asks for power: the machine
+// capsule floats over every route and is the one place that does — this
+// page is an extension of it, not a second dashboard. Pure web apps never
+// depend on the machine at all; machine apps say so when asked to run on a
+// machine left off (MACHINE_OFF below).
+type VmState = "off" | "booting" | "ready" | "failed"
+
+function readVmState(): VmState {
+  return (document.documentElement.dataset.vmState as VmState | undefined) ?? "off"
+}
+
+function useVmState(): VmState {
+  const [state, setState] = useState<VmState>(readVmState)
+  useEffect(() => {
+    const observer = new MutationObserver(() => setState(readVmState()))
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-vm-state"] })
+    setState(readVmState())
+    return () => observer.disconnect()
+  }, [])
+  return state
+}
+
 export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
   const client = useMemo(() => createChatClient(basePath), [basePath])
   const [apps, setApps] = useState<ReleaseRecord[] | null>(null)
@@ -942,6 +1011,12 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
   const [detailName, setDetailName] = useState<string | null>(null)
   const [marketDetailName, setMarketDetailName] = useState<string | null>(null)
 
+  // Vinx: the machine behind the list. Anything but ready, the bridge
+  // answers from the machine's mirror (the installed packages are facts
+  // about the machine whether or not it runs), so the list is real in
+  // every state and only the verbs' outcomes change with it.
+  const vmState = useVmState()
+
   const refresh = useCallback(() => {
     setRefreshing(true)
     client
@@ -966,9 +1041,33 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
     }
   }, [client])
 
+  // Vinx: the list follows the machine — every state change is a reason
+  // to ask again (off/booting→mirror, ready→rund's live states), so a page
+  // opened during a boot shows the installed set at once and fills in the
+  // states when the machine is up; the market too, for its installed
+  // marks (its 404 decides whether the tab exists at all).
   useEffect(() => {
-    refresh()
     void loadMarket()
+    refresh()
+  }, [vmState, refresh, loadMarket])
+
+  // Vinx: `ready` comes before /data is whole — the page replays the
+  // machine's mirror into it right after, and only then does rund's
+  // app.list know the installed apps. share-store says when (an event on
+  // the window; this tree imports nothing of the app's). And the model's
+  // install_app lands a web app while this page may be showing (the same
+  // event shape, from app-install.ts): re-read, so it appears at once.
+  useEffect(() => {
+    const again = () => {
+      refresh()
+      void loadMarket()
+    }
+    window.addEventListener("vinx:data-restored", again)
+    window.addEventListener("vinx:apps-changed", again)
+    return () => {
+      window.removeEventListener("vinx:data-restored", again)
+      window.removeEventListener("vinx:apps-changed", again)
+    }
   }, [refresh, loadMarket])
 
   // Reset the selection whenever the visible installed set changes via search.
@@ -1015,19 +1114,29 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
     document.addEventListener("pointerup", onUp)
   }, [])
 
+  // Vinx: the machine's refusals in the person's language. MACHINE_OFF is
+  // the shim's stable code for a machine they left powered off (the shim
+  // itself has no language); everything else is the guest's own words.
+  const errorText = useCallback((e: unknown) => {
+    if (e instanceof AppsError && e.code === "MACHINE_OFF") return t("appsVmOff")
+    return e instanceof Error ? e.message : String(e)
+  }, [])
+
   const fail = useCallback(
     (e: unknown) => {
-      toast.error(e instanceof Error ? e.message : String(e))
+      toast.error(errorText(e))
       refresh()
     },
-    [refresh],
+    [refresh, errorText],
   )
 
   const handleStart = useCallback(
     (r: ReleaseRecord) => {
       setBusy(r.name)
-      client
-        .startApp(r.name)
+      // Vinx: a window app's start is its window opening (`app run`); a
+      // pure web one opens from the page even with the machine off.
+      const go = r.app_kind === "window" ? client.runApp(r.name) : client.startApp(r.name)
+      go
         .then(refresh)
         .catch(fail)
         .finally(() => setBusy(null))
@@ -1040,6 +1149,20 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
       setBusy(r.name)
       client
         .stopApp(r.name)
+        .then(refresh)
+        .catch(fail)
+        .finally(() => setBusy(null))
+    },
+    [client, refresh, fail],
+  )
+
+  // Vinx: flip the boot-autostart policy. Only the policy — a running
+  // instance keeps running, a stopped one stays stopped until boot.
+  const handleToggleAutostart = useCallback(
+    (r: ReleaseRecord) => {
+      setBusy(r.name)
+      const flip = r.enabled === "enabled" ? client.disableApp(r.name) : client.enableApp(r.name)
+      flip
         .then(refresh)
         .catch(fail)
         .finally(() => setBusy(null))
@@ -1078,12 +1201,12 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
         refresh()
         await loadMarket()
       } catch (e) {
-        toast.error(tf("appsHubInstallFailed", e instanceof Error ? e.message : String(e)))
+        toast.error(tf("appsHubInstallFailed", errorText(e)))
       } finally {
         setInstalling(null)
       }
     },
-    [client, refresh, loadMarket],
+    [client, refresh, loadMarket, errorText],
   )
 
   // Install an app from a local tarball. Heavier than a skill zip (it starts a
@@ -1098,12 +1221,12 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
         refresh()
         await loadMarket()
       } catch (e) {
-        toast.error(tf("appsHubInstallFailed", e instanceof Error ? e.message : String(e)))
+        toast.error(tf("appsHubInstallFailed", errorText(e)))
       } finally {
         setImporting(false)
       }
     },
-    [client, refresh, loadMarket],
+    [client, refresh, loadMarket, errorText],
   )
 
   const doInstallUrl = useCallback(
@@ -1122,12 +1245,12 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
         refresh()
         await loadMarket()
       } catch (e) {
-        toast.error(tf("appsHubInstallFailed", e instanceof Error ? e.message : String(e)))
+        toast.error(tf("appsHubInstallFailed", errorText(e)))
       } finally {
         setImporting(false)
       }
     },
-    [client, refresh, loadMarket],
+    [client, refresh, loadMarket, errorText],
   )
 
   const onPickFile = useCallback(
@@ -1192,19 +1315,6 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
     [installedFiltered],
   )
 
-  const builtins = useMemo<BuiltinApp[]>(
-    () => [
-      {
-        icon: Terminal,
-        iconClassName: "text-[#3b82f6]",
-        title: t("appsSshTitle"),
-        description: t("appsSshDesc"),
-        href: `${basePath}/terminal/`,
-      },
-    ],
-    [basePath],
-  )
-
   const currentNames = useMemo(
     () => new Set(installedFiltered.map((a) => a.name)),
     [installedFiltered],
@@ -1237,17 +1347,18 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
     () => (apps ?? []).filter((a) => selectedNames.has(a.name) && currentNames.has(a.name)),
     [apps, selectedNames, currentNames],
   )
-  const startableCount = useMemo(
-    () => selectedApps.filter((a) => !a.oneshot).length,
-    [selectedApps],
-  )
+  // Vinx: batch start/stop is for services. A command runs once (oneshot,
+  // upstream's word too) and a window opens and closes — neither belongs
+  // in a "start all", and both are counted as skipped.
+  const isService = (a: ReleaseRecord) => !a.oneshot && a.app_kind !== "window"
+  const startableCount = useMemo(() => selectedApps.filter(isService).length, [selectedApps])
   const oneshotSkipped = useMemo(
-    () => selectedApps.filter((a) => a.oneshot).length,
+    () => selectedApps.filter((a) => !isService(a)).length,
     [selectedApps],
   )
 
   const batchStart = useCallback(async () => {
-    const names = selectedApps.filter((a) => !a.oneshot).map((a) => a.name)
+    const names = selectedApps.filter(isService).map((a) => a.name)
     if (names.length === 0) return
     setMenuOpen(false)
     await Promise.allSettled(names.map((n) => client.startApp(n)))
@@ -1255,7 +1366,7 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
   }, [client, refresh, selectedApps])
 
   const batchStop = useCallback(async () => {
-    const names = selectedApps.filter((a) => !a.oneshot).map((a) => a.name)
+    const names = selectedApps.filter(isService).map((a) => a.name)
     if (names.length === 0) return
     setMenuOpen(false)
     await Promise.allSettled(names.map((n) => client.stopApp(n)))
@@ -1340,36 +1451,33 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
   )
 
   const renderInstalledBody = () => {
+    // Vinx: no word from the machine here, in any state. The list is real
+    // whether it runs or not (a powered-off machine's installed packages
+    // come from its mirror), a pure web app opens right here without
+    // waking anything, and a machine app asked to run on a machine left
+    // off says so in its toast. Power lives on the capsule at the bottom
+    // right, which floats over this page too.
     if (apps === null) {
       return (
-        <div className={GRID_CLASS}>
-          {[0, 1, 2, 3].map((i) => (
-            <div
-              key={i}
-              className="h-[70px] animate-pulse rounded-[6px] border border-border bg-card"
-            />
-          ))}
+        <div className="flex items-center justify-center gap-2 rounded-md border border-dashed border-border/60 p-4 text-sm text-muted-foreground">
+          <Spinner size="sm" className="h-3 w-3" />
         </div>
       )
     }
-    // No "install an app" empty box: the toolbar's install button + the
-    // built-in tools section already carry the page when nothing is installed.
+    // An empty page says how apps come to exist. (The built-in "Web Terminal"
+    // card that used to carry this state is gone: /terminal is a different
+    // computer, and this page lists this machine's apps.)
+    if (apps.length === 0) {
+      return (
+        <div className="flex items-center justify-center rounded-md border border-dashed border-border/60 p-10 text-center text-sm text-muted-foreground">
+          {t("appsInstalledEmpty")}
+        </div>
+      )
+    }
     // A no-match box only appears when a search hides existing apps.
-    const noMatch = apps.length > 0 && installedFiltered.length === 0
+    const noMatch = installedFiltered.length === 0
     return (
       <div className="space-y-5">
-        {builtins.length > 0 &&
-          renderSection(
-            t("appsBuiltinSection"),
-            "bg-primary",
-            builtins.length,
-            <div className={GRID_CLASS}>
-              {builtins.map((b) => (
-                <AppCard key={b.href} {...b} />
-              ))}
-            </div>,
-          )}
-
         {noMatch ? (
           <div className="flex items-center justify-center rounded-md border border-dashed border-border/60 p-10 text-center text-sm text-muted-foreground">
             {t("appsHubNoMatch")}
@@ -1466,6 +1574,7 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
         onClose={() => setDetailName(null)}
         onStart={() => handleStart(detailApp)}
         onStop={() => handleStop(detailApp)}
+        onToggleAutostart={() => handleToggleAutostart(detailApp)}
         onOpenSession={onOpenSession}
         onDelete={() => void handleDelete(detailApp)}
       />
@@ -1592,6 +1701,10 @@ export function AppsPage({ basePath = "", onOpenSession }: AppsPageProps) {
               <span className="shrink-0 text-xs font-medium text-primary">
                 {tf("selectedCount", selectedNames.size)}
               </span>
+            ) : apps === null ? (
+              // Vinx: no count for a list nobody has seen yet — "0 apps"
+              // beside a booting machine's notice was a contradiction.
+              <span className="shrink-0 text-xs text-muted-foreground">—</span>
             ) : (
               <span className="shrink-0 text-xs text-muted-foreground">
                 {tf("appsHubCountLabel", installedFiltered.length)}

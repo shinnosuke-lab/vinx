@@ -21,6 +21,7 @@ import { ChatWelcome } from '@agentchat/components/chat/chat-welcome'
 import { ChatInput } from '@agentchat/components/chat/chat-input'
 import { defaultToolRenderers } from '@agentchat/components/chat/tools'
 import type { AskAnswer, AskQuestion, ChatEvent, ToolRenderer, ToolRenderProps } from '@agentchat/types'
+import { dropPendingNotes, placeStatusNote } from '@agentchat/lib/status-notes'
 import { t, tf } from './i18n'
 
 /**
@@ -48,6 +49,8 @@ interface Message {
   toolResult?: string
   toolSuccess?: boolean
   reasoning?: string
+  /** `status` rows: work in flight, replaced by the next status note. */
+  pending?: boolean
 }
 
 interface PendingConfirm {
@@ -400,9 +403,19 @@ export const TerminalAgentChat = forwardRef<TerminalAgentChatHandle, TerminalAge
           }
           break
         }
-        case 'status':
-          setMessages((prev) => [...prev, { id: nextMsgId++, role: 'status', content: ev.data.text ?? '' }])
+        case 'status': {
+          // Same placement rules as the main chat (lib/status-notes): the
+          // next note replaces a pending one, and notes never stack under
+          // the streaming placeholder.
+          const note: Message = {
+            id: nextMsgId++,
+            role: 'status',
+            content: ev.data.text ?? '',
+            pending: ev.data.pending === true,
+          }
+          setMessages((prev) => placeStatusNote(prev, note))
           break
+        }
         case 'confirm':
           setPendingConfirm({ id: ev.data.id, name: ev.data.name, arguments: ev.data.arguments })
           break
@@ -434,7 +447,7 @@ export const TerminalAgentChat = forwardRef<TerminalAgentChatHandle, TerminalAge
         case 'error':
           setSubagentNote(null)
           setMessages((prev) => [
-            ...prev,
+            ...dropPendingNotes(prev),
             { id: nextMsgId++, role: 'error', content: tf('errorPrefix', ev.data.message ?? 'error') },
           ])
           break
@@ -442,6 +455,9 @@ export const TerminalAgentChat = forwardRef<TerminalAgentChatHandle, TerminalAge
           setLoading(false)
           loadingRef.current = false
           setSubagentNote(null)
+          // A pending note the turn never resolved (cancelled mid-compaction)
+          // has nothing left to say.
+          setMessages(dropPendingNotes)
           // Anything queued while the turn ran goes out now, as one message.
           const queued = queuedRef.current.splice(0).join('\n')
           if (queued) setTimeout(() => sendMessageRef.current(queued), 0)
@@ -565,13 +581,19 @@ export const TerminalAgentChat = forwardRef<TerminalAgentChatHandle, TerminalAge
       [client, pendingConfirm],
     )
 
-    // Badge click: turn session full-auto off (applies to the in-flight
-    // turn's next tool call too — the backend flag is shared with the loop).
-    const handleAutoConfirmOff = useCallback(() => {
-      const sid = sessionIdRef.current
-      if (sid) void client.setAutoConfirm(sid, false)
-      setAutoConfirm(false)
-    }, [client])
+    // Badge click: switch session full-auto (applies to the in-flight turn's
+    // next tool call too — the backend flag is shared with the loop). Before
+    // a session exists only opting out is meaningful here, so the composer
+    // hides the opt-in pill (`canEnableAutoConfirm={false}`).
+    const handleAutoConfirmChange = useCallback(
+      (enabled: boolean) => {
+        const sid = sessionIdRef.current
+        if (sid) void client.setAutoConfirm(sid, enabled).catch(() => setAutoConfirm(!enabled))
+        else if (enabled) return
+        setAutoConfirm(enabled)
+      },
+      [client],
+    )
 
     const handleAskUser = useCallback(
       (answers: AskAnswer[], cancelled: boolean) => {
@@ -645,7 +667,7 @@ export const TerminalAgentChat = forwardRef<TerminalAgentChatHandle, TerminalAge
           hasMessages
           modelName={modelName}
           autoConfirm={autoConfirm}
-          onAutoConfirmOff={handleAutoConfirmOff}
+          onAutoConfirmChange={handleAutoConfirmChange}
           queueEnabled
           onSendNow={handleSendNow}
         />
@@ -763,7 +785,8 @@ export const TerminalAgentChat = forwardRef<TerminalAgentChatHandle, TerminalAge
                   centered
                   modelName={modelName}
                   autoConfirm={autoConfirm}
-                  onAutoConfirmOff={handleAutoConfirmOff}
+                  onAutoConfirmChange={handleAutoConfirmChange}
+                  canEnableAutoConfirm={false}
                 />
                 <div className="tac-welcome-chips">
                   {[t('chipDiskUsage'), t('chipNetworkStatus'), t('chipSystemLogs')].map((tip) => (

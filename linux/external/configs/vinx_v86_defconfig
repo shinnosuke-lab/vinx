@@ -15,15 +15,15 @@ BR2_TOOLCHAIN_BUILDROOT_MUSL=y
 BR2_TARGET_GENERIC_HOSTNAME="vinx"
 BR2_TARGET_GENERIC_ISSUE="Vinx Linux (i686, in your browser)"
 
-# The overlay carries its own inittab: a passwordless root shell on ttyS0 for
-# the person, agentd on ttyS1 for the model. Buildroot's generated getty line
-# would fight it, so it is off.
+# The overlay carries its own inittab: a passwordless root shell on ttyS0
+# for the person, rpcd/rund for the control plane. Buildroot's generated
+# getty line would fight it, so it is off.
 # BR2_TARGET_GENERIC_GETTY is not set
 BR2_TARGET_ENABLE_ROOT_LOGIN=y
 BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_VINX_PATH)/board/vinx/rootfs-overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_VINX_PATH)/board/vinx/post-build.sh"
 
-# agentd bounds each command with timeout(1); enable that busybox applet.
+# timeout(1) and friends the test suite leans on; see busybox.fragment.
 BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_VINX_PATH)/board/vinx/busybox.fragment"
 
 BR2_LINUX_KERNEL=y
@@ -120,6 +120,13 @@ BR2_PACKAGE_TERMBOX2=y
 # and PCM to 100 at boot through /dev/mixer. Without it, /dev/dsp plays
 # perfect silence. A ~10 KB binary.
 BR2_PACKAGE_VOL=y
+
+# The control plane (see package/vinx-rpc): rpcd owns /dev/ttyS3 and speaks
+# VX1-framed JSON-RPC to the page (system-v2 §6); rund serves proc.run over
+# /run/vinx/rpc.sock; rpc(1) is what js(1)/fetch(1) ride; libvinxrpc.a and
+# vinx_rpc.h make `tcc x.c -lvinxrpc` a one-liner. Replaces the old ad-hoc
+# hostcall.sh line protocol on the same port.
+BR2_PACKAGE_VINX_RPC=y
 
 # A real vim (busybox's vi draws by bytes, not display cells, so CJK text
 # shears into misplaced spaces -- an upstream limitation, not a config one).

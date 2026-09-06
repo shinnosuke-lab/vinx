@@ -2,6 +2,7 @@ import { useState } from "react"
 import { Terminal } from "lucide-react"
 import { cn } from "@agentchat/lib/utils"
 import { t, tf } from "@agentchat/lib/i18n"
+import { formatBudget } from "@agentchat/lib/duration"
 import { CopyButton, RunningIndicator, tryParseJson } from "./shared"
 import type { ToolDisplayProps } from "./index"
 
@@ -51,7 +52,15 @@ export function ShellExecTool({ name, args, result, isRunning }: ToolDisplayProp
 
   const command = parsed?.command ?? parsed?.cmd ?? args ?? ""
   const host = parsed?.host as string | undefined
-  const timeout = parsed?.timeout_secs ?? parsed?.timeout
+  // Budget in human units ("1 h", not "3600s"); a non-numeric value (a host
+  // tool's own convention) is shown as given.
+  const timeoutRaw = parsed?.timeout_secs ?? parsed?.timeout
+  const timeout =
+    timeoutRaw == null
+      ? null
+      : Number.isFinite(Number(timeoutRaw))
+        ? formatBudget(Number(timeoutRaw))
+        : String(timeoutRaw)
   const cmdStr = String(command)
 
   const hasResult = !!result
@@ -78,15 +87,15 @@ export function ShellExecTool({ name, args, result, isRunning }: ToolDisplayProp
           <div className="flex items-center gap-1.5 text-[10px] text-zinc-400">
             <Terminal className="h-3 w-3" />
             <span>
-              {name === "ssh_exec" ? t("ssh") : name === "vinx_run" ? t("vinx") : t("shell")}
+              {name === "ssh_exec" ? t("ssh") : name.endsWith("_run") ? t("run") : t("shell")}
             </span>
             {host && (
               <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-zinc-500">
                 {host}
               </span>
             )}
-            {timeout != null && (
-              <span className="text-zinc-600">{tf("timeoutLabel", String(timeout))}</span>
+            {timeout !== null && (
+              <span className="text-zinc-600">{tf("timeoutLabel", timeout)}</span>
             )}
           </div>
           <CopyButton text={cmdStr} dark />

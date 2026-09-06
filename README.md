@@ -14,26 +14,29 @@ same machine. The model provider is called straight from the browser; nothing
 you type leaves for a backend of ours, because there is no backend of ours.
 
 ```
-┌─ browser tab ───────────────────────────────────────────┐
-│                                                          │
-│  chat page  ─┐                        ┌─ v86 ──────────┐ │
-│              ├─► WASM agent loop ──────► ttyS1: agentd  │ │
-│  terminal ───┘   (Web Worker)     run  │   (run_shell)  │ │
-│      │                            _shell│                │ │
-│      └── xterm.js ───────────────────────► ttyS0: shell │ │
-│                                         │  (busybox)     │ │
-│  settings: model endpoint + key ─┐      └────────────────┘ │
-│                                  │                        │
-└──────────────────────────────────┼────────────────────────┘
+┌─ browser tab ────────────────────────────────────────────┐
+│                                                           │
+│  chat page  ─┐                         ┌─ v86 ──────────┐ │
+│              ├─► WASM agent loop ───────► ttyS3: rpcd    │ │
+│  terminal ───┘   (Web Worker)   run_shell│  (control     │ │
+│      │                        rpc call ◄─┤   plane)      │ │
+│      └── xterm.js ────────────────────────► ttyS0: shell │ │
+│                                          │  (busybox)    │ │
+│  settings: model endpoint + key ─┐       └───────────────┘ │
+│                                  │                         │
+└──────────────────────────────────┼─────────────────────────┘
                                    ▼
                              LLM provider (CORS)
 ```
 
-Two serial lines leave the VM. `ttyS0` is the person's console: xterm.js on the
-`/terminal` page is wired straight to it, and busybox's own shell does the line
-editing, history and Tab completion. `ttyS1` is `agentd`, a tiny line protocol
-behind the `run_shell` tool — so the model and the person are operating one
-machine, and a file the model writes is there at the prompt.
+Two serial lines carry the traffic. `ttyS0` is the person's console: xterm.js
+on the `/terminal` page is wired straight to it, and busybox's own shell does
+the line editing, history and Tab completion. `ttyS3` is the control plane —
+JSON-RPC frames between the page and `rpcd` in the guest, both directions: the
+model's `run_shell` rides it one way, and the guest's own CLIs (`js`, `fetch`,
+`notify`, `ble`, `bridge`...) call page capabilities the other way, via
+`rpc(1)`. The model and the person are operating one machine, and a file the
+model writes is there at the prompt.
 
 ## Quick start
 
@@ -81,9 +84,10 @@ linux/                    the guest Linux, built with Buildroot in Docker
                           btmon (bluez's analyzer, shim-built), vinx-nasm,
                           vinx-lvgl (LVGL v9 as liblvgl.so), termbox2
     board/vinx/
-      linux.fragment      kernel options: two 8250 UARTs, virtio-net, no SMP
-      rootfs-overlay/     inittab (getty on ttyS0, agentd on ttyS1), agentd,
-                          the guest's browser-facing commands (usr/bin)
+      linux.fragment      kernel options: four 8250 UARTs, virtio-net, no SMP
+      rootfs-overlay/     inittab (getty on ttyS0; rpcd/rund, the ttyS3
+                          control plane), the guest's browser-facing
+                          commands (usr/bin)
 
 nes/                      a NES console spanning guest and page: agnes + a
                           homegrown APU, framebuffer, /dev/dsp sound, Lua
@@ -91,6 +95,13 @@ nes/                      a NES console spanning guest and page: agnes + a
                           as /usr/bin/nes (see nes/README.md)
 
 skills/linux-vm/          the userland reference, shipped with the page
+
+apps/                     the apps shipped with the page, one directory per
+                          package as `app pack` takes it; web/build-apps.mjs
+                          packs them, the page seeds them once per machine
+  lasertyper/             a typing shooter for a tty window (termbox2, tcc)
+  nes/                    the console's window: a ROM picker on a tty, the
+                          image's /usr/bin/nes on the screen
 
 deploy/cloudflare-wisp/   a serverless wisp relay: one Cloudflare Worker
 
@@ -100,7 +111,9 @@ web/                      the page: agent-core in wasm, its worker, the UI, the 
   app/                    the pages themselves
     main.tsx              the chat page
     terminal.tsx          the /terminal console (xterm.js on ttyS0)
-    vm.ts                 the v86 lifecycle, serial bridge and agentd channel
+    vm.ts                 the v86 lifecycle, the serial bridge and the
+                          ttyS3 control link (rpc.ts frames, hostcall.ts
+                          methods)
     net-bridge.ts         the WebRTC LAN bridge (room codes, manual pairing)
     run-shell-tool.tsx    the run_shell tool card
   vendor/                 vendored agent-core engine + chat UI (see UPSTREAM.md)
@@ -117,7 +130,15 @@ web/                      the page: agent-core in wasm, its worker, the UI, the 
   are an HTTP device. `run_shell` calls are POSTed to an internal address the
   worker's own `fetch` intercepts and bounces to the main thread
   (`web/runtime/src/worker.ts`), where `web/runtime/src/device-vm.ts` runs them
-  on `ttyS1` and returns `{ok, output, exit_code}`.
+  as `proc.run` over the ttyS3 control plane and returns `{ok, output,
+  exit_code}`.
+- **The VM → the page.** The guest's CLIs (`js`, `fetch`, `notify`, `say`,
+  `camera`, `open`, `download`, `ble`, `bridge`) are `rpc(1)` calls the other
+  way over the same link: `rpcd` forwards them to the page, which serves them
+  as methods (`web/app/hostcall.ts`) — fetch from the page's origin, speak,
+  notify, Web Bluetooth, the WebRTC bridge. Errors come back named instead of
+  vanishing, and the commands work under `run_shell` too, not just at the
+  console.
 - **The agent → the model.** Everything under `/api/*` that the chat UI expects
   from a server is answered inside the page by the fetch shim
   (`web/runtime/src/shim.ts`); the only real network request is the engine's
@@ -208,8 +229,38 @@ below):
 - `fbdemo` — paints `/dev/fb0`; the footer's screen chip shows the
   framebuffer in a floating window.
 - `nes ROM.nes` — a NES console on that same screen, full speed with sound,
-  scriptable in Lua ([`nes/`](nes)). Ships in the image as `/usr/bin/nes`.
+  scriptable in Lua ([`nes/`](nes)). Ships in the image as `/usr/libexec/nes`
+  behind a small wrapper. All framebuffer programs (`lvdemo`, `fbdemo`,
+  `nes`, your own) go through `fb-run`: one FB program at a time (an flock
+  that dies with the process, `kill -9` included), and the console's termios
+  come back sane on every exit path.
 - `bridge start|join CODE|say WORDS` — one LAN across browsers, below.
+- `rpc call|notify|discover|watch|serve` — the control plane from the
+  shell; `rpc watch [TOPIC...]` prints events (`app.exited`,
+  `window.closed`, ...) as they happen, one line each, and
+  `rpc serve ext.myapp.method -- ./handler` makes a shell script callable
+  by everything else on the machine (and by the page): params arrive on
+  the handler's stdin, its stdout is the result, and the registration
+  dies with the process.
+- `app new|check|pack|install|run|start|stop|enable|list|log` — make and run
+  apps on this machine: scaffold a work tree (`--command`, `--service`,
+  `--web`, `--tty` or `--fb`), validate it (`--json` speaks a stable error
+  shape a model can fix against), pack it into a `.vapp` (a plain tar.gz),
+  install it into
+  `/data/apps` (validated, atomic), and run it — once in the foreground, as
+  a service supervised by `rund` (own process group, log under
+  `/run/vinx/apps/`, bounded crash restarts; enabled services autostart on
+  every boot), or as a **web window**: `index.html`/`style.css`/`app.js`
+  render in a floating window on the page, inside a sandboxed iframe with
+  a locked-down CSP — the app cannot touch the page's DOM, its storage or
+  the network, and talks to the desktop only through a small allowlisted
+  bridge. A hybrid app pairs that window with a Linux backend; closing the
+  window stops the backend. A **tty app** (`--tty`, termbox2 scaffold) gets
+  a real PTY and a floating xterm window on the page — keystrokes ride down,
+  the app's screen rides up (a byte mux on its own serial lane, so a
+  firehose of output never delays a control call) — and an **fb app**
+  (`--fb`, LVGL scaffold with a Chinese label out of the box) draws on the
+  machine's screen under the `fb-run` lock.
 - `alpine` — downloads Alpine's ~3.5 MB minirootfs (needs a relay network),
   chroots in, and hands you `apk`: a real package manager with a 32-bit x86
   repository, everything RAM-resident and gone on reload.
@@ -217,13 +268,17 @@ below):
 Everything is RAM and vanishes on reload — except `/data`. That directory is
 a 9p filesystem whose bytes live on the page side: drop a file onto the
 terminal (or use its footer's file button) and it lands there; the page
-mirrors the directory into IndexedDB — incrementally, on a size/mtime
-fingerprint — and replays it on the next boot. So `/data` is where work
+mirrors the tree into IndexedDB — recursively, incrementally on a size/mtime
+fingerprint, nudged by the emulator's own 9p write event so guest writes
+usually persist within a couple of seconds — and replays it on the next
+boot, directories, executable bits and all. So `/data` is where work
 survives, everything else is honest about being a fresh machine. Files
 deleted inside the VM stay deleted after a reload; work done in the final
-seconds before closing a tab may miss the last snapshot. A 64 MB quota per
-machine keeps the mirror (and the page) from growing without bound — past it,
-persistence pauses and the terminal says so.
+seconds before closing a tab may miss the last snapshot; dot-named scratch
+(`.vinx/` and friends) and the `host/` mount stay out of the archive by
+rule. A 64 MB / 2000-file quota per machine keeps the mirror (and the page)
+from growing without bound — past it, persistence pauses and the terminal
+says so.
 
 `/data` is private to its machine, with one shared spot inside it:
 `/data/share/local` holds the same files on every machine the person has open
@@ -334,10 +389,12 @@ later builds are incremental. `--clean` drops the build volume;
 To change what is in the machine — add packages, files, kernel options, or
 your own Buildroot package — see the recipes in
 [`linux/README.md`](linux/README.md); everything project-specific lives in the
-external tree under [`linux/external/`](linux/external). The command channel
-is a busybox `sh` script at
-[`linux/external/board/vinx/rootfs-overlay/usr/sbin/agentd`](linux/external/board/vinx/rootfs-overlay/usr/sbin/agentd);
-its protocol is documented at the top of that file.
+external tree under [`linux/external/`](linux/external). The control plane is
+a pair of small C daemons in
+[`linux/external/package/vinx-rpc/`](linux/external/package/vinx-rpc) — `rpcd`
+owns the ttyS3 wire and the method routing, `rund` executes `proc.run` jobs —
+with `rpc(1)` as the shell's way in; the protocol lives in
+[`docs/system-v2.zh-CN.md`](docs/system-v2.zh-CN.md) §6.
 
 ## Releasing
 

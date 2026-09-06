@@ -537,6 +537,41 @@ pub struct PromptTokensDetails {
     pub cached_tokens: u32,
 }
 
+/// Provider-neutral token accounting for one LLM round, as reported by the
+/// upstream `usage` object. Zero fields mean "not reported", not "none used".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    /// Prompt / input tokens INCLUDING cache reads (OpenAI convention).
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    /// Prompt tokens served from the provider's prompt cache.
+    pub cached_tokens: u32,
+    /// Prompt tokens written into the cache this round (Anthropic-style
+    /// providers; `0` where the concept does not exist).
+    pub cache_write_tokens: u32,
+}
+
+impl TokenUsage {
+    pub fn is_empty(&self) -> bool {
+        self.prompt_tokens == 0 && self.completion_tokens == 0
+    }
+
+    pub fn total_tokens(&self) -> u32 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
+}
+
+impl From<&SseUsage> for TokenUsage {
+    fn from(u: &SseUsage) -> Self {
+        TokenUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            cached_tokens: u.cached_tokens(),
+            cache_write_tokens: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SseData {
     #[serde(default)]

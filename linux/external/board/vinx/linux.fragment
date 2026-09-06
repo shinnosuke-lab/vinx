@@ -18,9 +18,10 @@ CONFIG_HZ=100
 # landing in the initramfs, which is how the rootfs stays a few megabytes.
 # CONFIG_MODULES is not set
 
-# Two 16550s: ttyS0 is the person's console, ttyS1 is agentd's command
-# channel. v86 emulates up to four; the kernel's default of 4 runtime uarts
-# is made explicit so nobody trims it.
+# Four 16550s: ttyS0 is the person's console, ttyS3 the control plane
+# (rpcd's), ttyS2 a pass-through serial device, ttyS1 idle (reserved for
+# the Phase 6 stream mux). v86 emulates up to four; the kernel's default
+# of 4 runtime uarts is made explicit so nobody trims it.
 CONFIG_SERIAL_8250=y
 CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_SERIAL_8250_NR_UARTS=4

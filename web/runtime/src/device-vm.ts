@@ -16,8 +16,9 @@
  * existence. Everything else stays `run_shell`.
  *
  * Exact file bytes travel through /data (the 9p filesystem both sides can
- * touch), not the agentd channel: agentd truncates output at 64 KiB, 9p reads
- * are exact and memory-speed. See `readGuestFile`/`writeGuestFile`.
+ * touch), not the shell channel: command output inlines up to 64 KiB (with
+ * an explicit truncation marker past it, backed by a §6.8 output ref), 9p
+ * reads are exact and memory-speed. See `readGuestFile`/`writeGuestFile`.
  */
 
 import type { DeviceConfig } from './device';
@@ -45,6 +46,22 @@ export interface ShellDevice {
 	readFile?(name: string): Promise<Uint8Array>;
 	/** Write `/data/<name>` exactly, via 9p. */
 	putFile?(name: string, bytes: Uint8Array): Promise<void>;
+	/** List `/data/<name>` from the page-side inodes: no guest round trip. */
+	listData?(name: string): Promise<DataEntry[]>;
+	/** `mkdir -p /data/<name>`, page-side. */
+	ensureDir?(name: string): Promise<void>;
+	/** Best-effort page-side unlink of `/data/<name>` (staging relays). */
+	deleteData?(name: string): void;
+}
+
+/** One /data directory entry, straight from the page-side 9p inode. */
+export interface DataEntry {
+	name: string;
+	size: number;
+	/** Seconds since the epoch. */
+	mtime: number;
+	mode: number;
+	dir: boolean;
 }
 
 /** The terminal page's screen, offered to the model as `read_terminal`. */
@@ -89,12 +106,28 @@ const MAX_EDIT_BYTES = 2 * 1024 * 1024;
 /** What read_file hands the model at most — context is not a pastebin. */
 const MAX_READ_CHARS = 48_000;
 /**
- * A /data relay name: a dotfile, so snapshots and globs never see it, and
- * unique per transfer, so two overlapping calls (or a stale cleanup from a
- * previous one) can never touch each other's bytes.
+ * A staging relay in the §6.8 tmp namespace: unique per transfer, so two
+ * overlapping calls (or a stale cleanup from a previous one) can never touch
+ * each other's bytes. Lives under /data/.vinx/tmp — the namespace
+ * persistence explicitly excludes and the boot sweep reclaims — not a
+ * root-level dotfile that merely hoped no glob would match (§12.1).
  */
 function ioName(): string {
-	return `.vinx-io-${Math.random().toString(36).slice(2, 10)}`;
+	return `.vinx/tmp/io-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * The 9p-relative name for a clean path inside /data, or null when the path
+ * is not (or not provably) there — dot segments go to the guest lane, where
+ * the shell resolves them for real. /data itself is the empty name.
+ */
+function dataRel(path: string): string | null {
+	if (path === '/data' || path === '/data/') return '';
+	if (!path.startsWith('/data/')) return null;
+	const rel = path.slice('/data/'.length);
+	const segs = rel.split('/');
+	if (segs.some((s) => s === '' || s === '.' || s === '..')) return null;
+	return rel;
 }
 
 const PROMPT = `You are attached to a small Linux machine emulated inside this browser tab \
@@ -108,7 +141,8 @@ for looking around. write_file and edit_file change files with exact content tra
 download_file hands a file from the VM to the person as a browser download; for files \
 going the other way, ask them to drop the file onto the terminal — it appears in /data. \
 run_shell executes one command line with \`sh -c\` as root and returns stdout and stderr \
-combined (capped at 64 KiB). Commands start in /data — the one directory that survives \
+combined (inline up to 64 KiB; a bigger result is cut there with a marker naming the \
+/data file that holds the full text). Commands start in /data — the one directory that survives \
 reloads — as does the person's console. Each call is independent — no shell state \
 survives between calls — but the filesystem and processes do, for as long as the page \
 stays open. \
@@ -145,7 +179,22 @@ The guest also has \`js\` (runs JavaScript on the \
 hosting page, same engine as run_js) and \`fetch\` (HTTP through the page's browser \
 fetch — works with zero network setup, but cross-origin reads need the server to \
 allow CORS; CORS-friendly readers like https://r.jina.ai/URL fetch arbitrary pages \
-as text). Both work from run_shell and from the person's console alike.
+as text). Both work from run_shell and from the person's console alike. \
+You can build the person real apps. An "app" here is an entry on the Apps page of \
+this page — a .vapp package in /data/apps, listed and started from there and by the \
+\`app\` CLI; a standalone HTML file is not one. \`app new NAME --command|--service|--web|--tty|--fb\` \
+scaffolds one that runs as generated, \`app check --json\` names what to fix, \
+\`app pack\`/\`app install\` put it on the Apps page, \`app start\` runs it as a supervised \
+service. A --web app is three files in a sandboxed window (index.html body fragment, \
+style.css, app.js — no <link>/<script src>, no network, no storage) with no process \
+behind it; once installed it opens from the Apps page even with the machine off. A web or tty \
+app opens a floating window on their page (a tty app runs on a real PTY shown in an \
+xterm window — start it with \`app start\`, never \`app run\`, from run_shell: your \
+channel has no tty); an fb app draws on the machine's screen (fb-run runs one FB \
+program at a time). \`rpc\` is the control plane raw: \`rpc discover\` lists every \
+live method, \`rpc watch\` prints events (app.exited, window.closed...) as lines, \
+and \`rpc serve ext.APP.NAME -- ./script\` turns a script into a method every \
+process and the page can call while it runs.
 
 The shell is ash and the userland is busybox, not GNU: no bash-isms, no \`grep -P\`, \
 short flags only. Networking has three modes and by default there is NO internet: the \
@@ -167,6 +216,36 @@ changed rather than making them hunt for it. When they mention "this error" or \
 something on their screen, read_terminal shows you their last lines — read before \
 asking them to paste.`;
 
+/**
+ * The briefing for a machine the person has left powered off: no tools,
+ * one paragraph. A tool-less payload still carries a system prompt, and
+ * that is the point — the model is told why the shell it may remember from
+ * another session is not here, and what to say instead of guessing.
+ */
+export const NO_MACHINE_PROMPT = `This page has a small Linux machine (emulated in the browser tab) \
+that the person has not powered on — booting it is their decision, not yours, and \
+it costs a download the first time. You have no shell, no files on it, and no way \
+to run programs until they do. If a task needs one, say so plainly and point them \
+to the machine capsule at the bottom right of the page (its power key boots the \
+machine; your tools appear on the next message once it is up), then help with \
+whatever does not need it. Plenty does not: what you write into your workspace \
+(a page, a script, a document) reaches the person without any machine — open_file \
+puts an Open button on its card that shows the file in a new browser tab (pages, \
+images, PDFs, text), download_file saves them a copy — so do not send them to the \
+power key for something you can simply show or hand over. Apps neither: an "app" on \
+this page is an entry on its Apps page (a package the machine keeps in /data/apps). \
+Web apps already installed there open without the machine, and install_app installs a \
+new pure web app without it — the window's body fragment, stylesheet and script, \
+written as drafts (no <html>/<head>/<body>, no <link> or <script src>: the window \
+injects style.css and app.js itself, and its sandbox has no network and no storage) \
+— so the person finds it on the Apps page and the card gets an Open button. Its \
+autostart flag (the window opens whenever the page loads, machine on or off) is for \
+when the person asked for an app that shows up every time; otherwise leave it off. Only an \
+app with a program behind it (a service, a command, a tty program) needs the machine.`;
+
+/** `vmToolsPayload`'s shape with nothing in it but the briefing above. */
+export const NO_MACHINE_PAYLOAD: unknown = { tools: [], system_prompt: NO_MACHINE_PROMPT };
+
 /** What a gateway would publish at `GET /api/tools`. */
 export function vmToolsPayload(options: VmToolsOptions = {}): unknown {
 	const tools: unknown[] = [
@@ -177,8 +256,10 @@ export function vmToolsPayload(options: VmToolsOptions = {}): unknown {
 			safe: false,
 			description:
 				'Run a shell command on the Linux VM in this page (sh -c, as root, ' +
-				'starting in /data). Returns stdout and stderr combined, capped at ' +
-				'64 KiB. busybox userland; only /data persists across a page reload.',
+				'starting in /data). Returns stdout and stderr combined, inline up to ' +
+				'64 KiB — a bigger result is truncated with a marker naming the /data ' +
+				'file holding the full text. busybox userland; only /data persists ' +
+				'across a page reload.',
 			parameters: {
 				type: 'object',
 				properties: {
@@ -301,10 +382,14 @@ export function vmToolsPayload(options: VmToolsOptions = {}): unknown {
 		tools.push({
 			name: 'run_js',
 			// Arbitrary code on the page's main thread: gated like run_shell.
+			// §14 splits this from the guest: run_js is the page DIAGNOSTIC
+			// (debug.js on the wire, like js(1) in the guest); Linux work
+			// belongs to run_shell.
 			safe: false,
 			description:
-				'Run JavaScript on the page hosting this VM (the browser main thread, not the ' +
-				"Linux). `await` works; `document`, `window` and `fetch` are the page's own, so " +
+				'Run JavaScript on the page hosting this VM — a page diagnostic (browser main ' +
+				"thread, not the Linux; use run_shell for Linux work). `await` works; `document`, " +
+				"`window` and `fetch` are the page's own, so " +
 				'network requests obey CORS. Returns console output plus the completion value ' +
 				'(expression results count: `6*7` returns 42). The timeout only interrupts code ' +
 				'that awaits — a synchronous infinite loop freezes the page, so never write one.',
@@ -382,9 +467,10 @@ function ranOutcome(output: string, exit_code: number, timeoutNote?: string) {
 }
 
 /**
- * Pull exact file bytes out of the guest: relay through /data, because 9p
- * reads are exact while the agentd channel truncates at 64 KiB. The relay
- * name is a dotfile, invisible to the share's snapshot glob.
+ * Pull exact file bytes out of the guest. A clean /data path is the page's
+ * own filesystem: read it directly, no guest round trip, no relay (§8.2).
+ * Anything else stages through the §6.8 tmp namespace, because 9p reads are
+ * exact while shell output inlines with a ceiling.
  */
 async function readGuestFile(
 	vm: ShellDevice,
@@ -392,6 +478,19 @@ async function readGuestFile(
 	maxBytes: number,
 ): Promise<{ bytes: Uint8Array } | { failed: string; exit_code: number }> {
 	if (!vm.readFile) return { failed: 'this device has no /data lane for exact reads', exit_code: 1 };
+	const direct = dataRel(path);
+	if (direct) {
+		let bytes: Uint8Array;
+		try {
+			bytes = await vm.readFile(direct);
+		} catch {
+			return { failed: `not a regular file: ${path}`, exit_code: 1 };
+		}
+		if (bytes.byteLength > maxBytes) {
+			return { failed: `${path} is ${bytes.byteLength} bytes (limit ${maxBytes})`, exit_code: 1 };
+		}
+		return { bytes };
+	}
 	const relay = ioName();
 	const staged = await vm.runShell(
 		`f=${shq(path)}; ` +
@@ -406,19 +505,37 @@ async function readGuestFile(
 		const bytes = await vm.readFile(relay);
 		return { bytes };
 	} finally {
-		// Awaited so the relay is gone before the next tool call runs — a
-		// fire-and-forget rm used to race the next transfer's staging cp.
-		await vm.runShell(`rm -f /data/${relay}`, 10).catch(() => {});
+		// Unlinked on the page side, which cannot race the next transfer's
+		// staging cp the way a fire-and-forget guest rm once did; the shell
+		// fallback (awaited, for bare ShellDevices) keeps the same property.
+		if (vm.deleteData) vm.deleteData(relay);
+		else await vm.runShell(`rm -f /data/${relay}`, 10).catch(() => {});
 	}
 }
 
-/** The reverse lane: exact bytes into the guest through /data. */
+/** The reverse lane: exact bytes into the guest. A clean /data path lands
+ * page-side (parents created there); anything else stages through the tmp
+ * namespace and a guest cp installs it. */
 async function writeGuestFile(
 	vm: ShellDevice,
 	path: string,
 	bytes: Uint8Array,
 ): Promise<{ ok: true } | { failed: string; exit_code: number }> {
 	if (!vm.putFile) return { failed: 'this device has no /data lane for exact writes', exit_code: 1 };
+	const direct = dataRel(path);
+	if (direct) {
+		try {
+			const dir = direct.includes('/') ? direct.slice(0, direct.lastIndexOf('/')) : '';
+			if (dir && vm.ensureDir) await vm.ensureDir(dir);
+			await vm.putFile(direct, bytes);
+			return { ok: true };
+		} catch (e) {
+			return {
+				failed: `could not write ${path}: ${e instanceof Error ? e.message : String(e)}`,
+				exit_code: 1,
+			};
+		}
+	}
 	const relay = ioName();
 	await vm.putFile(relay, bytes);
 	// Parent directories are created on the way: "write a file into a
@@ -512,7 +629,8 @@ async function runShellTool(vm: ShellDevice, args: any) {
 	}
 	const timeout = clamp(Number(args?.timeout) || 30, 1, 120);
 	const ran = await vm.runShell(command, timeout);
-	// 137 is agentd's SIGKILL-on-timeout.
+	// 137 is the guest-side SIGKILL-on-timeout (rund kills the process
+	// group at timeoutMs, the same convention agentd used).
 	return ranOutcome(
 		ran.output,
 		ran.exit_code,
@@ -523,8 +641,12 @@ async function runShellTool(vm: ShellDevice, args: any) {
 async function shareLocalTool(vm: ShellDevice, extras: VmExtras, args: any) {
 	if (!validPath(args?.path)) return refuse(400, "share_local requires a 'path' string");
 	// The guest's share(1) does the copy, the size check and the wording of
-	// the result; the page-side snapshot mirrors and announces it.
-	const ran = await vm.runShell(`share local ${shq(args.path)}`, 30);
+	// the result; the page-side snapshot mirrors and announces it. The
+	// budget is generous for what is one cp: sharing is exactly the moment
+	// two machines run at once (this VM and the tab being handed the file),
+	// and two emulated CPUs on one host thread can make even a cp crawl —
+	// 30 s was measured to starve under a long E2E suite's heat.
+	const ran = await vm.runShell(`share local ${shq(args.path)}`, 60);
 	if (ran.exit_code === 0) extras.onShared?.();
 	return ranOutcome(ran.output, ran.exit_code);
 }
@@ -556,11 +678,35 @@ async function readFileTool(vm: ShellDevice, args: any) {
 
 async function listDirTool(vm: ShellDevice, args: any) {
 	if (!validPath(args?.path)) return refuse(400, "list_dir requires a 'path' string");
+	// /data is the page's own filesystem: list it from the inodes (§8.2).
+	const rel = dataRel(args.path);
+	if (rel !== null && vm.listData) {
+		try {
+			return ranOutcome(formatListing(await vm.listData(rel)), 0);
+		} catch (e) {
+			return ranOutcome(e instanceof Error ? e.message : String(e), 1);
+		}
+	}
 	// `--` so a name starting with a dash stays a name; the output rides the
-	// agentd channel (a listing fits 64 KiB or the directory needs run_shell
-	// with filters anyway).
+	// shell channel (a listing fits the inline ceiling or the directory
+	// needs run_shell with filters anyway).
 	const ran = await vm.runShell(`ls -la -- ${shq(args.path)}`, 30);
 	return ranOutcome(ran.output, ran.exit_code);
+}
+
+/** An ls-shaped listing from page-side inodes: type + permission bits,
+ * size, mtime, name — /data listed without waking the guest. */
+function formatListing(entries: DataEntry[]): string {
+	if (entries.length === 0) return '(empty)';
+	return [...entries]
+		.sort((a, b) => a.name.localeCompare(b.name))
+		.map((e) => {
+			let bits = '';
+			for (let i = 0; i < 9; i++) bits += e.mode & (0o400 >> i) ? 'rwxrwxrwx'[i] : '-';
+			const when = new Date(e.mtime * 1000).toISOString().slice(0, 16).replace('T', ' ');
+			return `${e.dir ? 'd' : '-'}${bits} ${String(e.size).padStart(9)} ${when} ${e.name}${e.dir ? '/' : ''}`;
+		})
+		.join('\n');
 }
 
 async function writeFileTool(vm: ShellDevice, args: any) {

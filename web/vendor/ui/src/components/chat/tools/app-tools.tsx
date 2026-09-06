@@ -14,7 +14,7 @@ import type { ToolDisplayProps } from "./index"
 
 function chip(icon: React.ReactNode, label: string) {
   return (
-    <span className="inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 font-mono text-[11px] text-foreground/80">
+    <span className="inline-flex max-w-full min-w-0 items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 font-mono text-[11px] text-foreground/80 wrap-anywhere">
       {icon}
       {label}
     </span>

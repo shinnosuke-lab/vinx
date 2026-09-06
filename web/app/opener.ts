@@ -1,28 +1,16 @@
 /**
  * The page half of open(1) in the guest: give the bytes a MIME type and hand
  * them to the browser, which renders what it can (PDF, HTML, images, video,
- * text) in a new tab and downloads the rest. Plus the base64 helpers the
- * terminal's OSC handlers need.
+ * text) in a new tab and downloads the rest.
  *
- * window.open here usually runs outside a user gesture (the trigger was
- * serial output), so a popup blocker may say no; `OpenRequest.open()` reports
- * that, and the terminal shows a click-me chip whose click is a gesture.
+ * window.open here usually runs outside a user gesture (the trigger was an
+ * RPC frame off the wire), so a popup blocker may say no; `OpenRequest.open()`
+ * reports that, and the terminal shows a click-me chip whose click is a
+ * gesture. (The base64 helpers that used to live here left with the OSC
+ * handlers in Phase 3.)
  */
 
 import { triggerDownload } from './downloads';
-
-const decoder = new TextDecoder();
-
-export function bytesFromB64(b64: string): Uint8Array {
-	const bin = atob(b64);
-	const bytes = new Uint8Array(bin.length);
-	for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-	return bytes;
-}
-
-export function textFromB64(b64: string): string {
-	return decoder.decode(bytesFromB64(b64));
-}
 
 /**
  * By extension, not by sniffing: the point is to tell the browser what it is

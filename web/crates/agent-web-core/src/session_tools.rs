@@ -25,9 +25,7 @@ use async_trait::async_trait;
 use crate::context::SUMMARY_MARKER;
 use crate::store::SessionStore;
 use crate::tool::{Tool, ToolContext, ToolRegistry};
-use crate::types::{
-    ChatMessage, Role, ToolDefinition, ToolParameter, ToolParameters, ToolResult,
-};
+use crate::types::{ChatMessage, Role, ToolDefinition, ToolParameter, ToolParameters, ToolResult};
 
 /// Per-message excerpt cap in a transcript (chars).
 const MSG_CHAR_LIMIT: usize = 500;
@@ -441,8 +439,7 @@ fn assemble_transcript(entries: Vec<String>) -> String {
     }
 
     let head: Vec<String> = entries.iter().take(HEAD_KEEP).cloned().collect();
-    let mut budget =
-        TOTAL_CHAR_BUDGET.saturating_sub(head.iter().map(|e| e.chars().count()).sum());
+    let mut budget = TOTAL_CHAR_BUDGET.saturating_sub(head.iter().map(|e| e.chars().count()).sum());
     let mut tail: Vec<String> = Vec::new();
     for e in entries.iter().skip(HEAD_KEEP).rev() {
         let len = e.chars().count();

@@ -14,6 +14,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use agent_web_core::host::AgentHost;
+use agent_web_core::store::SessionStore;
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_test::*;
 
@@ -27,13 +29,22 @@ struct Harness {
 
 impl Harness {
     fn new() -> Harness {
+        Self::build(|sink| AgentHost::new(sink).expect("host over an in-memory store"))
+    }
+
+    /// A host over a store another host may already have written to: what a
+    /// reload looks like from inside a test.
+    fn over(store: Arc<SessionStore>) -> Harness {
+        Self::build(|sink| AgentHost::over_shared(sink, store))
+    }
+
+    fn build(make: impl FnOnce(js_sys::Function) -> AgentHost) -> Harness {
         let frames = Rc::new(RefCell::new(Vec::new()));
         let recorder = frames.clone();
         let sink = Closure::wrap(Box::new(move |stream: String, frame: String| {
             recorder.borrow_mut().push((stream, frame));
         }) as Box<dyn FnMut(String, String)>);
-        let host = AgentHost::new(sink.as_ref().unchecked_ref::<js_sys::Function>().clone())
-            .expect("host over an in-memory store");
+        let host = make(sink.as_ref().unchecked_ref::<js_sys::Function>().clone());
         Harness {
             host,
             frames,
@@ -157,9 +168,7 @@ fn an_imported_transcript_comes_back_intact() {
         },
         { "role": "tool", "content": "3 devices", "tool_call_id": "call_1" },
     ]);
-    h.host
-        .import_session("s", &transcript.to_string())
-        .unwrap();
+    h.host.import_session("s", &transcript.to_string()).unwrap();
 
     let detail: serde_json::Value = serde_json::from_str(&h.host.session("s").unwrap()).unwrap();
     let messages = detail["messages"].as_array().unwrap();
@@ -170,8 +179,7 @@ fn an_imported_transcript_comes_back_intact() {
     assert_eq!(detail["meta"]["running"], false);
 
     // And it shows up in the list with the system message excluded from counts.
-    let sessions: serde_json::Value =
-        serde_json::from_str(&h.host.sessions().unwrap()).unwrap();
+    let sessions: serde_json::Value = serde_json::from_str(&h.host.sessions(None).unwrap()).unwrap();
     assert_eq!(sessions.as_array().unwrap().len(), 1);
     assert_eq!(sessions[0]["id"], "s");
     assert_eq!(sessions[0]["message_count"], 3);
@@ -205,7 +213,8 @@ fn a_turn_without_an_endpoint_is_refused_and_says_so_on_the_stream() {
 #[wasm_bindgen_test]
 fn a_sessions_origin_is_the_surface_that_started_it() {
     let h = Harness::new();
-    h.host.configure("https://api.example.com/v1", "key", "model");
+    h.host
+        .configure("https://api.example.com/v1", "key", "model");
 
     assert_eq!(
         ack(&h.host.send("term", "hi", r#"{"origin":"terminal"}"#))["accepted"],
@@ -213,7 +222,7 @@ fn a_sessions_origin_is_the_surface_that_started_it() {
     );
     assert_eq!(ack(&h.host.send("chat", "hi", "{}"))["accepted"], true);
 
-    let sessions: serde_json::Value = serde_json::from_str(&h.host.sessions().unwrap()).unwrap();
+    let sessions: serde_json::Value = serde_json::from_str(&h.host.sessions(None).unwrap()).unwrap();
     let origin = |id: &str| {
         sessions
             .as_array()
@@ -233,7 +242,8 @@ fn a_sessions_origin_is_the_surface_that_started_it() {
 #[wasm_bindgen_test]
 fn a_turn_is_visible_to_an_attach_that_follows_immediately() {
     let h = Harness::new();
-    h.host.configure("https://api.example.com/v1", "key", "model");
+    h.host
+        .configure("https://api.example.com/v1", "key", "model");
 
     assert_eq!(ack(&h.host.send("chat", "hello", "{}"))["accepted"], true);
     h.watch("s1", "chat");
@@ -249,7 +259,7 @@ fn a_turn_is_visible_to_an_attach_that_follows_immediately() {
     );
 
     // And the same turn is reported as running by the session list.
-    let sessions: serde_json::Value = serde_json::from_str(&h.host.sessions().unwrap()).unwrap();
+    let sessions: serde_json::Value = serde_json::from_str(&h.host.sessions(None).unwrap()).unwrap();
     assert_eq!(sessions[0]["running"], true);
 }
 
@@ -261,7 +271,8 @@ fn a_turn_is_visible_to_an_attach_that_follows_immediately() {
 #[wasm_bindgen_test]
 fn history_carries_the_message_the_turn_was_started_with() {
     let h = Harness::new();
-    h.host.configure("https://api.example.com/v1", "key", "model");
+    h.host
+        .configure("https://api.example.com/v1", "key", "model");
 
     h.host.send("chat", "scan for devices", "{}");
     h.watch("s1", "chat");
@@ -290,7 +301,8 @@ fn history_carries_the_message_the_turn_was_started_with() {
 #[wasm_bindgen_test]
 fn full_auto_is_remembered_for_the_session_that_granted_it() {
     let h = Harness::new();
-    h.host.configure("https://api.example.com/v1", "key", "model");
+    h.host
+        .configure("https://api.example.com/v1", "key", "model");
     // A stored session to read back: `session()` answers `null` for an id that
     // has never been written, and every assertion below would pass against it.
     h.host.import_session("chat", "[]").unwrap();
@@ -307,7 +319,8 @@ fn full_auto_is_remembered_for_the_session_that_granted_it() {
 
     h.watch("s2", "chat");
     assert_eq!(
-        h.payload("s2", "session")["auto_confirm"], true,
+        h.payload("s2", "session")["auto_confirm"],
+        true,
         "a reattach must not report the badge as off"
     );
 
@@ -316,7 +329,10 @@ fn full_auto_is_remembered_for_the_session_that_granted_it() {
 
     // And the next turn in that session starts with it still on, which is the
     // part that was broken: the flag used to live for one turn only.
-    assert_eq!(ack(&h.host.send("chat", "again", "{}"))["auto_confirm"], true);
+    assert_eq!(
+        ack(&h.host.send("chat", "again", "{}"))["auto_confirm"],
+        true
+    );
 
     // Another session is unaffected: this is not a global switch.
     h.watch("s3", "other");
@@ -351,7 +367,8 @@ fn full_auto_can_be_turned_off_again() {
 #[wasm_bindgen_test]
 fn a_following_stream_is_told_when_the_next_turn_starts() {
     let h = Harness::new();
-    h.host.configure("https://api.example.com/v1", "key", "model");
+    h.host
+        .configure("https://api.example.com/v1", "key", "model");
 
     h.follow("f", "chat");
     h.watch("w", "chat");
@@ -446,7 +463,8 @@ fn rewinding_discards_a_message_and_everything_after_it() {
 #[wasm_bindgen_test]
 fn rewinding_is_refused_while_a_turn_is_running() {
     let h = Harness::new();
-    h.host.configure("https://api.example.com/v1", "key", "model");
+    h.host
+        .configure("https://api.example.com/v1", "key", "model");
     h.host.import_session("chat", "[]").unwrap();
 
     h.host.send("chat", "hello", "{}");
@@ -458,7 +476,8 @@ fn rewinding_is_refused_while_a_turn_is_running() {
 #[wasm_bindgen_test]
 fn a_second_turn_is_refused_while_one_is_in_flight() {
     let h = Harness::new();
-    h.host.configure("https://api.example.com/v1", "key", "model");
+    h.host
+        .configure("https://api.example.com/v1", "key", "model");
 
     assert_eq!(ack(&h.host.send("chat", "one", "{}"))["accepted"], true);
     let second = ack(&h.host.send("chat", "two", "{}"));
@@ -519,7 +538,7 @@ fn two_streams_on_one_session_both_get_the_opening_frames() {
 fn session_queries_return_json_the_client_can_use() {
     let h = Harness::new();
 
-    assert_eq!(h.host.sessions().unwrap(), "[]");
+    assert_eq!(h.host.sessions(None).unwrap(), "[]");
     assert_eq!(h.host.session("nope").unwrap(), "null");
 
     let hits: serde_json::Value = serde_json::from_str(&h.host.search("", 10, None).unwrap())
@@ -528,7 +547,9 @@ fn session_queries_return_json_the_client_can_use() {
 
     // Updating a session that does not exist is a no-op rather than an error,
     // matching the store.
-    h.host.update_session("nope", Some("t".into()), Some(true)).unwrap();
+    h.host
+        .update_session("nope", Some("t".into()), Some(true), None, None)
+        .unwrap();
     h.host.delete_session("nope").unwrap();
 }
 
@@ -545,3 +566,95 @@ async fn an_unconfigured_host_lists_no_models_rather_than_failing() {
 // would need a reachable model endpoint, and the client's retry/backoff would
 // make the test slow and flaky. That path is covered end to end against a live
 // endpoint when the fetch shim lands.
+
+#[wasm_bindgen_test]
+fn sessions_scope_archive_and_category_round_trip_through_the_host() {
+    let h = Harness::new();
+    let transcript = serde_json::json!([{ "role": "user", "content": "hi" }]);
+    h.host.import_session("a", &transcript.to_string()).unwrap();
+    h.host.import_session("b", &transcript.to_string()).unwrap();
+
+    // Archive one, label the other; the category arrives as the JS shim sends
+    // it ('' = clear, since Option<String> has no third state).
+    h.host
+        .update_session("a", None, None, Some(true), None)
+        .unwrap();
+    h.host
+        .update_session("b", None, None, None, Some("work".into()))
+        .unwrap();
+
+    let list = |scope: Option<&str>| -> serde_json::Value {
+        serde_json::from_str(&h.host.sessions(scope.map(str::to_string)).unwrap()).unwrap()
+    };
+    let active = list(None);
+    assert_eq!(active.as_array().unwrap().len(), 1, "archived rows leave the default list");
+    assert_eq!(active[0]["id"], "b");
+    assert_eq!(active[0]["category"], "work");
+    assert!(active[0].get("archived_at").is_none(), "unset flags are omitted, not null");
+
+    let archived = list(Some("archived"));
+    assert_eq!(archived.as_array().unwrap().len(), 1);
+    assert_eq!(archived[0]["id"], "a");
+    assert!(archived[0]["archived_at"].is_string());
+    assert_eq!(list(Some("all")).as_array().unwrap().len(), 2);
+    assert!(h.host.sessions(Some("bogus".into())).is_err(), "unknown scopes are refused");
+
+    // The detail's meta carries the same flags, so a page opened on an
+    // archived session can show its state.
+    let detail: serde_json::Value = serde_json::from_str(&h.host.session("a").unwrap()).unwrap();
+    assert!(detail["meta"]["archived_at"].is_string());
+    let detail: serde_json::Value = serde_json::from_str(&h.host.session("b").unwrap()).unwrap();
+    assert_eq!(detail["meta"]["category"], "work");
+
+    // Clearing: '' from the shim, plus an over-long label is ignored.
+    h.host
+        .update_session("b", None, None, None, Some("".into()))
+        .unwrap();
+    assert!(list(None)[0].get("category").is_none());
+    assert!(
+        h.host
+            .update_session("b", None, None, None, Some("x".repeat(65)))
+            .is_err(),
+        "over-long labels are refused"
+    );
+    assert!(list(None)[0].get("category").is_none());
+
+    // Restoring brings it back to the default list.
+    h.host
+        .update_session("a", None, None, Some(false), None)
+        .unwrap();
+    assert_eq!(list(None).as_array().unwrap().len(), 2);
+
+    // Promoting a queued id nobody parked reports "not found" rather than
+    // touching any turn.
+    assert!(!h.host.queue_promote("a", 42.0));
+}
+
+#[wasm_bindgen_test]
+fn full_auto_survives_a_reload() {
+    let store = Arc::new(SessionStore::open(":memory:").unwrap());
+    let transcript = serde_json::json!([{ "role": "user", "content": "hi" }]).to_string();
+    let meta = |h: &Harness, id: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&h.host.session(id).unwrap()).unwrap()["meta"]
+            .clone()
+    };
+
+    // First tab: flip the badge on a saved session, and on one that has no
+    // row yet (the toggle in a fresh composer).
+    let first = Harness::over(store.clone());
+    first.host.import_session("a", &transcript).unwrap();
+    assert_eq!(meta(&first, "a")["auto_confirm"], false, "off by default");
+    first.host.set_auto("a", true);
+    first.host.set_auto("fresh", true);
+    assert_eq!(meta(&first, "a")["auto_confirm"], true);
+    drop(first);
+
+    // After the reload the saved session remembers; the one that never had a
+    // turn had nothing to remember it in.
+    let second = Harness::over(store.clone());
+    assert_eq!(meta(&second, "a")["auto_confirm"], true, "read before any flag is created");
+    assert!(!store.full_auto("fresh").unwrap());
+    second.host.set_auto("a", false);
+    assert_eq!(meta(&second, "a")["auto_confirm"], false);
+    assert!(!store.full_auto("a").unwrap(), "turning it off is persisted too");
+}

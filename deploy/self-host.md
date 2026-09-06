@@ -130,3 +130,41 @@ what each piece can and cannot do:
   [wisp-server-python](https://github.com/MercuryWorkshop/wisp-server-python)
   blocks loopback and private destinations unless `--allow-loopback` /
   `--allow-private` are passed — a good pick for shared deployments.
+
+## The app shell (web app windows)
+
+Guest apps with a web UI (`app new NAME --web`) render inside a sandboxed
+iframe whose document is `web/app/public/app-frame.html` — one static file,
+no build step, copied into `dist/` beside the page. **Nothing to configure:**
+the desktop loads it as `app-frame.html` relative to its own document, so it
+is served by whatever serves the page, GitHub Pages included. Two walls make
+it a wall rather than a decoration (system-v2 §10.3), and neither depends on
+where the file is hosted:
+
+- the frame's `sandbox="allow-scripts"` (no `allow-same-origin`): the
+  document is an opaque origin — no storage, no cookie, no reach into the
+  page's DOM, even though it comes from the page's own host;
+- the policy in the file's own `<meta http-equiv="Content-Security-Policy">`
+  — `default-src 'none'; script-src 'unsafe-inline'; style-src
+  'unsafe-inline'; img-src data:` — no network, no external script, no
+  child frame. A meta policy binds exactly like a response header; later
+  policies can only tighten it, and app text arrives via `innerHTML`, where
+  a `<meta http-equiv>` is inert anyway.
+
+What hosting the shell on the page's own site does *not* buy is a guaranteed
+separate renderer process: desktop Chromium (127+) gives a sandboxed frame
+its own process regardless of site, but Firefox, Safari and mobile browsers
+may run it in the page's. There the walls above still hold, but a buggy
+app's synchronous infinite loop hangs the whole tab until you reload it
+(the machine's `/data` persists; the boot does not). Vinx is a local page —
+your own model writing apps for your own browser — so that is the default
+trade. If you want the process wall on every browser, host a copy of the
+same file on a different *site* (a different registrable domain or a
+separate `*.pages.dev`/`*.github.io` project) and bake its URL into the
+build:
+
+```bash
+VINX_APP_FRAME_URL=https://apps.example.net/app-frame.html npm run build
+```
+
+The copy needs no headers of its own — the policy travels in the file.

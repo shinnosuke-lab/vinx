@@ -1,0 +1,164 @@
+<!doctype html>
+<!--
+  The vinx app shell (system-v2 §10.3): a static page that receives one
+  app bundle over postMessage and runs it. It never touches the VM and
+  holds no secrets. It ships inside the built site (app/public/ → dist/)
+  and is loaded from there by default; a deploy may point the desktop at
+  a copy on another site instead (VINX_APP_FRAME_URL).
+
+  Two walls, neither depending on where the file is served from:
+
+  - the iframe's sandbox (allow-scripts only, no allow-same-origin): the
+    document is an opaque origin — no storage, no cookie, no reach into
+    the desktop's DOM even when served from the desktop's own origin;
+  - the Content-Security-Policy in the <meta> below: no network, no
+    external script, no child frame; only the bundle's own inline
+    script/style and data: images. A meta policy binds like a header —
+    later policies can only tighten it, and the bundle's html lands via
+    innerHTML, where a <meta http-equiv> is inert anyway.
+
+      default-src 'none'; script-src 'unsafe-inline';
+      style-src 'unsafe-inline'; img-src data:
+
+  Process isolation is the browser's to give: desktop Chromium (127+)
+  runs a sandboxed frame in its own process whatever its site; elsewhere
+  a same-site shell may share the desktop's, so an app's synchronous
+  infinite loop can hang the page until it is reloaded (§18). A deploy
+  that wants that wall everywhere hosts a copy of this file on a
+  different site and names it with VINX_APP_FRAME_URL.
+
+  The bundle is structured {html, css, js} — never a whole document. It is
+  loaded the §10.3 way: CSS as style text, HTML as a body fragment, JS as
+  one inline script — no hand-written HTML rewriter. The first message that
+  carries a MessagePort wins; everything after rides that port and nothing
+  else (window `message` is not an authoritative channel). The desktop
+  knows this frame as {machineId, appId} through the port it kept — an
+  opaque origin has no usable event.origin and ids in messages are not
+  identity.
+
+  The app sees one tiny API, `vinx`:
+      vinx.call(method, params) -> Promise   (host-allowlisted methods)
+      vinx.close()                           (ask the desktop to close this window)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:" />
+<title>vinx app</title>
+<style>
+	:root { color-scheme: dark light; }
+	html, body { margin: 0; height: 100%; }
+	body { font: 13px/1.5 system-ui, sans-serif; background: #16161e; color: #c0caf5; }
+</style>
+<script>
+	'use strict';
+	addEventListener('message', function boot(e) {
+		var d = e.data;
+		if (!d || d.t !== 'vinx-bundle' || !e.ports || !e.ports[0]) return;
+		removeEventListener('message', boot);
+		var port = e.ports[0];
+
+		var seq = 0;
+		var pending = new Map();
+		port.onmessage = function (ev) {
+			var m = ev.data;
+			if (!m || typeof m.re !== 'number') return;
+			var p = pending.get(m.re);
+			if (!p) return;
+			pending.delete(m.re);
+			if (m.ok) p.resolve(m.result);
+			else p.reject(new Error(String(m.error || 'the desktop refused the call')));
+		};
+
+		// The app's whole system surface. Defined before the app's script
+		// runs, frozen so the app cannot confuse itself about it.
+		var vinx = {
+			call: function (method, params) {
+				return new Promise(function (resolve, reject) {
+					var id = ++seq;
+					pending.set(id, { resolve: resolve, reject: reject });
+					port.postMessage({ t: 'call', id: id, method: String(method), params: params || {} });
+				});
+			},
+			close: function () {
+				return vinx.call('window.close', {});
+			},
+		};
+		Object.freeze(vinx);
+		window.vinx = vinx;
+
+		// This document is sandboxed without allow-same-origin — an opaque
+		// origin, so it can hold no storage and no cookie: the very property
+		// that keeps one app's window from reading another's, or the desktop's.
+		// The browser expresses that by THROWING on the mere read of
+		// `localStorage`, which takes a model-written app down at its first
+		// line for a habit as ordinary as remembering a high score. Stand in
+		// an in-memory Storage for the window's lifetime: the app runs, the
+		// score lasts until the window closes, and `app check` (JS_SANDBOX_API)
+		// says why nothing persists.
+		function volatileStorage() {
+			var m = new Map();
+			return {
+				get length() { return m.size; },
+				key: function (i) { return Array.from(m.keys())[i] === undefined ? null : Array.from(m.keys())[i]; },
+				getItem: function (k) { return m.has(String(k)) ? m.get(String(k)) : null; },
+				setItem: function (k, v) { m.set(String(k), String(v)); },
+				removeItem: function (k) { m.delete(String(k)); },
+				clear: function () { m.clear(); },
+			};
+		}
+		try {
+			void window.localStorage;
+		} catch (_) {
+			var local = volatileStorage();
+			var session = volatileStorage();
+			Object.defineProperty(window, 'localStorage', { value: local, configurable: true });
+			Object.defineProperty(window, 'sessionStorage', { value: session, configurable: true });
+			Object.defineProperty(document, 'cookie', {
+				get: function () { return ''; },
+				set: function () {},
+				configurable: true,
+			});
+		}
+
+		var style = document.createElement('style');
+		style.textContent = String(d.css || '');
+		document.head.appendChild(style);
+		// A body *fragment*: scripts inside it do not execute via innerHTML
+		// (by HTML spec), which is exactly right — the bundle's code is its
+		// js part, nothing else.
+		//
+		// Written as a whole page anyway — <html>/<head>/<body> wrappers, a
+		// <link rel=stylesheet href="style.css">, a <script src="app.js"> —
+		// the fragment is what is left after unwrapping and dropping those
+		// references: the css and js parts ARE style.css and app.js, already
+		// injected, and under the shell's CSP a fetch of either would only
+		// fail. Models write pages by habit; `app check` names the habit
+		// (HTML_EXTERNAL_REF) and this makes the window work meanwhile.
+		document.body.innerHTML = asFragment(String(d.html || ''));
+		var script = document.createElement('script');
+		script.textContent = String(d.js || '');
+		document.body.appendChild(script);
+
+		port.postMessage({ t: 'ready' });
+	});
+
+	function asFragment(html) {
+		if (!/<(?:!doctype|html|head|body|link|script)\b/i.test(html)) return html;
+		var doc = new DOMParser().parseFromString(html, 'text/html');
+		// Same-package references only; anything else was never going to
+		// load under default-src 'none' either, and dropping it keeps the
+		// console clean so the app's own errors stand out.
+		var refs = doc.querySelectorAll('link[rel~="stylesheet"], script[src]');
+		for (var i = 0; i < refs.length; i++) refs[i].parentNode.removeChild(refs[i]);
+		// Inline <script> in the html never ran (innerHTML) and does not now;
+		// <style> blocks in a head are kept — moved into the body they still
+		// apply, and a page-shaped index.html often carries its CSS there.
+		var styles = doc.head.querySelectorAll('style');
+		for (var j = 0; j < styles.length; j++) doc.body.insertBefore(styles[j], doc.body.firstChild);
+		return doc.body.innerHTML;
+	}
+</script>
+</head>
+<body></body>
+</html>

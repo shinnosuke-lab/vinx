@@ -40,10 +40,12 @@ import {
 	setIceList,
 } from './net-bridge';
 import { bridgeRelays, setBridgeRelays } from './nostr-signal';
-import { trackRoom } from './bridge-ctl';
+import { Icon, ICON_MONITOR, ICON_POWER, ICON_TERMINAL } from './icons';
 import { t, tf } from './i18n';
-import { existingVm, sharedVm, type RelayHealth, type VmState } from './vm';
-import { VINX_LOGO } from '../vendor/ui/src/assets/vinx-logo';
+import { flushMirror } from './share-store';
+import { existingVm, sharedVm, type BootProgress, type RelayHealth, type VmState } from './vm';
+import { bootStatusLine, rememberedPower, rememberPower, type VmStatus } from './vm-status';
+import { windowManager } from './window-manager';
 import './net-panel.css';
 
 // Where the two "how do I run one?" links point: this repo's own
@@ -396,10 +398,13 @@ function BridgePanel({ onClose }: { onClose: () => void }) {
 		force();
 	};
 
+	// No paperwork after these: bridge(1)'s show reads the live room through
+	// network.bridge.status, so a room started with clicks is visible to the
+	// guest with nothing written anywhere (the old /data/.bridge-status job).
 	const host = () =>
 		guard(async () => {
 			const me = await guestIdentity();
-			trackRoom(await hostRoom(me.name, me.ip));
+			await hostRoom(me.name, me.ip);
 			force();
 		});
 
@@ -407,7 +412,7 @@ function BridgePanel({ onClose }: { onClose: () => void }) {
 		guard(async () => {
 			const me = await guestIdentity();
 			setMode('idle');
-			trackRoom(await joinRoom(code, me.name, me.ip));
+			await joinRoom(code, me.name, me.ip);
 			force();
 		});
 
@@ -508,7 +513,7 @@ function BridgePanel({ onClose }: { onClose: () => void }) {
 														onClick={() =>
 															guard(async () => {
 																const me = await guestIdentity();
-																trackRoom((await manualInvite(me.name, me.ip)).room);
+																await manualInvite(me.name, me.ip);
 																force();
 															})
 														}
@@ -540,7 +545,7 @@ function BridgePanel({ onClose }: { onClose: () => void }) {
 															onClick={() =>
 																guard(async () => {
 																	const me = await guestIdentity();
-																	trackRoom((await manualAnswer(paste, me.name, me.ip)).room);
+																	await manualAnswer(paste, me.name, me.ip);
 																	setPaste('');
 																	setMode('idle');
 																	force();
@@ -743,7 +748,70 @@ function AdvancedFold() {
 	);
 }
 
-function Panel({ onClose, onManageBridge }: { onClose: () => void; onManageBridge: () => void }) {
+/** The first-load question, in the network dialog's dress: two options as
+ * radio cards, cancel/confirm. Either answer is the machine's remembered
+ * power from then on (machine-power.ts) — "Power on" leaves it running,
+ * "Not now" leaves it off — so the question is asked once; the power key
+ * is how the person changes their mind. Cancel (or the backdrop) decides
+ * nothing: the machine stays off for this load, and the next load asks
+ * again. */
+function MachineAskDialog({
+	choice,
+	onChoice,
+	onConfirm,
+	onCancel,
+}: {
+	choice: 'boot' | 'skip';
+	onChoice: (c: 'boot' | 'skip') => void;
+	onConfirm: () => void;
+	onCancel: () => void;
+}) {
+	return (
+		<div className="np-backdrop" onClick={onCancel}>
+			<div
+				className="np-panel np-ask"
+				data-testid="vm-ask"
+				role="dialog"
+				aria-label={t('vmAskTitle')}
+				onClick={(e) => e.stopPropagation()}
+			>
+				<div className="np-title">{t('vmAskTitle')}</div>
+				<div className="np-opt-d np-ask-body">{t('vmAskBody')}</div>
+				<label className={`np-opt np-ask-boot${choice === 'boot' ? ' on' : ''}`}>
+					<input type="radio" name="np-ask" checked={choice === 'boot'} onChange={() => onChoice('boot')} />
+					<div>
+						<div className="np-opt-h">{t('vmAskBoot')}</div>
+						<div className="np-opt-d">{t('vmAskBootD')}</div>
+					</div>
+				</label>
+				<label className={`np-opt np-ask-skip${choice === 'skip' ? ' on' : ''}`}>
+					<input type="radio" name="np-ask" checked={choice === 'skip'} onChange={() => onChoice('skip')} />
+					<div>
+						<div className="np-opt-h">{t('vmAskSkip')}</div>
+						<div className="np-opt-d">{t('vmAskSkipD')}</div>
+					</div>
+				</label>
+				<div className="np-opt-d np-ask-note">{t('vmAskNote')}</div>
+				<div className="np-actions">
+					<button type="button" className="np-cancel" onClick={onCancel}>
+						{t('npCancel')}
+					</button>
+					<button type="button" className="np-save np-ask-go" onClick={onConfirm}>
+						{t('npConfirm')}
+					</button>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+function Panel({
+	onClose,
+	onManageBridge,
+}: {
+	onClose: () => void;
+	onManageBridge: () => void;
+}) {
 	const token = currentRelay();
 	const start = initialChoice(token);
 	// A live bridge is the "Bridge LAN" mode in effect, whatever the stored
@@ -999,12 +1067,51 @@ function NetGlyph({ label, size = 15 }: { label: string; size?: number }) {
 	);
 }
 
-export function NetworkControl({ variant }: { variant: 'inline' | 'fab' }) {
-	const [open, setOpen] = useState<'none' | 'settings' | 'bridge'>('none');
+export function NetworkControl({
+	variant,
+	onClick,
+	onScreen,
+}: {
+	/** inline: the terminal footer chip. fab: the chat page's machine
+	 * capsule — mascot (console), network, terminal, screen in one strip. */
+	variant: 'inline' | 'fab';
+	/** The capsule's mascot segment (fab): open the machine console. On
+	 * the inline chip it repoints the whole chip instead. */
+	onClick?: () => void;
+	/** The capsule's screen segment (fab): toggle the VGA window. Injected
+	 * by the caller — importing vm-console from here would be circular. */
+	onScreen?: () => void;
+}) {
+	const [open, setOpen] = useState<'none' | 'settings' | 'bridge' | 'poweroff'>('none');
 	const [health, setHealth] = useState<RelayHealth>(null);
 	const [, force] = useReducer((n: number) => n + 1, 0);
 	// The chip wears the bridge: ⇄N while this LAN is joined to N-1 others.
 	useEffect(() => onBridgeActivity(force), []);
+	// The capsule's power segment follows the machine's state (lit while
+	// it runs). Only the fab subscribes: on the chat page the VM long
+	// exists by mount time, while the terminal page's inline chip must
+	// not call a bare sharedVm() — the page constructs its machine WITH
+	// options (networkRelay), and whoever calls first wins the singleton.
+	// The fab is also the machine's one boot indicator on the chat page
+	// (a progress line while booting, a failure chip after a failed boot),
+	// so it subscribes to progress and the recorded error too.
+	const [vmState, setVmState] = useState<VmState>(() => existingVm()?.getState() ?? 'off');
+	const [bootProgress, setBootProgress] = useState<BootProgress | null>(null);
+	const [bootErr, setBootErr] = useState<string | null>(null);
+	useEffect(() => {
+		if (variant !== 'fab') return;
+		const vm = sharedVm();
+		const unState = vm.onState((s) => {
+			setVmState(s);
+			if (s !== 'booting') setBootProgress(null);
+			setBootErr(vm.bootError());
+		});
+		const unProgress = vm.onBootProgress(setBootProgress);
+		return () => {
+			unState();
+			unProgress();
+		};
+	}, [variant]);
 	const relay = currentRelay();
 	useEffect(() => {
 		if (!/^(?:wss?|wisps?):\/\//i.test(relay)) {
@@ -1028,25 +1135,181 @@ export function NetworkControl({ variant }: { variant: 'inline' | 'fab' }) {
 	// "still up" row carries the disconnect button for CLI-started rooms.
 	const live = bridgeUi() && !!room && room.state !== 'closed' && room.state !== 'failed';
 	const openPanel = () => setOpen(live ? 'bridge' : 'settings');
+	const powered = vmState === 'booting' || vmState === 'ready';
+	// The power key's tooltip is the boot's status line while there is one
+	// to tell (download and percent, or the failure's reason); otherwise
+	// the action it performs.
+	const bootStatus: VmStatus = {
+		state: vmState,
+		progress: bootProgress,
+		percent: Math.round((bootProgress?.fraction ?? 0) * 100),
+		error: bootErr,
+	};
+	const bootLine = vmState === 'booting' || vmState === 'failed' ? bootStatusLine(bootStatus) : '';
+	const powerTitle =
+		bootLine || (powered ? t('vmcPowerOff') : vmState === 'off' ? t('vmOffTitle') : t('vmcPowerOn'));
+	// The machine comes back the way the person left it (vm-status.ts,
+	// machine-power.ts): every power gesture here writes that memory.
+	// Nothing remembered yet — a first visit — and the capsule asks, once
+	// per load, until answered; the machine stays off meanwhile and the
+	// model works without its tools.
+	const [asking, setAsking] = useState(() => variant === 'fab' && rememberedPower() === null);
+	const [askChoice, setAskChoice] = useState<'boot' | 'skip'>('boot');
+	const [laterHint, setLaterHint] = useState(false);
+	const powerOn = () => {
+		setAsking(false);
+		rememberPower('on');
+		void sharedVm()
+			.boot()
+			.catch(() => {});
+		onClick?.(); /* the console opens to show the boot */
+	};
+	const answerAsk = (boot: boolean) => {
+		if (boot) {
+			powerOn();
+			return;
+		}
+		rememberPower('off');
+		setAsking(false);
+		// Where the key is, said once: the hint rides the dock for a few
+		// seconds and goes.
+		setLaterHint(true);
+		window.setTimeout(() => setLaterHint(false), 6_000);
+	};
+	const stopBoot = () => {
+		// Only a boot in progress; a running machine's stop is the power
+		// key's confirm. A stop is a change of mind about this boot and the
+		// next: left off. destroy() leaves the machine 'off', not 'failed'.
+		if (sharedVm().getState() !== 'booting') return;
+		rememberPower('off');
+		windowManager().close('console');
+		sharedVm().destroy();
+	};
+	const togglePower = () => {
+		const vm = sharedVm();
+		if (vm.getState() === 'booting' || vm.getState() === 'ready') {
+			// A destructive click asks first — in the network panel's own
+			// dress, not the browser's native confirm.
+			setOpen('poweroff');
+			return;
+		}
+		powerOn();
+	};
+	const powerOff = () => {
+		setOpen('none');
+		// Off, and off next time too: the machine stays as it was left.
+		rememberPower('off');
+		// The windows first (their teardown talks to the live VM), then
+		// the mirror — whatever the guest wrote since the last snapshot
+		// (an `app remove` a moment ago, a file just saved) exists nowhere
+		// else until it lands there — then the machine itself.
+		windowManager().close('console');
+		windowManager().close('screen');
+		void flushMirror().finally(() => sharedVm().destroy());
+	};
 	return (
 		<>
 			{variant === 'fab' ? (
-				<button
-					type="button"
-					className={`np-fab${down ? ' np-relay-down' : ''}`}
-					title={down ? statusTitle : tf('npFabTitle', `${label}${suffix}`)}
-					aria-label={down ? statusTitle : tf('npFabTitle', `${label}${suffix}`)}
-					onClick={openPanel}
-				>
-					<img className="np-fab-logo" src={VINX_LOGO} alt="" />
-					<NetGlyph label={label} />
-				</button>
+				// The machine capsule: one pill, four segments — terminal,
+				// screen, network, power (the destructive key sits last).
+				// The console title bar carries no controls; everything
+				// lives here. Beside it, the machine's word about a boot
+				// that needs one: the progress while it boots, the reason
+				// and a retry after it failed — nothing while it runs.
+				<div className="np-fab-dock">
+					{laterHint && vmState === 'off' && (
+						<div className="np-boot-note" data-testid="vm-ask-later">
+							<span className="np-boot-text">{t('vmAskLater')}</span>
+						</div>
+					)}
+					{vmState === 'booting' && (
+						<div className="np-boot-note" data-testid="vm-boot-note" title={bootLine}>
+							<span className="np-boot-text">{bootLine}</span>
+							<button type="button" className="np-boot-act np-boot-stop" onClick={stopBoot}>
+								{t('vmStopBoot')}
+							</button>
+							<span className="np-boot-track" aria-hidden>
+								<span
+									className={`np-boot-fill${bootProgress ? '' : ' np-boot-scan'}`}
+									style={bootProgress ? { width: `${bootStatus.percent}%` } : undefined}
+								/>
+							</span>
+						</div>
+					)}
+					{vmState === 'failed' && (
+						<div className="np-boot-note np-boot-failed" data-testid="vm-boot-failed" title={bootLine}>
+							<span className="np-boot-text">{bootLine}</span>
+							<button type="button" className="np-boot-act np-boot-retry" onClick={powerOn}>
+								{t('vmRetryBoot')}
+							</button>
+							{onClick && (
+								<button type="button" className="np-boot-act" onClick={onClick}>
+									{t('vmOpenConsole')}
+								</button>
+							)}
+						</div>
+					)}
+					<div className="np-fab">
+						<button
+							type="button"
+							className="np-fab-seg np-fab-term"
+							data-state={vmState}
+							title={
+								vmState === 'booting'
+									? 'The machine is booting — the shell window opens when it is up'
+									: 'Open a shell in a new terminal window (proc.pty)'
+							}
+							onClick={() => {
+								// A cold click (booting, or off — rpcCall boots
+								// the machine and waits) opens the console first,
+								// where ttyS0's boot log scrolls: on a slow
+								// machine a click that showed nothing for twenty
+								// seconds read as broken. Same gesture as the
+								// power key's boot. Once ready the shell window
+								// pops on its own, as before.
+								if (sharedVm().getState() !== 'ready') onClick?.();
+								void sharedVm()
+									.openShellWindow()
+									.catch(() => {});
+							}}
+						>
+							<Icon d={ICON_TERMINAL} size={14} />
+						</button>
+						<button
+							type="button"
+							className="np-fab-seg np-fab-screen"
+							title={t('vmcScreenBtn')}
+							onClick={onScreen}
+						>
+							<Icon d={ICON_MONITOR} size={14} />
+						</button>
+						<button
+							type="button"
+							className={`np-fab-seg np-fab-net${down ? ' np-relay-down' : ''}`}
+							title={statusTitle}
+							aria-label={statusTitle}
+							onClick={openPanel}
+						>
+							<NetGlyph label={label} />
+						</button>
+						<button
+							type="button"
+							className="np-fab-seg np-fab-power"
+							data-state={vmState}
+							title={powerTitle}
+							aria-label={powerTitle}
+							onClick={togglePower}
+						>
+							<Icon d={ICON_POWER} size={14} />
+						</button>
+					</div>
+				</div>
 			) : (
 				<button
 					type="button"
 					className={`np-chip${down ? ' np-relay-down' : ''}`}
 					title={statusTitle}
-					onClick={openPanel}
+					onClick={onClick ?? openPanel}
 				>
 					<NetGlyph label={label} size={12} />
 					{label}
@@ -1057,17 +1320,48 @@ export function NetworkControl({ variant }: { variant: 'inline' | 'fab' }) {
 			{open === 'settings' && (
 				<Panel onClose={() => setOpen('none')} onManageBridge={() => setOpen('bridge')} />
 			)}
+			{asking && vmState === 'off' && (
+				<MachineAskDialog
+					choice={askChoice}
+					onChoice={setAskChoice}
+					onConfirm={() => answerAsk(askChoice === 'boot')}
+					onCancel={() => setAsking(false)}
+				/>
+			)}
 			{open === 'bridge' && <BridgePanel onClose={() => setOpen('none')} />}
+			{open === 'poweroff' && (
+				<div className="np-backdrop" onClick={() => setOpen('none')}>
+					<div className="np-panel np-poweroff" onClick={(e) => e.stopPropagation()}>
+						<div className="np-title">{t('vmcPowerOff')}</div>
+						<p className="np-poweroff-note">{t('vmcPowerOffConfirm')}</p>
+						{/* What "off" means for the next visit, said where it is
+						    decided: the machine stays as it was left (machine-power.ts).
+						    The terminal page's machine is the page — no next visit
+						    to speak of. */}
+						{variant === 'fab' && <p className="np-poweroff-note np-poweroff-next">{t('vmcPowerOffNext')}</p>}
+						<div className="np-actions">
+							<button type="button" className="np-cancel" onClick={() => setOpen('none')}>
+								{t('npCancel')}
+							</button>
+							<button type="button" className="np-save np-danger np-poweroff-go" onClick={powerOff}>
+								{t('vmcPowerOffBtn')}
+							</button>
+						</div>
+					</div>
+				</div>
+			)}
 		</>
 	);
 }
 
-/** Chat page helper: mount a floating network button without touching the
- * vendored CopilotApp tree. */
-export function mountNetFab() {
+/** Chat page helper: mount the floating machine capsule without touching
+ * the vendored CopilotApp tree. `onClick` opens the machine console (the
+ * mascot segment); `onScreen` toggles the VGA window — both injected here
+ * because net-panel importing vm-console would be a module cycle. */
+export function mountNetFab(onClick?: () => void, onScreen?: () => void) {
 	const el = document.createElement('div');
 	document.body.appendChild(el);
-	createRoot(el).render(<NetworkControl variant="fab" />);
+	createRoot(el).render(<NetworkControl variant="fab" onClick={onClick} onScreen={onScreen} />);
 }
 
 // The terminal's first-run nudge. The default network is LAN-only, and

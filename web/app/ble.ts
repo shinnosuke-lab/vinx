@@ -6,7 +6,7 @@
  * an adapter the guest could run BlueZ on. Two browser rules shape the flow:
  *
  *   - The device picker (and the experimental LE scan) must be called inside
- *     a user gesture, and an OSC sequence is not one. Requests park here and
+ *     a user gesture, and an RPC frame is not one. Requests park here and
  *     the footer's ble chip pulses until the person clicks it; a device
  *     Chrome already remembers reconnects silently, no click.
  *
@@ -14,9 +14,14 @@
  *     pop its own dialog, then the operation just succeeds — nothing for
  *     this module to do, which is why ble(1) has no `pair`.
  *
- * Answers travel through /data files the script polls: .ble-status for the
- *  connection, .ble-reply per command (matched by seq), .ble-notify as a
- * rolling feed shared by notifications and scan results.
+ * Since Phase 3 this is a BleBroker behind the ble.* control-plane methods
+ * (hostcall.ts): commands answer as RPC results, connect blocks until the
+ * chip click resolves the picker, and the old .ble-status/.ble-reply files
+ * are gone. The one survivor is the notification/scan feed — genuinely a
+ * stream, which the control plane does not carry until Phase 6 — kept as an
+ * explicit data-plane ring under /data/.vinx/tmp that the methods name in
+ * their results (§6.8), 64 lines, ever-increasing line numbers so ble(1)'s
+ * watch can tail it across rewrites.
  *
  * Access rule worth knowing: with `acceptAllDevices` Chrome grants only the
  * services listed in optionalServices, so every 16-bit service id — the
@@ -25,11 +30,13 @@
  * explicit filter doubles as the access grant.
  */
 
+import type { BleBroker } from './hostcall';
+import { acquireOriginHold } from './origin-broker';
 import { sharedVm, type VinxVm, type VmState } from './vm';
 
-const STATUS = '.ble-status';
-const REPLY = '.ble-reply';
-const FEED = '.ble-notify';
+/** The feed ring, 9p-root-relative; the guest sees it at FEED_PATH. */
+const FEED = '.vinx/tmp/ble-feed';
+const FEED_PATH = '/data/.vinx/tmp/ble-feed';
 
 // The URL leads: with the script's `ble: ` prefix it ends inside 80 columns,
 // so the terminal's chrome:// link stays whole (and clickable) even there.
@@ -38,17 +45,6 @@ const FLAG_HINT =
 	" -- enable it, restart the browser; or just 'ble connect' (the picker scans " +
 	'in its own window)';
 
-export interface BleRequest {
-	op: 'scan' | 'connect' | 'services' | 'read' | 'write' | 'notify' | 'disconnect';
-	seq?: string;
-	service?: string;
-	svc?: string;
-	chr?: string;
-	hex?: string;
-	on?: boolean;
-	off?: boolean;
-}
-
 // ── state: one device, one scan, at most one parked gesture ──
 
 let device: BluetoothDevice | null = null;
@@ -56,6 +52,11 @@ let leScan: BluetoothLEScan | null = null;
 let scanListener: ((e: Event) => void) | null = null;
 /** A picker request waiting for the chip click ({} means no service filter). */
 let pendingPick: { service?: string } | null = null;
+/** The blocked ble.connect call the click will settle. */
+let pickWaiter: {
+	resolve: (got: { device: string; id: string }) => void;
+	reject: (e: Error) => void;
+} | null = null;
 /** A scan request waiting for the chip click. */
 let pendingScan = false;
 /**
@@ -73,15 +74,29 @@ function dropSubs(): void {
 	subs.clear();
 }
 
-/** Let the current device go: subscriptions, GATT link, the lot. */
+/** The origin broker's grips: one radio session per origin (§3.0). The
+ * device connection and a running scan each hold one reference; the
+ * broker's per-document refcount lets them coexist here while a sibling
+ * machine's connect answers RESOURCE_BUSY. */
+let deviceHold: (() => void) | null = null;
+let scanHold: (() => void) | null = null;
+
+/** Let the current device go: subscriptions, GATT link, hold, the lot. */
 function release(): void {
 	dropSubs();
 	const d = device;
 	device = null;
 	d?.gatt?.disconnect();
+	deviceHold?.();
+	deviceHold = null;
 }
 
 let note: (msg: string) => void = () => {};
+
+/** Where the chip's hints land; the terminal page wires its toast in. */
+export function setBleNote(cb: (msg: string) => void): void {
+	note = cb;
+}
 
 const chipListeners = new Set<() => void>();
 
@@ -105,7 +120,7 @@ export function bleChip(): BleChip {
 	return { state: 'off', device: '' };
 }
 
-// ── /data plumbing (the bridge-ctl stance: no VM, no paperwork) ──
+// ── the feed ring (data plane, not protocol: results name it, §6.8) ──
 
 function vmState(vm: VinxVm): VmState {
 	let s: VmState = 'off';
@@ -115,43 +130,6 @@ function vmState(vm: VinxVm): VmState {
 	return s;
 }
 
-async function put(name: string, text: string): Promise<void> {
-	const vm = sharedVm();
-	if (vmState(vm) !== 'ready') return;
-	try {
-		await vm.putFile(name, new TextEncoder().encode(text));
-	} catch {
-		/* a reload race; the next write replaces it */
-	}
-}
-
-async function writeStatus(): Promise<void> {
-	let text = 'state=off\n';
-	if (pendingPick) text = 'state=picking\n';
-	else if (device?.gatt?.connected) {
-		text = `state=connected\ndevice=${device.name || 'unnamed'}\nid=${device.id}\n`;
-	}
-	await put(STATUS, text);
-	ping();
-}
-
-async function failStatus(msg: string): Promise<void> {
-	pendingPick = null;
-	await put(STATUS, `state=failed\nerror=${msg}\n`);
-	ping();
-}
-
-async function reply(seq: string | undefined, ok: boolean, body = ''): Promise<void> {
-	if (!seq) return;
-	const lines = [`seq=${seq}`, `ok=${ok ? 1 : 0}`];
-	if (!ok) lines.push(`err=${body}`);
-	else if (body) lines.push(body);
-	await put(REPLY, lines.join('\n') + '\n');
-}
-
-// The rolling feed: notifications and scan lines share one file, newest
-// last, each line "N text" with N ever-increasing so the script can tail it
-// across rewrites.
 let feedSeq = 0;
 const feed: string[] = [];
 let feedTimer: ReturnType<typeof setTimeout> | null = null;
@@ -161,10 +139,14 @@ function pushFeed(text: string): void {
 	if (feed.length > 64) feed.shift();
 	// Trailing debounce: an IMU notifying at 100Hz coalesces into one /data
 	// write per 150ms instead of a hundred full rewrites a second. The guest
-	// polls the feed at 1s, so it cannot tell the difference.
+	// tails the feed at 1s, so it cannot tell the difference.
 	feedTimer ??= setTimeout(() => {
 		feedTimer = null;
-		void put(FEED, feed.join('\n') + '\n');
+		const vm = sharedVm();
+		if (vmState(vm) !== 'ready') return;
+		vm.putFile(FEED, new TextEncoder().encode(feed.join('\n') + '\n')).catch(() => {
+			/* a reload race; the next write replaces it */
+		});
 	}, 150);
 }
 
@@ -219,12 +201,27 @@ function adopt(d: BluetoothDevice): void {
 		() => {
 			if (device === d) {
 				dropSubs();
-				void writeStatus();
+				// The session ended on its own; the origin gets the radio back.
+				deviceHold?.();
+				deviceHold = null;
+				ping();
 			}
 		},
 		{ once: true },
 	);
-	void writeStatus();
+	ping();
+	pickWaiter?.resolve({ device: d.name || 'unnamed', id: d.id });
+	pickWaiter = null;
+}
+
+function failPick(msg: string): void {
+	pendingPick = null;
+	ping();
+	pickWaiter?.reject(new Error(msg));
+	pickWaiter = null;
+	// No device came of it: the radio hold goes back to the origin.
+	deviceHold?.();
+	deviceHold = null;
 }
 
 async function openPicker(): Promise<void> {
@@ -243,9 +240,9 @@ async function openPicker(): Promise<void> {
 	} catch (e) {
 		// NotFoundError is the picker's cancel button — an answer, not a fault.
 		if (e instanceof Error && e.name === 'NotFoundError') {
-			await failStatus('the picker was dismissed');
+			failPick('the picker was dismissed');
 		} else {
-			await failStatus(e instanceof Error ? e.message : String(e));
+			failPick(e instanceof Error ? e.message : String(e));
 		}
 	}
 }
@@ -283,6 +280,8 @@ function stopScan(): void {
 		navigator.bluetooth?.removeEventListener('advertisementreceived', scanListener);
 		scanListener = null;
 	}
+	scanHold?.();
+	scanHold = null;
 	ping();
 }
 
@@ -295,14 +294,28 @@ export async function bleChipClick(): Promise<void> {
 		return;
 	}
 	// Idle click: offer the picker anyway — connecting from the UI first and
-	// typing `ble services` after is a perfectly good order of events.
+	// typing `ble services` after is a perfectly good order of events. The
+	// same origin arbitration applies as to a guest connect.
 	if (navigator.bluetooth) {
+		if (!deviceHold) {
+			try {
+				deviceHold = await acquireOriginHold('ble');
+			} catch (e) {
+				note(`ble: ${e instanceof Error ? e.message : String(e)}`);
+				return;
+			}
+		}
 		pendingPick = {};
 		await openPicker();
 	}
 }
 
 // ── gatt ops ──
+
+function requireBluetooth(): Bluetooth {
+	if (!navigator.bluetooth) throw new Error('this browser has no Web Bluetooth (Chromium only)');
+	return navigator.bluetooth;
+}
 
 function connectedChr(svc: string, chr: string): Promise<BluetoothRemoteGATTCharacteristic> {
 	const server = device?.gatt;
@@ -332,120 +345,136 @@ async function listServices(): Promise<string> {
 	return lines.join('\n') || '(no services granted -- try ble connect SERVICE)';
 }
 
-/**
- * One command from the guest script. Fast ops answer through .ble-reply;
- * connect, which can wait on a human, reports through .ble-status instead.
- */
-export async function handleBleOsc(req: BleRequest, notify: (msg: string) => void): Promise<void> {
-	note = notify;
-	if (!navigator.bluetooth) {
-		const msg = 'this browser has no Web Bluetooth (Chromium only)';
-		if (req.op === 'connect') await failStatus(msg);
-		else await reply(req.seq, false, msg);
-		return;
-	}
+// ── the broker (hostcall.ts serves it as the ble.* methods) ──
 
-	try {
-		if (req.op === 'connect') {
-			// One device per machine: a second connect lets the first go,
-			// or its GATT link (and its subscriptions) would linger unseen.
-			release();
-			// A remembered device reconnects without the picker — but only
-			// when no service was named: naming one means re-picking, since
-			// the filter is also the access grant.
-			if (!req.service && navigator.bluetooth.getDevices) {
-				try {
-					for (const d of await navigator.bluetooth.getDevices()) {
-						if (!d.gatt) continue;
-						try {
-							await d.gatt.connect();
-							adopt(d);
-							return;
-						} catch {
-							/* gone or asleep; try the next */
-						}
+export const bleBroker: BleBroker = {
+	async connect(service) {
+		const bt = requireBluetooth();
+		// One radio session per origin (§3.0): a sibling machine holding
+		// it makes this an immediate RESOURCE_BUSY naming the holder. Take
+		// the new hold before releasing the old device — same-document
+		// re-connects share the refcounted hold and never self-deadlock.
+		const hold = await acquireOriginHold('ble');
+		// One device per machine: a second connect lets the first go,
+		// or its GATT link (and its subscriptions) would linger unseen.
+		release();
+		deviceHold = hold;
+		// A remembered device reconnects without the picker — but only
+		// when no service was named: naming one means re-picking, since
+		// the filter is also the access grant.
+		if (!service && bt.getDevices) {
+			try {
+				for (const d of await bt.getDevices()) {
+					if (!d.gatt) continue;
+					try {
+						await d.gatt.connect();
+						const got = { device: d.name || 'unnamed', id: d.id };
+						adopt(d);
+						return got;
+					} catch {
+						/* gone or asleep; try the next */
 					}
-				} catch {
-					/* permissions backend absent; the picker path remains */
 				}
+			} catch {
+				/* permissions backend absent; the picker path remains */
 			}
-			pendingPick = { service: req.service ? String(req.service) : undefined };
-			await writeStatus();
-			note('ble: click the ble chip in the footer to pick a device');
-		} else if (req.op === 'scan') {
-			if (!req.on) {
-				stopScan();
-				await reply(req.seq, true);
-				return;
-			}
-			if (!navigator.bluetooth.requestLEScan) {
-				await reply(req.seq, false, FLAG_HINT);
-				note('ble: scanning needs chrome://flags/#enable-experimental-web-platform-features');
-				return;
-			}
-			if (leScan) {
-				await reply(req.seq, true, 'already scanning');
-				return;
-			}
-			pendingScan = true;
-			ping();
-			note('ble: click the ble chip in the footer to start the scan');
-			await reply(req.seq, true, 'click the ble chip in the footer to start the scan');
-		} else if (req.op === 'services') {
-			await reply(req.seq, true, await listServices());
-		} else if (req.op === 'read') {
-			const c = await connectedChr(String(req.svc), String(req.chr));
-			const v = await c.readValue();
-			let text = hex(v) || '(empty)';
-			// A byte run that is all printable ASCII earns a peek.
-			if (v.byteLength) {
-				const bytes = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
-				if (bytes.every((b) => b >= 0x20 && b < 0x7f)) {
-					text += `  "${new TextDecoder().decode(bytes)}"`;
-				}
-			}
-			await reply(req.seq, true, text);
-		} else if (req.op === 'write') {
-			const hexStr = String(req.hex || '');
-			if (!/^([0-9a-fA-F]{2})+$/.test(hexStr)) throw new Error('HEX must be full bytes');
-			const c = await connectedChr(String(req.svc), String(req.chr));
-			await c.writeValue(bytesOf(hexStr) as Uint8Array<ArrayBuffer>);
-			await reply(req.seq, true);
-		} else if (req.op === 'notify') {
-			// The map is keyed by the resolved uuid, so `heart_rate` and
-			// `2a37` name the same subscription in both directions.
-			const c = await connectedChr(String(req.svc), String(req.chr));
-			if (req.off) {
-				const sub = subs.get(c.uuid);
-				if (sub) {
-					sub.chr.removeEventListener('characteristicvaluechanged', sub.handler);
-					subs.delete(c.uuid);
-					await sub.chr.stopNotifications().catch(() => {});
-				}
-				await reply(req.seq, true);
-				return;
-			}
-			if (subs.has(c.uuid)) {
-				await reply(req.seq, true, 'already subscribed');
-				return;
-			}
-			const label = shortUuid(c.uuid);
-			const handler = () => {
-				if (c.value) pushFeed(`${label}  ${hex(c.value)}`);
-			};
-			c.addEventListener('characteristicvaluechanged', handler);
-			await c.startNotifications();
-			subs.set(c.uuid, { chr: c, handler });
-			await reply(req.seq, true);
-		} else if (req.op === 'disconnect') {
-			stopScan();
-			release();
-			await writeStatus();
-			await reply(req.seq, true);
 		}
-	} catch (e) {
-		const msg = e instanceof Error ? e.message : String(e);
-		if (req.op === 'connect') await failStatus(msg);
-		else await reply(req.seq, false, msg);
-	}
-}
+		return await new Promise((resolve, reject) => {
+			// A newer connect supersedes a parked one; the old caller hears so.
+			pickWaiter?.reject(new Error('superseded by a newer connect'));
+			pickWaiter = { resolve, reject };
+			pendingPick = { service };
+			ping();
+			note('ble: click the ble chip in the footer to pick a device');
+		});
+	},
+
+	status() {
+		if (pendingPick || pendingScan) return { state: 'pending' };
+		if (device?.gatt?.connected) {
+			return { state: 'connected', device: device.name || 'unnamed', id: device.id };
+		}
+		return { state: 'off' };
+	},
+
+	async scan(on) {
+		const bt = requireBluetooth();
+		if (!on) {
+			stopScan();
+			return {};
+		}
+		if (!bt.requestLEScan) {
+			note('ble: scanning needs chrome://flags/#enable-experimental-web-platform-features');
+			throw new Error(FLAG_HINT);
+		}
+		if (leScan) return { note: 'already scanning' };
+		// The scan holds the origin's radio like a connection does (the
+		// per-document refcount lets both coexist on this machine).
+		scanHold ??= await acquireOriginHold('ble');
+		pendingScan = true;
+		ping();
+		note('ble: click the ble chip in the footer to start the scan');
+		return { pending: true, note: 'click the ble chip in the footer to start the scan' };
+	},
+
+	async services() {
+		requireBluetooth();
+		return listServices();
+	},
+
+	async read(svc, chr) {
+		requireBluetooth();
+		const c = await connectedChr(svc, chr);
+		const v = await c.readValue();
+		let text = hex(v) || '(empty)';
+		// A byte run that is all printable ASCII earns a peek.
+		if (v.byteLength) {
+			const bytes = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+			if (bytes.every((b) => b >= 0x20 && b < 0x7f)) {
+				text += `  "${new TextDecoder().decode(bytes)}"`;
+			}
+		}
+		return text;
+	},
+
+	async write(svc, chr, hexStr) {
+		requireBluetooth();
+		const c = await connectedChr(svc, chr);
+		await c.writeValue(bytesOf(hexStr) as Uint8Array<ArrayBuffer>);
+	},
+
+	async subscribe(svc, chr, off) {
+		requireBluetooth();
+		// The map is keyed by the resolved uuid, so `heart_rate` and
+		// `2a37` name the same subscription in both directions.
+		const c = await connectedChr(svc, chr);
+		if (off) {
+			const sub = subs.get(c.uuid);
+			if (sub) {
+				sub.chr.removeEventListener('characteristicvaluechanged', sub.handler);
+				subs.delete(c.uuid);
+				await sub.chr.stopNotifications().catch(() => {});
+			}
+			return '';
+		}
+		if (subs.has(c.uuid)) return 'already subscribed';
+		const label = shortUuid(c.uuid);
+		const handler = () => {
+			if (c.value) pushFeed(`${label}  ${hex(c.value)}`);
+		};
+		c.addEventListener('characteristicvaluechanged', handler);
+		await c.startNotifications();
+		subs.set(c.uuid, { chr: c, handler });
+		return '';
+	},
+
+	async disconnect() {
+		stopScan();
+		release();
+		ping();
+	},
+
+	feedPath() {
+		return FEED_PATH;
+	},
+};

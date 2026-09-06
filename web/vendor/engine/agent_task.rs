@@ -66,7 +66,9 @@ impl ConfirmRouter {
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<ConfirmResponse>>> {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<ConfirmResponse>>> {
         self.routes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -310,6 +312,11 @@ impl TaskRunner {
     /// Run a batch of `task` calls concurrently (bounded by `max_parallel`,
     /// allSettled semantics: one child failing never aborts the others) and
     /// return `(call_id, result_json, success)` per call, in input order.
+    ///
+    /// Each call's `ToolCallResult` goes out on the parent stream the moment
+    /// that child finishes, so a batch of three shows three cards resolving
+    /// one by one instead of all at once when the slowest is done. The caller
+    /// therefore must NOT emit results for these ids again.
     pub async fn run_batch(
         self: &Arc<Self>,
         calls: Vec<TaskCall>,
@@ -344,25 +351,42 @@ impl TaskRunner {
 
         let mut by_id: HashMap<String, TaskReport> = HashMap::new();
         while let Some((call_id, report)) = futures::StreamExt::next(&mut drivers).await {
+            let _ = parent_event_tx.send(AgentEvent::ToolCallResult {
+                id: call_id.clone(),
+                result: report.to_json(),
+                success: report.ok,
+            });
             by_id.insert(call_id, report);
         }
 
         // The "driver crashed" fallback below is kept even though a driver can
-        // no longer fail to report: the batch still owes an answer per call.
+        // no longer fail to report: the batch still owes an answer per call,
+        // and the event stream owes every announced call a resolution.
         order
             .into_iter()
             .map(|call_id| {
-                let report = by_id.remove(&call_id).unwrap_or(TaskReport {
-                    ok: false,
-                    result: String::new(),
-                    error: Some("task driver crashed before reporting".into()),
-                    transcript_session_id: None,
-                    elapsed_ms: 0,
-                    timed_out: false,
-                    cancelled: false,
-                });
-                let ok = report.ok;
-                (call_id, report.to_json(), ok)
+                let (json, ok) = match by_id.remove(&call_id) {
+                    Some(report) => (report.to_json(), report.ok),
+                    None => {
+                        let report = TaskReport {
+                            ok: false,
+                            result: String::new(),
+                            error: Some("task driver crashed before reporting".into()),
+                            transcript_session_id: None,
+                            elapsed_ms: 0,
+                            timed_out: false,
+                            cancelled: false,
+                        };
+                        let json = report.to_json();
+                        let _ = parent_event_tx.send(AgentEvent::ToolCallResult {
+                            id: call_id.clone(),
+                            result: json.clone(),
+                            success: false,
+                        });
+                        (json, false)
+                    }
+                };
+                (call_id, json, ok)
             })
             .collect()
     }
@@ -474,8 +498,9 @@ impl TaskRunner {
         };
 
         // Fresh, self-contained child context.
-        let mut initial: Vec<ChatMessage> =
-            vec![ChatMessage::system(&subagent_system_prompt(&self.system_prompt))];
+        let mut initial: Vec<ChatMessage> = vec![ChatMessage::system(&subagent_system_prompt(
+            &self.system_prompt,
+        ))];
         if let Some(msg) = skill_message {
             initial.push(msg);
         }
@@ -527,6 +552,7 @@ impl TaskRunner {
             .drive_child(
                 &call.call_id,
                 &child_session_id,
+                &task_label(&call.args),
                 active_skill.as_ref(),
                 timeout_secs,
                 child_event_rx,
@@ -564,6 +590,7 @@ impl TaskRunner {
         &self,
         task_id: &str,
         child_session_id: &str,
+        task_label: &str,
         active_skill: Option<&ActiveSkill>,
         timeout_secs: u64,
         mut child_event_rx: mpsc::UnboundedReceiver<AgentEvent>,
@@ -590,7 +617,11 @@ impl TaskRunner {
             // setTimeout(0) -- which fires at once, finds the deadline still in
             // the future and reschedules, i.e. spins a core. Nothing here lives
             // for a day: the worker holding this dies with its document.
-            if timeout_secs == 0 { 86_400 } else { timeout_secs },
+            if timeout_secs == 0 {
+                86_400
+            } else {
+                timeout_secs
+            },
         ));
         tokio::pin!(timeout);
         // Soft deadline (SIGTERM before SIGKILL): `margin` before the hard
@@ -601,9 +632,11 @@ impl TaskRunner {
         // same one-day sleep as `timeout` above (browser i32-millis timers).
         let wrap_up_margin = wrap_up_margin_secs(timeout_secs);
         let wrap_up_enabled = timeout_secs > 0 && wrap_up_margin > 0;
-        let wrap_up = wasmtimer::tokio::sleep(std::time::Duration::from_secs(
-            if wrap_up_enabled { timeout_secs - wrap_up_margin } else { 86_400 },
-        ));
+        let wrap_up = wasmtimer::tokio::sleep(std::time::Duration::from_secs(if wrap_up_enabled {
+            timeout_secs - wrap_up_margin
+        } else {
+            86_400
+        }));
         tokio::pin!(wrap_up);
         let mut wrap_up_sent = false;
         let mut cancel_poll =
@@ -615,13 +648,14 @@ impl TaskRunner {
         tokio::pin!(grace);
         let mut winding_down = false;
 
-        let signal_cancel = |child_cancel: &Arc<AtomicBool>,
-                             child_confirm_tx: &mpsc::UnboundedSender<ConfirmResponse>| {
-            child_cancel.store(true, Ordering::Relaxed);
-            // Wake a child parked on a confirmation — the flag alone cannot
-            // interrupt a blocked recv().
-            let _ = child_confirm_tx.send(ConfirmResponse::Deny);
-        };
+        let signal_cancel =
+            |child_cancel: &Arc<AtomicBool>,
+             child_confirm_tx: &mpsc::UnboundedSender<ConfirmResponse>| {
+                child_cancel.store(true, Ordering::Relaxed);
+                // Wake a child parked on a confirmation — the flag alone cannot
+                // interrupt a blocked recv().
+                let _ = child_confirm_tx.send(ConfirmResponse::Deny);
+            };
 
         loop {
             tokio::select! {
@@ -649,11 +683,12 @@ impl TaskRunner {
                             // the route + the presentation slot, and forward
                             // the result unwrapped too, so the confirm UI that
                             // showed the unwrapped request also sees its
-                            // resolution signal.
+                            // resolution signal. No `continue`: the wrapped
+                            // copy below still goes out, so a live view of the
+                            // child transcript sees the result as well.
                             router.unregister(id);
                             confirm_permit = None;
                             let _ = parent_event_tx.send(evt.clone());
-                            continue;
                         }
                         AgentEvent::SkillActivated { name, allowed_tools } => {
                             current_skill = Some(ActiveSkill {
@@ -667,12 +702,23 @@ impl TaskRunner {
                         AgentEvent::SessionSync { full_context, .. } => {
                             last_context = full_context.clone();
                             if let Some(store) = &self.store {
+                                let first_sync = !outcome.synced;
                                 store.save_async(
                                     child_session_id,
                                     full_context,
                                     "task",
                                     current_skill.as_ref(),
                                 );
+                                // Title the transcript with the task's human
+                                // label, once: `save` inserts the row with an
+                                // empty title (auto-titling only runs for user
+                                // chats), which the transcript viewer would
+                                // render as "New chat". Queued AFTER the save
+                                // — set_title_async's ordering guarantees the
+                                // UPDATE lands behind the INSERT it targets.
+                                if first_sync {
+                                    store.set_title_async(child_session_id, task_label);
+                                }
                                 outcome.synced = true;
                             }
                         }
@@ -689,6 +735,8 @@ impl TaskRunner {
                     }
                     let _ = parent_event_tx.send(AgentEvent::Subagent {
                         task_id: task_id.to_string(),
+                        session_id: child_session_id.to_string(),
+                        label: task_label.to_string(),
                         event: Box::new(evt),
                     });
                 }
@@ -808,6 +856,36 @@ struct ChildOutcome {
     /// True once at least one `SessionSync` was handed to the store — the
     /// gate for advertising `transcript_session_id` in the report.
     synced: bool,
+}
+
+/// Human-readable name of one task: its `description` argument (the schema's
+/// "3-8 word summary, shown to the user"), the prompt's first line as a
+/// fallback. Rides every `Subagent` envelope (`label`) so a viewer that never
+/// saw the parent round's tool_start — a re-attached tab whose replay was
+/// trimmed — can still title the task's progress row.
+///
+/// vinx: `pub` rather than upstream's `pub(crate)` — the crate's tests live
+/// outside the vendored engine (`tests/turn.rs`), and there is no store-side
+/// title backfill here to share it with.
+pub fn task_label(args: &serde_json::Value) -> String {
+    let description = args
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if !description.is_empty() {
+        return description.to_string();
+    }
+    let first_line = args
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim();
+    first_line.chars().take(80).collect()
 }
 
 /// Per-task wall-clock budget: the `timeout_secs` argument (clamped to

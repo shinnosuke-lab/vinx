@@ -19,6 +19,8 @@ import type {
   ChatEvent,
   MarketSkillPreview,
   MessageView,
+  SessionPatch,
+  SessionScope,
   SessionSummary,
   SkillAction,
   SkillDiagnostic,
@@ -43,6 +45,25 @@ function parseFrame(frame: string): ChatEvent | null {
 }
 
 export class ChatUnavailableError extends Error {}
+
+// Vinx: an app-management call the machine could not take. `code` is the
+// shim's stable word for the common one — `MACHINE_OFF`, a machine the
+// person left powered off — so the Apps page can say it in their language;
+// anything else carries the guest's own message.
+export class AppsError extends Error {
+  constructor(
+    message: string,
+    public code?: string,
+  ) {
+    super(message)
+  }
+}
+
+/** Vinx: turn a failed app route into an AppsError with its code. */
+async function appsFailure(r: Response): Promise<AppsError> {
+  const data = await r.json().catch(() => ({}))
+  return new AppsError(data?.error || `HTTP ${r.status}`, typeof data?.code === 'string' ? data.code : undefined)
+}
 
 /** `POST /api/chat` was rejected because a turn is already running in the
  *  session (HTTP 409 `turn_in_flight`) — attach to watch it instead. */
@@ -107,6 +128,13 @@ export interface ChatClient {
     attachments?: { id: string; name?: string; lines?: number | null }[],
     model?: string,
     reasoningEffort?: string,
+    modelParameters?: [string, string][],
+    maxMode?: boolean,
+    /** Extras for a session created BY this call (ignored for existing
+     *  sessions): the fresh-chat composer's full-auto toggle, so the choice
+     *  is in place before the first tool call (`undefined` = follow the
+     *  server default). */
+    options?: { fullAuto?: boolean },
   ): Promise<ChatAck>
   /** Upload one file (image or any other type) for chat attachment. */
   uploadFile(blob: Blob, name?: string): Promise<UploadResult>
@@ -137,6 +165,8 @@ export interface ChatClient {
     attachments?: { id: string; name?: string; lines?: number | null }[],
     model?: string,
     reasoningEffort?: string,
+    modelParameters?: [string, string][],
+    maxMode?: boolean,
   ): Promise<ChatAck>
   /** "Send now": wind the RUNNING turn down (same machinery as stop, but the
    *  queue survives) and park this message at the queue front — it starts
@@ -148,6 +178,8 @@ export interface ChatClient {
     attachments?: { id: string; name?: string; lines?: number | null }[],
     model?: string,
     reasoningEffort?: string,
+    modelParameters?: [string, string][],
+    maxMode?: boolean,
   ): Promise<ChatAck>
   /** Drop one parked message by the id the `queue` frame carries. Resolves
    *  `false` when it is already gone (started or removed elsewhere) — the
@@ -156,6 +188,13 @@ export interface ChatClient {
   /** Replace one parked message's text (attachments ride along unchanged).
    *  Resolves `false` when the item is already gone. */
   editQueued(sessionId: string, id: number, message: string): Promise<boolean>
+  /** "Send now" for one parked message: it moves to the queue FRONT and the
+   *  running turn is told to wind down (the queue survives), so the pump
+   *  starts it the moment the turn ends — the parked item's attachments and
+   *  model selection ride along. Resolves `false` when the item is already
+   *  gone (started or removed elsewhere); the next `queue` snapshot converges
+   *  the strip either way. */
+  sendQueuedNow(sessionId: string, id: number): Promise<boolean>
   /** Cancel ONE running sub-agent by the `task_id` the `subagent` frames
    *  carry. The child winds down and reports partial progress in the parent
    *  `task` tool result; the rest of the turn keeps running. Resolves
@@ -197,15 +236,18 @@ export interface ChatClient {
   cancel(sessionId: string): Promise<void>
   /** Toggle session-scoped full-auto (ask_user still prompts). */
   setAutoConfirm(sessionId: string, enabled: boolean): Promise<void>
-  /** List sessions; `q` enables server-side search (title + message content). */
-  listSessions(q?: string): Promise<SessionSummary[]>
+  /** List sessions; `q` enables server-side search (title + message content).
+   *  `scope` picks live sessions (default), the archive, or both. */
+  listSessions(q?: string, scope?: SessionScope): Promise<SessionSummary[]>
   getSession(id: string): Promise<{
     meta: {
       title: string
       created_at: string
       updated_at: string
       active_skill?: string | null
-      /** Memory-only session full-auto state (badge sync on load/reload). */
+      /** Session full-auto state (badge sync on load/reload). Backend-owned
+       *  and persisted with the session, so it survives reloads, idle
+       *  eviction and restarts. */
       auto_confirm?: boolean
       /** Whether a turn is currently running (attach to watch it live). */
       running?: boolean
@@ -213,6 +255,11 @@ export interface ChatClient {
        *  When > 0 the transcript can be extended backwards via
        *  `listSessionArchive` / `getSessionArchive`. */
       archive_generations?: number
+      /** Organisation flags off the listing row (absent on older agents). */
+      pinned?: boolean
+      archived_at?: string | null
+      /** User-assigned category; `null`/absent = uncategorised. */
+      category?: string | null
     }
     messages: MessageView[]
   }>
@@ -221,7 +268,10 @@ export interface ChatClient {
   listSessionArchive(id: string): Promise<ArchiveGeneration[]>
   /** Full messages of one archived generation (system prompt excluded). */
   getSessionArchive(id: string, generation: number): Promise<MessageView[]>
-  updateSession(id: string, patch: { title?: string; pinned?: boolean }): Promise<void>
+  /** Patch session metadata. `archived: true` also un-pins; `category: null`
+   *  clears the category (a new turn in an archived session restores it
+   *  server-side, so the flag is never sticky). */
+  updateSession(id: string, patch: SessionPatch): Promise<void>
   deleteSession(id: string): Promise<void>
   /** Discovered skills + discovery diagnostics for the `/` command palette. */
   listSkills(): Promise<{ skills: SkillInfo[]; diagnostics: SkillDiagnostic[] }>
@@ -232,7 +282,7 @@ export interface ChatClient {
    *  configured default model, even when `models` is empty). Both empty when
    *  the endpoint is absent/unreachable — the chat input falls back to a
    *  read-only model badge. */
-  getModels(): Promise<{ models: string[]; caps: Record<string, ModelCaps> }>
+  getModels(): Promise<{ models: string[]; caps: Record<string, ModelCaps>; catalog: CatalogModel[] }>
   /** Install a skill package (zip). Resolves `{ name, diagnostics }`, throws on error. */
   importSkill(file: File | Blob): Promise<{ name: string; diagnostics: string[] }>
   /** Install a skill from a package (zip) URL — the agent downloads it (the
@@ -317,6 +367,16 @@ export interface ChatClient {
   startApp(name: string): Promise<void>
   /** Stop a managed app's systemd service (`kind=app` cards). */
   stopApp(name: string): Promise<void>
+  // Vinx: autostart is switchable from the Apps page (upstream only shows
+  // it). Boot policy only — neither call touches a running instance.
+  /** Mark an app to start on every boot (`kind=app` cards). */
+  enableApp(name: string): Promise<void>
+  /** Unmark an app from starting on boot; a running instance keeps running. */
+  disableApp(name: string): Promise<void>
+  // Vinx: a window app's "start" is opening its window (`app run`); a pure
+  // web app opens from the page even while the machine is off.
+  /** Open a window app (`kind=app` cards whose app_kind is `window`). */
+  runApp(name: string): Promise<void>
   /** Saved themes: injectable payloads applied at boot. */
   listThemes(): Promise<ThemeContent[]>
   /** Persist the current chat look as a saved theme (the "save this theme"
@@ -352,6 +412,54 @@ export interface ModelCaps {
   effortLevels: string[]
   /** The provider's server-side default effort (shown on the "default" row). */
   defaultEffort: string | null
+}
+
+/** One selectable value of a catalog model parameter (`high` of `reasoning`). */
+export interface CatalogParameterValue {
+  value: string
+  displayName?: string
+}
+
+/** A catalog model-parameter definition (the `reasoning` / `context` chips). */
+export interface CatalogParameterDefinition {
+  id: string
+  name: string
+  kind: string
+  values: CatalogParameterValue[]
+}
+
+/** One `(id, value)` pair inside a variant's parameter tuple. */
+export interface CatalogParameterPair {
+  id: string
+  value: string
+}
+
+/** A predefined parameter combination of a base model (`gpt-6.1 high 200k`). */
+export interface CatalogVariant {
+  parameters: CatalogParameterPair[]
+  displayName?: string
+  isMaxMode: boolean
+  isDefaultMaxConfig: boolean
+  isDefaultNonMaxConfig: boolean
+  variantStringRepresentation?: string
+  legacySlug?: string
+}
+
+/** A base model plus its parameter space, from `/api/models.catalog`.
+ *  Optional: a backend that has no structured catalog omits it and the UI
+ *  falls back to flat model strings (vinx today). */
+export interface CatalogModel {
+  name: string
+  serverModelName?: string
+  supportsMaxMode: boolean
+  supportsNonMaxMode: boolean
+  forcedMaxMode: boolean
+  contextTokenLimit?: number
+  contextTokenLimitForMaxMode?: number
+  legacySlugs: string[]
+  idAliases: string[]
+  parameters: CatalogParameterDefinition[]
+  variants: CatalogVariant[]
 }
 
 export interface SafeCommands {
@@ -414,6 +522,16 @@ export interface ReleaseRecord {
   runtime?: string
   /** `app` kind: run-to-completion task (not a resident daemon). */
   oneshot?: boolean
+  // Vinx: the manifest kind of a machine app (command|service|window), so
+  // the card can offer the right verb — a window opens, a command runs
+  // once, a service starts. Absent for upstream (systemd) apps.
+  app_kind?: string
+  /** Vinx: a pure web app — kind window with no process behind it, a
+   *  window on the desktop. Its autostart (`enabled`) means "opens when
+   *  the page loads", not "starts when the machine boots". */
+  web?: boolean
+  /** Vinx: the manifest's display title (the card shows it; `name` stays the id). */
+  title?: string
 }
 
 /** What `POST /api/backup/import` changed (mirrors the kernel's summary). */
@@ -540,7 +658,7 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
       await attach(ack.session_id, onEvent, signal)
     },
 
-    sendMessage(message, sessionId, skillAction, attachments, model, reasoningEffort) {
+    sendMessage(message, sessionId, skillAction, attachments, model, reasoningEffort, modelParameters, maxMode, options) {
       return postChat({
         message,
         session_id: sessionId,
@@ -548,6 +666,10 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
         attachments: attachments?.length ? attachments : undefined,
         model: model?.trim() ? model.trim() : undefined,
         reasoning_effort: reasoningEffort?.trim() ? reasoningEffort.trim() : undefined,
+        model_parameters: modelParameters?.length ? modelParameters : undefined,
+        max_mode: maxMode || undefined,
+        // Only meaningful for a session this call creates.
+        full_auto: !sessionId && typeof options?.fullAuto === "boolean" ? options.fullAuto : undefined,
       })
     },
 
@@ -555,24 +677,28 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
       return attach(sessionId, onEvent, signal, follow)
     },
 
-    queueMessage(message, sessionId, attachments, model, reasoningEffort) {
+    queueMessage(message, sessionId, attachments, model, reasoningEffort, modelParameters, maxMode) {
       return postChat({
         message,
         session_id: sessionId,
         attachments: attachments?.length ? attachments : undefined,
         model: model?.trim() ? model.trim() : undefined,
         reasoning_effort: reasoningEffort?.trim() ? reasoningEffort.trim() : undefined,
+        model_parameters: modelParameters?.length ? modelParameters : undefined,
+        max_mode: maxMode || undefined,
         queue: true,
       })
     },
 
-    interruptMessage(message, sessionId, attachments, model, reasoningEffort) {
+    interruptMessage(message, sessionId, attachments, model, reasoningEffort, modelParameters, maxMode) {
       return postChat({
         message,
         session_id: sessionId,
         attachments: attachments?.length ? attachments : undefined,
         model: model?.trim() ? model.trim() : undefined,
         reasoning_effort: reasoningEffort?.trim() ? reasoningEffort.trim() : undefined,
+        model_parameters: modelParameters?.length ? modelParameters : undefined,
+        max_mode: maxMode || undefined,
         interrupt: true,
       })
     },
@@ -596,6 +722,19 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ session_id: sessionId, id, message }),
+        })
+        return res.ok
+      } catch {
+        return false
+      }
+    },
+
+    async sendQueuedNow(sessionId, id) {
+      try {
+        const res = await fetch(url('/api/chat/queue/promote'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId, id }),
         })
         return res.ok
       } catch {
@@ -725,15 +864,19 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
     },
 
     async setAutoConfirm(sessionId, enabled) {
-      await fetch(url('/api/chat/auto'), {
+      const r = await fetch(url('/api/chat/auto'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId, enabled }),
       })
+      if (!r.ok) throw new Error(`set full-auto failed: ${r.status}`)
     },
 
-    listSessions(q) {
-      const query = q?.trim() ? `?q=${encodeURIComponent(q.trim())}` : ''
+    listSessions(q, scope) {
+      const params = new URLSearchParams()
+      if (q?.trim()) params.set('q', q.trim())
+      if (scope && scope !== 'active') params.set('scope', scope)
+      const query = params.size ? `?${params}` : ''
       return fetch(url(`/api/sessions${query}`)).then((r) => (r.ok ? r.json() : []))
     },
 
@@ -762,11 +905,17 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
     },
 
     async updateSession(id, patch) {
-      await fetch(url(`/api/sessions/${encodeURIComponent(id)}`), {
+      const r = await fetch(url(`/api/sessions/${encodeURIComponent(id)}`), {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch),
       })
+      // Callers roll back optimistic UI on rejection, so a 4xx (unknown id,
+      // over-long category, bad payload) must not pass as success.
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}))
+        throw new Error((data && (data.message || data.error)) || `HTTP ${r.status}`)
+      }
     },
 
     async deleteSession(id) {
@@ -790,7 +939,7 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
     async getModels() {
       try {
         const r = await fetch(url('/api/models'))
-        if (!r.ok) return { models: [], caps: {} }
+        if (!r.ok) return { models: [], caps: {}, catalog: [] }
         const data = await r.json()
         const models = Array.isArray(data?.models)
           ? data.models.filter((m: unknown): m is string => typeof m === 'string')
@@ -812,9 +961,22 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
             }
           }
         }
-        return { models, caps }
+        // Optional structured model catalog (base models + parameter
+        // definitions + variants); absent on backends without one. Trust its
+        // camelCase JSON shape, just normalize the containers so the UI can
+        // index without guards.
+        const catalog: CatalogModel[] = Array.isArray(data?.catalog)
+          ? (data.catalog as CatalogModel[]).map((m) => ({
+              ...m,
+              legacySlugs: Array.isArray(m.legacySlugs) ? m.legacySlugs : [],
+              idAliases: Array.isArray(m.idAliases) ? m.idAliases : [],
+              parameters: Array.isArray(m.parameters) ? m.parameters : [],
+              variants: Array.isArray(m.variants) ? m.variants : [],
+            }))
+          : []
+        return { models, caps, catalog }
       } catch {
-        return { models: [], caps: {} }
+        return { models: [], caps: {}, catalog: [] }
       }
     },
 
@@ -969,7 +1131,7 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
         body: JSON.stringify({ name }),
       })
       const data = await r.json().catch(() => ({}))
-      if (!r.ok) throw new Error((data && data.error) || `HTTP ${r.status}`)
+      if (!r.ok) throw new AppsError((data && data.error) || `HTTP ${r.status}`, typeof data?.code === 'string' ? data.code : undefined)
       return {
         name: String(data?.name ?? ''),
         receipt: String(data?.receipt ?? ''),
@@ -979,11 +1141,17 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
     async importApp(file) {
       const r = await fetch(url('/api/apps/install'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/gzip' },
+        // Vinx: the name rides along (percent-encoded, headers are ASCII)
+        // because a vinx .vapp derives its app id from the file name — the
+        // flat manifest inside carries none. Same idiom as /api/chat/upload.
+        headers: {
+          'Content-Type': 'application/gzip',
+          'X-File-Name': encodeURIComponent(file instanceof File ? file.name : ''),
+        },
         body: file,
       })
       const data = await r.json().catch(() => ({}))
-      if (!r.ok) throw new Error((data && data.error) || `HTTP ${r.status}`)
+      if (!r.ok) throw new AppsError((data && data.error) || `HTTP ${r.status}`, typeof data?.code === 'string' ? data.code : undefined)
       return {
         name: String(data?.name ?? ''),
         upgraded: Boolean(data?.upgraded),
@@ -998,7 +1166,7 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
         body: JSON.stringify({ url: appUrl }),
       })
       const data = await r.json().catch(() => ({}))
-      if (!r.ok) throw new Error((data && data.error) || `HTTP ${r.status}`)
+      if (!r.ok) throw new AppsError((data && data.error) || `HTTP ${r.status}`, typeof data?.code === 'string' ? data.code : undefined)
       return {
         name: String(data?.name ?? ''),
         upgraded: Boolean(data?.upgraded),
@@ -1105,30 +1273,44 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
         url(`/api/releases/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`),
         { method: 'DELETE' },
       )
-      if (!r.ok) {
-        const data = await r.json().catch(() => ({}))
-        throw new Error(data?.error || `HTTP ${r.status}`)
-      }
+      if (!r.ok) throw await appsFailure(r)
     },
 
     async startApp(name) {
       const r = await fetch(url(`/api/releases/app/${encodeURIComponent(name)}/start`), {
         method: 'POST',
       })
-      if (!r.ok) {
-        const data = await r.json().catch(() => ({}))
-        throw new Error(data?.error || `HTTP ${r.status}`)
-      }
+      if (!r.ok) throw await appsFailure(r)
     },
 
     async stopApp(name) {
       const r = await fetch(url(`/api/releases/app/${encodeURIComponent(name)}/stop`), {
         method: 'POST',
       })
-      if (!r.ok) {
-        const data = await r.json().catch(() => ({}))
-        throw new Error(data?.error || `HTTP ${r.status}`)
-      }
+      if (!r.ok) throw await appsFailure(r)
+    },
+
+    // Vinx: the autostart switch, shaped exactly like startApp/stopApp.
+    async enableApp(name) {
+      const r = await fetch(url(`/api/releases/app/${encodeURIComponent(name)}/enable`), {
+        method: 'POST',
+      })
+      if (!r.ok) throw await appsFailure(r)
+    },
+
+    async disableApp(name) {
+      const r = await fetch(url(`/api/releases/app/${encodeURIComponent(name)}/disable`), {
+        method: 'POST',
+      })
+      if (!r.ok) throw await appsFailure(r)
+    },
+
+    // Vinx: open a window app.
+    async runApp(name) {
+      const r = await fetch(url(`/api/releases/app/${encodeURIComponent(name)}/run`), {
+        method: 'POST',
+      })
+      if (!r.ok) throw await appsFailure(r)
     },
 
     async listThemes() {
@@ -1148,10 +1330,7 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ css, js, session_id: sessionId ?? null }),
       })
-      if (!r.ok) {
-        const data = await r.json().catch(() => ({}))
-        throw new Error(data?.error || `HTTP ${r.status}`)
-      }
+      if (!r.ok) throw await appsFailure(r)
     },
 
     async activateTheme(name) {
@@ -1160,18 +1339,12 @@ export function createChatClient(basePath = '', opts?: ChatClientOptions): ChatC
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
       })
-      if (!r.ok) {
-        const data = await r.json().catch(() => ({}))
-        throw new Error(data?.error || `HTTP ${r.status}`)
-      }
+      if (!r.ok) throw await appsFailure(r)
     },
 
     async deactivateTheme() {
       const r = await fetch(url('/api/themes/active'), { method: 'DELETE' })
-      if (!r.ok) {
-        const data = await r.json().catch(() => ({}))
-        throw new Error(data?.error || `HTTP ${r.status}`)
-      }
+      if (!r.ok) throw await appsFailure(r)
     },
 
     getRuntimeStat(category) {

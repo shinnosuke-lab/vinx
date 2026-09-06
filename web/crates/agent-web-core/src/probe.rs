@@ -30,7 +30,12 @@ use crate::types::{ChatMessage, RiskLevel, ToolParameters};
 /// `AgentLoop`, YAML frontmatter and the regex matcher via `SkillRegistry`,
 /// and the wire encoder via `sse`.
 #[wasm_bindgen]
-pub async fn probe_turn(base_url: String, api_key: String, model: String, prompt: String) -> String {
+pub async fn probe_turn(
+    base_url: String,
+    api_key: String,
+    model: String,
+    prompt: String,
+) -> String {
     console_error_panic_hook::set_once();
 
     let llm = LlmClient::new(&base_url, &api_key, &model, None);
@@ -49,9 +54,10 @@ pub async fn probe_turn(base_url: String, api_key: String, model: String, prompt
     // that hangs on the first tool call would never reach the rest of it.
     wasm_bindgen_futures::spawn_local(async move {
         while let Some(call) = tool_rx.recv().await {
-            let _ = call
-                .reply
-                .send(crate::types::ToolResult::text(format!("stub: {}", call.tool)));
+            let _ = call.reply.send(crate::types::ToolResult::text(format!(
+                "stub: {}",
+                call.tool
+            )));
         }
     });
 
@@ -115,7 +121,10 @@ pub async fn probe_sqlite() -> String {
     }
     let loaded = store.load(&id).map(|m| m.len()).unwrap_or(0);
     let listed = store.list().map(|r| r.len()).unwrap_or(0);
-    let found = store.search("devices", 10, None).map(|h| h.len()).unwrap_or(0);
+    let found = store
+        .search("devices", 10, None)
+        .map(|h| h.len())
+        .unwrap_or(0);
     let detailed = store.detail(&id).map(|d| d.is_some()).unwrap_or(false);
     let _ = store.set_title(&id, "probe");
     let _ = store.update(&id, None, Some(true));

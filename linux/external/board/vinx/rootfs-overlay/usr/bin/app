@@ -1,0 +1,840 @@
+#!/bin/sh
+# app -- make, check, pack, install and run apps on this machine
+# (system-v2 §9, §12.3-12.5, §13.2).
+#
+# An app is a directory with an app.json (schema 0) and an entry (default
+# ./run). Its id is the directory or package name -- never repeated inside
+# the manifest. `new` scaffolds a work tree under /data/work, `check`
+# validates it (--json emits the stable {code,path,message,hint} shape a
+# model can act on), `pack` makes a .vapp (a plain tar.gz), `install`
+# validates a .vapp and lands it atomically in /data/apps -- which the
+# page's recursive mirror persists, so installed apps survive a reload.
+#
+# Running: `run` execs the app in the foreground through app-run(8);
+# start/stop/status/list ride the app.* control-plane methods into rund,
+# which supervises services (own process group, log at
+# /run/vinx/apps/ID/log, bounded crash backoff). enable/disable edit
+# /data/apps/enabled -- user policy, one id per line: enabled services
+# autostart after a boot (§9.3); an enabled pure web window's "boot" is
+# the page loading, and the desktop opens it then (§10.7) -- rund skips
+# it, told by the .web marker install leaves beside the package.
+
+WORK_DIR=/data/work
+APPS_DIR=/data/apps
+ENABLED="$APPS_DIR/enabled"
+RUN_DIR=/run/vinx/apps
+PKG_DIR=/run/vinx/pkg
+MAX_VAPP_BYTES=8388608      # a packed app: 8 MiB
+MAX_UNPACKED_BYTES=33554432 # ...and 32 MiB unpacked
+MAX_FILES=400
+MAX_DEPTH=8
+
+usage() {
+	cat >&2 <<'EOF'
+usage: app new NAME --command|--service|--web|--tty|--fb
+                                          scaffold /data/work/NAME
+       app check PATH [--json]            validate an app directory
+       app run NAME                       run once, in the foreground
+       app start|stop|status NAME         supervised service (rund)
+       app enable|disable NAME            autostart: after boot, or when the
+                                          page loads for a web window
+       app list [--json]                  installed and managed apps
+       app show NAME                      manifest and state
+       app log NAME [-f]                  the service's log
+       app pack PATH                      app directory -> ID.vapp
+       app install FILE.vapp              validate, then install atomically
+       app remove NAME                    stop, disable and uninstall
+EOF
+	exit 2
+}
+
+# App ids are package-name shaped; they become paths, so both ends check.
+check_id() {
+	case "$1" in
+	'' | -* | *[!a-z0-9-]*)
+		echo "app: not an app id: '$1' (lowercase letters, digits, dashes)" >&2
+		exit 2
+		;;
+	esac
+	if [ "${#1}" -gt 32 ]; then
+		echo "app: id '$1' is longer than 32" >&2
+		exit 2
+	fi
+	case "$1" in
+	app | enabled | rpc | rpcd | rund | vinx)
+		echo "app: '$1' is a reserved name" >&2
+		exit 2
+		;;
+	esac
+}
+
+# The installed manifest of ID, from the package (the install's source of
+# truth; the run tree may not exist this boot). Empty when not installed.
+installed_manifest() {
+	[ -f "$APPS_DIR/$1.vapp" ] || return 1
+	tar -xzOf "$APPS_DIR/$1.vapp" ./app.json 2>/dev/null || tar -xzOf "$APPS_DIR/$1.vapp" app.json 2>/dev/null
+}
+
+# A pure web window: kind window, ui web, no exec (§9.1). The one kind of
+# app whose "running" is a window and not a process — start, stop and
+# enable all mean something else for it.
+pure_web() {
+	m=$(installed_manifest "$1") || return 1
+	[ "$(printf '%s' "$m" | jq -r '.kind // "command"')" = window ] &&
+		[ "$(printf '%s' "$m" | jq -r '.ui.type // empty')" = web ] &&
+		[ -z "$(printf '%s' "$m" | jq -r '.exec // empty')" ]
+}
+
+# ── check: the validation both `app check` and `app install` run ──
+#
+# Findings accumulate as lines "E|code|path|message|hint" (or W| for
+# warnings); --json folds them into §13.2's stable shape with jq.
+
+CHECK_FINDINGS=''
+
+finding() { CHECK_FINDINGS="$CHECK_FINDINGS$1|$2|$3|$4|$5
+"; }
+
+check_tree() {
+	dir=$1
+	id=$2
+	CHECK_FINDINGS=''
+	if [ ! -d "$dir" ]; then
+		finding E NOT_A_DIR "$dir" 'not a directory' 'app check wants the app directory itself'
+		return
+	fi
+	case "$id" in
+	'' | -* | *[!a-z0-9-]*)
+		finding E ID_INVALID "$id" 'the directory name is not a usable app id' \
+			'lowercase letters, digits and dashes name apps'
+		;;
+	esac
+	if [ ! -f "$dir/app.json" ]; then
+		finding E NO_MANIFEST app.json 'app.json does not exist' 'create app.json beside the entry script'
+		return
+	fi
+	if ! jq -e . "$dir/app.json" >/dev/null 2>&1; then
+		finding E BAD_JSON app.json 'app.json is not valid JSON' 'jq . app.json shows where it breaks'
+		return
+	fi
+	# schema:1 is the frozen shape (system-v2 §16); 0 is the same shape in
+	# its pre-freeze coat and stays accepted for one version window.
+	schema=$(jq -r '.schema' "$dir/app.json")
+	if [ "$schema" = null ]; then
+		finding W SCHEMA_MISSING app.json 'no schema field' 'declare "schema": 1'
+	elif [ "$schema" != 0 ] && [ "$schema" != 1 ]; then
+		finding E SCHEMA_UNKNOWN app.json "schema $schema is not known here" 'this machine speaks schema 1 (and 0, its pre-freeze name)'
+	fi
+	kind=$(jq -r '.kind // "command"' "$dir/app.json")
+	ui_type=$(jq -r '.ui.type // empty' "$dir/app.json")
+	case "$kind" in
+	command | service) ;;
+	window)
+		# A window app names its surface in ui.type (§9.2): web (a §10.3
+		# bundle window), tty (a PTY terminal window, §6.9) or fb (the
+		# screen through fb-run, §10.5).
+		case "$ui_type" in
+		web | tty | fb) ;;
+		'')
+			finding E UI_MISSING app.json 'kind "window" wants a ui.type' 'add "ui": {"type": "web"}'
+			;;
+		*)
+			finding E UI_UNKNOWN app.json "ui.type \"$ui_type\" is not a surface" 'web, tty or fb'
+			;;
+		esac
+		;;
+	*)
+		finding E KIND_UNKNOWN app.json "kind \"$kind\" is not a thing" 'command, service or window'
+		;;
+	esac
+	# A web window reads index.html (plus optional style.css/app.js) by
+	# convention (§9.2); the error path is the would-be manifest field.
+	if [ "$kind" = window ] && [ "$ui_type" = web ] && [ ! -f "$dir/index.html" ]; then
+		finding E ENTRY_NOT_FOUND ui.html 'index.html does not exist' 'create index.html beside app.json'
+	fi
+	# The window's contract (§10.3), which a page written by habit breaks:
+	# index.html is a BODY FRAGMENT — the shell injects style.css and app.js
+	# itself, and under its CSP (default-src 'none') a <link> or <script
+	# src> fetch can only fail. The shell drops such references so the
+	# window still comes up; this says so, once, with the fix. Warnings:
+	# the app runs, but not the way its author pictured.
+	if [ "$kind" = window ] && [ "$ui_type" = web ] && [ -f "$dir/index.html" ]; then
+		if grep -qiE '<(link[^>]+rel=["'"'"']?stylesheet|script[^>]+src=)' "$dir/index.html"; then
+			finding W HTML_EXTERNAL_REF ui.html \
+				'index.html links style.css / app.js by <link> or <script src>' \
+				'drop them: the window injects style.css and app.js itself; index.html is a body fragment'
+		elif grep -qiE '<(!doctype|html|head|body)([ >]|$)' "$dir/index.html"; then
+			finding W HTML_EXTERNAL_REF ui.html \
+				'index.html is a whole document (<html>/<head>/<body>)' \
+				'make it a body fragment: the window supplies the document; only the body content is yours'
+		fi
+		# The frame is sandboxed with an opaque origin: storage and cookies
+		# do not exist there. The shell stands in a per-window memory store
+		# so the app runs, but nothing survives the window closing.
+		if [ -f "$dir/app.js" ] && grep -qE '(^|[^A-Za-z0-9_$.])(localStorage|sessionStorage|indexedDB)([^A-Za-z0-9_$]|$)|document\.cookie' "$dir/app.js"; then
+			finding W JS_SANDBOX_API ui.js \
+				'app.js uses localStorage/sessionStorage/indexedDB/cookie, which the sandboxed window does not have' \
+				'state lives only while the window is open (an in-memory stand-in); for persistence put a service behind the window (kind window + exec)'
+		fi
+		if [ -f "$dir/app.js" ] && grep -qE '(^|[^A-Za-z0-9_$.])fetch\(|XMLHttpRequest|new WebSocket|import\(' "$dir/app.js"; then
+			finding W JS_SANDBOX_API ui.js \
+				'app.js reaches for the network (fetch/XMLHttpRequest/WebSocket/import), which the window CSP forbids' \
+				'a web window has no network: bundle everything into the three files, and talk to the system only through vinx.call'
+		fi
+	fi
+	# The entry: optional for a pure web window (no backend is a shape,
+	# §9.1), conventional ./run for everything else.
+	entry=$(jq -r '.exec // empty' "$dir/app.json")
+	if [ -z "$entry" ] && ! { [ "$kind" = window ] && [ "$ui_type" = web ]; }; then
+		entry=./run
+	fi
+	entry_bin=${entry%% *}
+	case "$entry_bin" in
+	'') ;;
+	/* | *..*)
+		finding E ENTRY_ESCAPES app.json "exec $entry_bin leaves the app directory" \
+			'entries are relative paths inside the app'
+		;;
+	*)
+		if [ ! -e "$dir/$entry_bin" ]; then
+			finding E ENTRY_NOT_FOUND "$entry_bin" "$entry_bin does not exist" \
+				"create $entry_bin beside app.json (or set exec)"
+		elif [ ! -x "$dir/$entry_bin" ]; then
+			finding E ENTRY_NOT_EXEC "$entry_bin" "$entry_bin is not executable" "chmod +x $entry_bin"
+		fi
+		;;
+	esac
+	# A title and a description are the two words a listing shows (the
+	# Apps page, `app list`); optional, plain strings, short — the id stays
+	# the name the system knows the app by (§9.2). jq judges type and
+	# length: "ok", "type" or "long".
+	for fld in title:64 description:240; do
+		name=${fld%%:*}
+		cap=${fld##*:}
+		verdict=$(jq -r --arg k "$name" --argjson cap "$cap" \
+			'if has($k) | not then "ok" elif (.[$k] | type) != "string" then "type" elif (.[$k] | length) > $cap then "long" else "ok" end' \
+			"$dir/app.json" 2>/dev/null)
+		case "$verdict" in
+		type)
+			finding E "$(printf '%s' "$name" | tr a-z A-Z)_INVALID" app.json "$name is not a string" \
+				"a short $name, e.g. \"Cute 2048\""
+			;;
+		long)
+			finding E "$(printf '%s' "$name" | tr a-z A-Z)_INVALID" app.json "$name is longer than $cap characters" \
+				"a shorter $name"
+			;;
+		esac
+	done
+	# Unknown manifest fields are ignored at runtime; say so here (§9.2).
+	unknown=$(jq -r 'keys[] | select(. as $k | ["schema","kind","exec","ui","title","description"] | index($k) | not)' \
+		"$dir/app.json" 2>/dev/null)
+	for f in $unknown; do
+		finding W FIELD_UNKNOWN app.json "field \"$f\" is not understood (ignored at runtime)" \
+			'schema, kind, exec, ui, title and description are the manifest today'
+	done
+}
+
+check_report() {
+	json=$1
+	errs=$(printf '%s' "$CHECK_FINDINGS" | grep -c '^E|')
+	if [ "$json" = --json ]; then
+		printf '%s' "$CHECK_FINDINGS" | jq -Rn '
+			[inputs | select(length > 0) | split("|") |
+			 {sev: .[0], code: .[1], path: .[2], message: .[3], hint: .[4]}] as $all |
+			{ok: ([$all[] | select(.sev == "E")] | length == 0),
+			 errors: [$all[] | select(.sev == "E") | del(.sev)],
+			 warnings: [$all[] | select(.sev == "W") | del(.sev)]}'
+	else
+		printf '%s' "$CHECK_FINDINGS" | while IFS='|' read -r sev code path message hint; do
+			[ -n "$sev" ] || continue
+			label=$([ "$sev" = E ] && echo error || echo warning)
+			echo "app check: $label $code ($path): $message -- $hint"
+		done
+		[ "$errs" -eq 0 ] && echo 'app check: ok'
+	fi
+	[ "$errs" -eq 0 ]
+}
+
+cmd=$1
+[ $# -ge 1 ] && shift
+
+case "$cmd" in
+new)
+	name=$1
+	kind=''
+	[ $# -ge 1 ] && shift
+	case "${1:-}" in
+	--command) kind=command ;;
+	--service) kind=service ;;
+	--web) kind=web ;;
+	--tty) kind=tty ;;
+	--fb) kind=fb ;;
+	'') echo 'app: new wants --command, --service, --web, --tty or --fb' >&2; exit 2 ;;
+	*) usage ;;
+	esac
+	check_id "$name"
+	dir="$WORK_DIR/$name"
+	if [ -e "$dir" ]; then
+		echo "app: $dir already exists" >&2
+		exit 1
+	fi
+	mkdir -p "$dir" || exit 1
+	if [ "$kind" = web ]; then
+		# A pure web window (§9.2): no backend, so no exec; the UI is the
+		# conventional index.html + style.css + app.js triple.
+		printf '{\n  "schema": 1,\n  "kind": "window",\n  "ui": { "type": "web" },\n  "title": "%s",\n  "description": "A web app scaffolded by app new --web. Edit index.html, style.css and app.js."\n}\n' "$name" > "$dir/app.json"
+		cat > "$dir/index.html" <<'EOF'
+<h1 id="title">hello</h1>
+<p>This window is a vinx app. Edit index.html, style.css and app.js.</p>
+<button id="ping">notify</button>
+EOF
+		cat > "$dir/style.css" <<'EOF'
+body { padding: 12px; }
+h1 { margin: 0 0 8px; font-size: 18px; }
+button { margin-top: 8px; }
+EOF
+		cat > "$dir/app.js" <<'EOF'
+// The window's system surface is `vinx` (allowlisted, via the desktop):
+//   vinx.call('notify.show', {text: '...'})  a browser notification/toast
+//   vinx.close()                             close this window
+document.getElementById('title').textContent = 'hello from ' + location.protocol;
+document.getElementById('ping').onclick = () => {
+	vinx.call('notify.show', { text: 'clicked at ' + new Date().toLocaleTimeString() });
+};
+EOF
+		printf '# %s\n\nEdit the UI, then: app check %s && app pack %s\n' "$name" "$dir" "$dir" > "$dir/README.md"
+		echo "app: scaffolded $dir (web window) -- edit the UI, then app check $dir"
+	elif [ "$kind" = tty ]; then
+		# A terminal window (§6.9): the desktop opens an xterm over this
+		# process's PTY. termbox2 is one header, already on this machine.
+		printf '{\n  "schema": 1,\n  "kind": "window",\n  "ui": { "type": "tty" },\n  "exec": "./run"\n}\n' > "$dir/app.json"
+		cat > "$dir/main.c" <<'EOF'
+/* A terminal-window app: stdin/stdout are a PTY, the desktop shows it
+ * in an xterm window (close the window and the app is stopped). The UI
+ * library is termbox2 -- a single header, shipped on this machine.
+ * ./run compiles this with tcc in place. q (or ctrl-c) quits. */
+#define TB_IMPL
+#include <termbox2.h>
+
+static void draw(int keys, uint32_t last)
+{
+	int w = tb_width(), h = tb_height();
+	tb_clear();
+	for (int x = 0; x < w; x++) {
+		tb_set_cell(x, 0, 0x2500, TB_CYAN, TB_DEFAULT);
+		tb_set_cell(x, h - 1, 0x2500, TB_CYAN, TB_DEFAULT);
+	}
+	for (int y = 0; y < h; y++) {
+		tb_set_cell(0, y, 0x2502, TB_CYAN, TB_DEFAULT);
+		tb_set_cell(w - 1, y, 0x2502, TB_CYAN, TB_DEFAULT);
+	}
+	tb_set_cell(0, 0, 0x250c, TB_CYAN, TB_DEFAULT);
+	tb_set_cell(w - 1, 0, 0x2510, TB_CYAN, TB_DEFAULT);
+	tb_set_cell(0, h - 1, 0x2514, TB_CYAN, TB_DEFAULT);
+	tb_set_cell(w - 1, h - 1, 0x2518, TB_CYAN, TB_DEFAULT);
+	tb_printf(2, 0, TB_CYAN | TB_BOLD, TB_DEFAULT, " tty app ");
+	tb_printf(2, 2, TB_DEFAULT, TB_DEFAULT, "This window is a PTY, %dx%d.", w, h);
+	tb_printf(2, 3, TB_DEFAULT, TB_DEFAULT, "Type keys (%d so far); the last was U+%04X.", keys, (unsigned)last);
+	tb_printf(2, 5, TB_YELLOW, TB_DEFAULT, "q quits (closing the window also stops the app).");
+	tb_present();
+}
+
+int main(void)
+{
+	if (tb_init() != 0) return 1;
+	int keys = 0;
+	uint32_t last = 0;
+	draw(keys, last);
+	struct tb_event ev;
+	while (tb_poll_event(&ev) == TB_OK) {
+		if (ev.type == TB_EVENT_KEY) {
+			if (ev.ch == 'q' || ev.key == TB_KEY_CTRL_C) break;
+			keys++;
+			last = ev.ch;
+		}
+		/* TB_EVENT_RESIZE falls through: draw() remeasures. */
+		draw(keys, last);
+	}
+	tb_shutdown();
+	return 0;
+}
+EOF
+		cat > "$dir/run" <<'EOF'
+#!/bin/sh
+# Compile in place (tcc; termbox2 is a single header) and exec. The PTY
+# is already stdin/stdout -- rund spawned us on one (app.start {pty}).
+set -e
+cd "$(dirname "$0")"
+if [ ! -x main ] || [ main.c -nt main ]; then
+	tcc main.c -o main
+fi
+exec ./main
+EOF
+		chmod +x "$dir/run"
+		printf '# %s\n\nA terminal-window app. Edit main.c, then:\n  app check %s && app pack %s && app install /data/%s.vapp && app start %s\n' \
+			"$name" "$dir" "$dir" "$name" "$name" > "$dir/README.md"
+		echo "app: scaffolded $dir (tty window) -- edit main.c, then app check $dir"
+	elif [ "$kind" = fb ]; then
+		# A framebuffer app (§10.5): LVGL on /dev/fb0 with the page's
+		# pointer, through fb-run (one FB program at a time).
+		printf '{\n  "schema": 1,\n  "kind": "window",\n  "ui": { "type": "fb" },\n  "exec": "./run"\n}\n' > "$dir/app.json"
+		cat > "$dir/main.c" <<'EOF'
+/* A framebuffer app: LVGL on /dev/fb0, the page's pointer as input --
+ * /usr/share/lvgl/lvdemo.c's shape with a signal-clean exit. ./run
+ * compiles it with tcc and runs it under fb-run (the screen lock; the
+ * terminal comes back sane on any exit). Ctrl-C or a TERM quits. */
+#include <lvgl/lvgl.h>
+
+#include <ctype.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t quit;
+static void on_signal(int sig)
+{
+	(void)sig;
+	quit = 1;
+}
+
+static uint32_t ms_now(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+/* The PS/2 mouse lands on whichever /dev/input/eventN psmouse registered. */
+static const char *mouse_event_path(void)
+{
+	static char path[32];
+	for (int i = 0; i < 8; i++) {
+		char sys[64], name[128];
+		snprintf(sys, sizeof sys, "/sys/class/input/event%d/device/name", i);
+		FILE *f = fopen(sys, "r");
+		if (!f) continue;
+		name[0] = 0;
+		if (!fgets(name, sizeof name, f)) name[0] = 0;
+		fclose(f);
+		for (char *p = name; *p; p++) *p = (char)tolower((unsigned char)*p);
+		if (strstr(name, "mouse")) {
+			snprintf(path, sizeof path, "/dev/input/event%d", i);
+			return path;
+		}
+	}
+	return NULL;
+}
+
+static lv_obj_t *button_label;
+static int clicks;
+
+static void on_click(lv_event_t *e)
+{
+	(void)e;
+	clicks++;
+	lv_label_set_text_fmt(button_label, "clicks: %d", clicks);
+}
+
+int main(void)
+{
+	signal(SIGINT, on_signal);
+	signal(SIGTERM, on_signal);
+	signal(SIGHUP, on_signal);
+
+	lv_init();
+	lv_tick_set_cb(ms_now);
+
+	lv_display_t *disp = lv_linux_fbdev_create();
+	if (!disp) {
+		fprintf(stderr, "no display driver\n");
+		return 1;
+	}
+	lv_linux_fbdev_set_file(disp, "/dev/fb0");
+
+	lv_obj_t *scr = lv_screen_active();
+	lv_obj_set_style_bg_color(scr, lv_color_hex(0x102a43), 0);
+
+	/* The CJK font ships at /usr/share/fonts/cjk16.bin (GB2312 + ASCII,
+	 * 16 px); without it the labels fall back to Latin. */
+	const lv_font_t *cjk = NULL;
+	if (access("/usr/share/fonts/cjk16.bin", R_OK) == 0)
+		cjk = lv_binfont_create("A:/usr/share/fonts/cjk16.bin");
+
+	lv_obj_t *title = lv_label_create(scr);
+	if (cjk) {
+		lv_obj_set_style_text_font(title, cjk, 0);
+		lv_label_set_text(title, "这是一个 FB 应用：画在 /dev/fb0，指针来自页面。");
+	} else {
+		lv_label_set_text(title, "An FB app on /dev/fb0 (no CJK font found).");
+	}
+	lv_obj_set_style_text_color(title, lv_color_hex(0xf0f4f8), 0);
+	lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
+
+	lv_obj_t *btn = lv_button_create(scr);
+	lv_obj_set_size(btn, 200, 90);
+	lv_obj_align(btn, LV_ALIGN_CENTER, 0, 0);
+	lv_obj_add_event_cb(btn, on_click, LV_EVENT_CLICKED, NULL);
+	button_label = lv_label_create(btn);
+	lv_label_set_text(button_label, "clicks: 0");
+	lv_obj_center(button_label);
+
+	const char *mouse = mouse_event_path();
+	if (mouse) {
+		lv_indev_t *ptr = lv_evdev_create(LV_INDEV_TYPE_POINTER, mouse);
+		lv_obj_t *cursor = lv_obj_create(lv_layer_sys());
+		lv_obj_set_size(cursor, 8, 8);
+		lv_obj_set_style_radius(cursor, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_color(cursor, lv_color_hex(0xffc857), 0);
+		lv_obj_set_style_border_width(cursor, 0, 0);
+		lv_obj_set_style_translate_x(cursor, -4, 0);
+		lv_obj_set_style_translate_y(cursor, -4, 0);
+		lv_indev_set_cursor(ptr, cursor);
+	}
+	printf("ready (ctrl-c quits)\n");
+	fflush(stdout);
+
+	/* The signal flag, not for(;;): fb-run restores the terminal on the
+	 * way out, and a clean return is what lets every exit path match. */
+	while (!quit) {
+		uint32_t wait = lv_timer_handler();
+		if (wait > 500) wait = 33;
+		usleep(wait * 1000);
+	}
+	printf("bye\n");
+	return 0;
+}
+EOF
+		cat > "$dir/run" <<'EOF'
+#!/bin/sh
+# Compile outside the screen lock (tcc against the shipped liblvgl),
+# then run under fb-run: one FB program at a time, stty restored on any
+# exit (§10.5). window.focus pops the page's screen window -- drawing on
+# fb0 changes no video mode, so the page cannot notice by itself.
+set -e
+cd "$(dirname "$0")"
+if [ ! -x main ] || [ main.c -nt main ]; then
+	tcc main.c -o main -llvgl
+fi
+rpc call window.focus '{"id":"screen"}' >/dev/null 2>&1 || true
+exec fb-run ./main
+EOF
+		chmod +x "$dir/run"
+		printf '# %s\n\nA framebuffer (LVGL) app. Edit main.c, then:\n  app check %s && app pack %s && app install /data/%s.vapp && app start %s\n' \
+			"$name" "$dir" "$dir" "$name" "$name" > "$dir/README.md"
+		echo "app: scaffolded $dir (fb) -- edit main.c, then app check $dir"
+	else
+		printf '{\n  "schema": 1,\n  "kind": "%s",\n  "exec": "./run"\n}\n' "$kind" > "$dir/app.json"
+		if [ "$kind" = service ]; then
+			cat > "$dir/run" <<'EOF'
+#!/bin/sh
+# A service: run until stopped. rund keeps the log and the lifecycle.
+while :; do
+	echo "alive at $(date)"
+	sleep 5
+done
+EOF
+		else
+			cat > "$dir/run" <<'EOF'
+#!/bin/sh
+echo "hello from a vinx app"
+EOF
+		fi
+		chmod +x "$dir/run"
+		printf '# %s\n\nEdit run, then: app check %s && app pack %s\n' "$name" "$dir" "$dir" > "$dir/README.md"
+		echo "app: scaffolded $dir ($kind) -- edit run, then app check $dir"
+	fi
+	;;
+check)
+	[ $# -ge 1 ] || usage
+	path=${1%/}
+	jsonflag=${2:-}
+	check_tree "$path" "$(basename "$path")"
+	check_report "$jsonflag"
+	;;
+run)
+	[ $# -eq 1 ] || usage
+	check_id "$1"
+	# A tty app draws on its controlling terminal. Run from the console
+	# that is this very tty; run from an agent's run_shell (stdin is
+	# /dev/null) it would just die confused — say the useful thing instead.
+	if [ ! -t 0 ] && manifest=$(installed_manifest "$1"); then
+		if [ "$(printf '%s' "$manifest" | jq -r '.ui.type // empty')" = tty ]; then
+			echo "app: $1 is a tty app and this channel has no terminal -- app start $1 opens its window on the page (app run works from the console)" >&2
+			exit 2
+		fi
+	fi
+	exec /usr/sbin/app-run "$1"
+	;;
+start)
+	[ $# -eq 1 ] || usage
+	check_id "$1"
+	# A pure web window has no backend for rund to supervise: starting it
+	# is showing it, which is app run's job (the window IS the app). A tty
+	# window wants its backend on a PTY (§6.9): app.start {pty} makes rund
+	# spawn through openpty and the desktop grow a terminal window.
+	want_pty=false
+	if pure_web "$1"; then
+		echo "app: $1 is a pure web app (no backend) -- app run $1 opens its window" >&2
+		exit 2
+	fi
+	if m=$(installed_manifest "$1"); then
+		[ "$(printf '%s' "$m" | jq -r '.ui.type // empty')" = tty ] && want_pty=true
+	fi
+	res=$(jq -cn --arg id "$1" --argjson pty "$want_pty" '{id: $id, pty: $pty}' | rpc call app.start - -t 20) || exit 1
+	echo "app: $1 $(printf '%s' "$res" | jq -r '.state') (pid $(printf '%s' "$res" | jq -r '.pid // "-"')) -- app log $1 follows it"
+	;;
+stop)
+	[ $# -eq 1 ] || usage
+	check_id "$1"
+	# A pure web window has no backend: its "stop" is its window closing,
+	# and the desktop owns windows (§10.7) — window.close by the app's id,
+	# which is what the window was created under. Nothing for rund.
+	if pure_web "$1"; then
+		if jq -cn --arg id "$1" '{id: $id}' | rpc call window.close - -t 10 >/dev/null 2>&1; then
+			echo "app: $1 window closed"
+		else
+			echo "app: $1 has no window open"
+		fi
+		exit 0
+	fi
+	res=$(jq -cn --arg id "$1" '{id: $id}' | rpc call app.stop - -t 20) || exit 1
+	echo "app: $1 $(printf '%s' "$res" | jq -r '.state')"
+	;;
+status)
+	[ $# -eq 1 ] || usage
+	check_id "$1"
+	res=$(jq -cn --arg id "$1" '{id: $id}' | rpc call app.status - -t 20) || exit 1
+	state=$(printf '%s' "$res" | jq -r '.state')
+	pid=$(printf '%s' "$res" | jq -r '.pid // empty')
+	enabled=$(printf '%s' "$res" | jq -r 'if .enabled then ", enabled" else "" end')
+	restarts=$(printf '%s' "$res" | jq -r 'if .restarts > 0 then ", \(.restarts) restart(s)" else "" end')
+	echo "app: $1 is $state${pid:+ (pid $pid)}$enabled$restarts"
+	[ "$state" = running ]
+	;;
+list)
+	res=$(rpc call app.list '{}' -t 20) || exit 1
+	if [ "${1:-}" = --json ]; then
+		printf '%s\n' "$res"
+	else
+		count=$(printf '%s' "$res" | jq -r '.apps | length')
+		if [ "$count" = 0 ]; then
+			echo 'app: nothing installed (app new NAME --command scaffolds one)'
+		else
+			printf '%s' "$res" |
+				jq -r '.apps[] | "\(.id)\t\(.state)\(if .enabled then "\tenabled" else "" end)"'
+		fi
+	fi
+	;;
+show)
+	[ $# -eq 1 ] || usage
+	check_id "$1"
+	vapp="$APPS_DIR/$1.vapp"
+	if [ -f "$vapp" ]; then
+		echo "app: $1 -- $(wc -c < "$vapp") bytes at $vapp"
+		tar -xzOf "$vapp" ./app.json 2>/dev/null || tar -xzOf "$vapp" app.json 2>/dev/null ||
+			echo '(no app.json in the package?)'
+	else
+		echo "app: $1 is not installed"
+	fi
+	"$0" status "$1" 2>/dev/null || true
+	;;
+log)
+	[ $# -ge 1 ] || usage
+	check_id "$1"
+	logf="$RUN_DIR/$1/log"
+	[ -f "$logf" ] || {
+		echo "app: no log yet for $1 (it has not run this boot)" >&2
+		exit 1
+	}
+	if [ "${2:-}" = -f ]; then
+		exec tail -f "$logf"
+	fi
+	cat "$logf"
+	;;
+enable)
+	[ $# -eq 1 ] || usage
+	check_id "$1"
+	[ -f "$APPS_DIR/$1.vapp" ] || {
+		echo "app: $1 is not installed (app install FILE.vapp first)" >&2
+		exit 1
+	}
+	mkdir -p "$APPS_DIR"
+	# A pure web window has no process for the boot sweep to start: its
+	# "boot" is the page loading, and the desktop opens it then, from its
+	# own copy of the package (§10.7) -- machine on or off. The marker
+	# sidecar tells rund to skip it in the sweep (a package installed before
+	# the marker existed gets it here, the same words install writes).
+	if pure_web "$1"; then
+		echo web > "$APPS_DIR/$1.web"
+		grep -qx "$1" "$ENABLED" 2>/dev/null || echo "$1" >> "$ENABLED"
+		echo "app: $1 enabled -- its window opens whenever the page loads (app run $1 opens it now)"
+		exit 0
+	fi
+	grep -qx "$1" "$ENABLED" 2>/dev/null || echo "$1" >> "$ENABLED"
+	# Policy, not an action (§9.3): a service stopped by hand this boot
+	# stays stopped -- the list is read at boot and after crashes. Say what
+	# happens now, honestly, per kind.
+	if [ "$(cat "$APPS_DIR/$1.kind" 2>/dev/null)" = command ]; then
+		echo "app: $1 enabled -- it runs once on every boot (app run $1 runs it now)"
+	else
+		echo "app: $1 enabled -- it starts on every boot (app start $1 starts it now)"
+	fi
+	;;
+disable)
+	[ $# -eq 1 ] || usage
+	check_id "$1"
+	if [ -f "$ENABLED" ]; then
+		grep -vx "$1" "$ENABLED" > "$ENABLED.tmp" 2>/dev/null || true
+		mv "$ENABLED.tmp" "$ENABLED"
+	fi
+	echo "app: $1 disabled -- a running instance keeps running (app stop $1 stops it)"
+	;;
+pack)
+	[ $# -eq 1 ] || usage
+	path=${1%/}
+	id=$(basename "$path")
+	check_id "$id"
+	check_tree "$path" "$id"
+	check_report '' || {
+		echo "app: fix the errors above, then pack again" >&2
+		exit 1
+	}
+	out="$(dirname "$path")/$id.vapp"
+	tar czf "$out" -C "$path" . || exit 1
+	echo "app: packed $out ($(wc -c < "$out") bytes) -- app install $out"
+	;;
+install)
+	[ $# -eq 1 ] || usage
+	file=$1
+	[ -f "$file" ] || {
+		echo "app: $file: no such file" >&2
+		exit 1
+	}
+	id=$(basename "$file" .vapp)
+	check_id "$id"
+	grep -q ' /data 9p ' /proc/mounts || {
+		echo 'app: no /data mounted -- nothing to install into' >&2
+		exit 1
+	}
+	if [ "$(wc -c < "$file")" -gt "$MAX_VAPP_BYTES" ]; then
+		echo "app: $file is larger than $MAX_VAPP_BYTES bytes packed" >&2
+		exit 1
+	fi
+	# The archive listing is the first gate (§12.4): links, escapes, count,
+	# depth and unpacked size are all visible without extracting a byte.
+	# Links first — a symlink line's last field is its target, which would
+	# muddle the escape check's message.
+	listing=$(tar -tvzf "$file" 2>/dev/null) || {
+		echo "app: $file is not a readable tar.gz" >&2
+		exit 1
+	}
+	if printf '%s\n' "$listing" | grep -qE '^[lh]'; then
+		echo "app: $file contains links; apps carry plain files only" >&2
+		exit 1
+	fi
+	if printf '%s\n' "$listing" | awk '{print $NF}' | grep -qE '^/|(^|/)\.\.(/|$)'; then
+		echo "app: $file contains escaping paths (absolute or ..)" >&2
+		exit 1
+	fi
+	nfiles=$(printf '%s\n' "$listing" | grep -cv '/$')
+	if [ "$nfiles" -gt "$MAX_FILES" ]; then
+		echo "app: $file carries $nfiles files; the cap is $MAX_FILES" >&2
+		exit 1
+	fi
+	if printf '%s\n' "$listing" | awk '{print $NF}' | sed 's|^\./||' |
+		awk -F/ "NF > $MAX_DEPTH { bad = 1 } END { exit !bad }"; then
+		echo "app: $file nests deeper than $MAX_DEPTH levels" >&2
+		exit 1
+	fi
+	total=$(printf '%s\n' "$listing" | awk '{ s += $3 } END { printf "%d", s }')
+	if [ "$total" -gt "$MAX_UNPACKED_BYTES" ]; then
+		echo "app: $file unpacks to $total bytes; the cap is $MAX_UNPACKED_BYTES" >&2
+		exit 1
+	fi
+	# Unpack to a staging tree and run the same check the work tree gets;
+	# only a tree that passes replaces the installed package -- atomically,
+	# and under a dot-name while in flight so the mirror never sees it.
+	stage="$PKG_DIR/.install-$$"
+	mkdir -p "$stage" || exit 1
+	if ! tar xzf "$file" -C "$stage"; then
+		rm -rf "$stage"
+		echo "app: $file does not unpack" >&2
+		exit 1
+	fi
+	check_tree "$stage" "$id"
+	CHECK_FINDINGS=$(printf '%s' "$CHECK_FINDINGS" | grep -v '^E|ID_INVALID' || true)
+	if ! check_report ''; then
+		rm -rf "$stage"
+		echo "app: $file failed validation; nothing installed" >&2
+		exit 1
+	fi
+	mkdir -p "$APPS_DIR"
+	# A fresh install is not an enable. An id on the autostart list with no
+	# package behind it is a leftover -- a remove whose disable never
+	# reached the machine's mirror -- and it must not make a new package
+	# under that name autostart unasked: the list is the person's policy,
+	# set after an install. An update (a package already there) keeps the
+	# list as it is. The page's install_app (app-install.ts) keeps the same
+	# rule.
+	if [ ! -f "$APPS_DIR/$id.vapp" ] && grep -qx "$id" "$ENABLED" 2>/dev/null; then
+		"$0" disable "$id" >/dev/null 2>&1 || true
+	fi
+	cp "$file" "$APPS_DIR/.$id.vapp.tmp" && mv "$APPS_DIR/.$id.vapp.tmp" "$APPS_DIR/$id.vapp" || {
+		rm -rf "$stage"
+		echo 'app: could not land the package in /data/apps' >&2
+		exit 1
+	}
+	# The manifest's kind, as a sidecar rund and app list can read without
+	# a tree to look in: a command is one run, a service is supervised
+	# (§9.3), and telling them apart must not wait for the first start of
+	# the boot. Beside the package, so the mirror carries it too — which is
+	# also how the page lists a powered-off machine's apps. Title and
+	# description ride the same way (empty files when the manifest has
+	# none; a listing falls back to the id).
+	jq -r '.kind // "command"' "$stage/app.json" > "$APPS_DIR/$id.kind" 2>/dev/null ||
+		echo command > "$APPS_DIR/$id.kind"
+	jq -r '.title // ""' "$stage/app.json" 2>/dev/null > "$APPS_DIR/$id.title" || : > "$APPS_DIR/$id.title"
+	jq -r '.description // ""' "$stage/app.json" 2>/dev/null > "$APPS_DIR/$id.description" || : > "$APPS_DIR/$id.description"
+	# A pure web window (kind window, ui web, no exec) gets a marker too:
+	# rund's enabled sweep skips it -- there is no process, and its
+	# autostart is the desktop opening the window when the page loads --
+	# and the page's lists know it without opening the package. Absent for
+	# everything else, and removed when a reinstall changes the kind.
+	if jq -e '(.kind // "command") == "window" and (.ui.type // "") == "web" and (.exec // "") == ""' \
+		"$stage/app.json" >/dev/null 2>&1; then
+		echo web > "$APPS_DIR/$id.web"
+	else
+		rm -f "$APPS_DIR/$id.web"
+	fi
+	# Pre-warm this boot's run tree when none exists, stamped the way
+	# app-run(8) stamps its own unpacks (the tree is a cache keyed on the
+	# package bytes; see there). A live older tree is left alone: app-run
+	# notices the stale stamp on the next start and swaps the tree then,
+	# so stop/start really does pick the new version up.
+	if [ -d "$PKG_DIR/$id" ]; then
+		rm -rf "$stage"
+		echo "app: installed $APPS_DIR/$id.vapp -- app stop $id && app start $id picks it up"
+	else
+		sha256sum "$APPS_DIR/$id.vapp" | cut -c1-64 > "$stage/.stamp"
+		mv "$stage" "$PKG_DIR/$id" 2>/dev/null || rm -rf "$stage"
+		echo "app: installed $APPS_DIR/$id.vapp -- app start $id (or app run $id once)"
+	fi
+	;;
+remove)
+	[ $# -eq 1 ] || usage
+	check_id "$1"
+	# Stop it first — through this CLI's own stop, which knows the kinds: a
+	# service's process group through rund, a window app's window through
+	# the desktop. A removed app must not leave a window floating.
+	"$0" stop "$1" >/dev/null 2>&1 || true
+	"$0" disable "$1" >/dev/null 2>&1 || true
+	rm -f "$APPS_DIR/$1.vapp" "$APPS_DIR/$1.kind" "$APPS_DIR/$1.title" "$APPS_DIR/$1.description" "$APPS_DIR/$1.web"
+	rm -rf "${PKG_DIR:?}/$1"
+	echo "app: removed $1"
+	;;
+*)
+	usage
+	;;
+esac

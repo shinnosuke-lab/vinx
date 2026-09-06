@@ -53,11 +53,9 @@ pub fn save(name: &str, css: &str, js: &str, session_id: Option<&str>) -> Result
 
 /// `PUT /api/themes/active`: switch which saved look is injected.
 pub fn activate(name: &str) -> Result<(), Refused> {
-    crate::releases::set_active_theme(&root(), name).map_err(|e| {
-        match e.kind() {
-            std::io::ErrorKind::NotFound => Refused::missing(format!("no theme named '{name}'")),
-            _ => Refused::bad(e.to_string()),
-        }
+    crate::releases::set_active_theme(&root(), name).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Refused::missing(format!("no theme named '{name}'")),
+        _ => Refused::bad(e.to_string()),
     })
 }
 

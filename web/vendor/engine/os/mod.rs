@@ -34,11 +34,19 @@ pub use search::SearchFilesTool;
 /// inside the drafts bucket, anything carrying a path is used verbatim. This is
 /// what makes `write_file("hero.svg")` compose with `publish` and with
 /// `set_chat_style`'s theme assets, without the model tracking absolute paths.
+///
+/// `.` and `..` are not filenames: they keep meaning the working directory
+/// (the default `path` of `list_files` and `search_files`), never the drafts
+/// bucket.
 pub fn resolve_in_drafts(drafts_dir: Option<&Path>, path: &str) -> String {
     if let Some(drafts) = drafts_dir {
         let p = path.trim();
-        let bare =
-            !p.is_empty() && !p.contains('/') && !p.contains('\\') && !Path::new(p).is_absolute();
+        let bare = !p.is_empty()
+            && p != "."
+            && p != ".."
+            && !p.contains('/')
+            && !p.contains('\\')
+            && !Path::new(p).is_absolute();
         if bare {
             return drafts.join(p).to_string_lossy().into_owned();
         }
@@ -46,7 +54,20 @@ pub fn resolve_in_drafts(drafts_dir: Option<&Path>, path: &str) -> String {
     path.to_string()
 }
 
-/// Scoping policy for OS tools.
+/// The same convention read back: a bare filename names the draft a
+/// bare-filename `write_file` produced, so `read_file` / `edit_file` /
+/// `list_files` / `search_files` / `download_file` look in the drafts bucket
+/// first. When no such draft exists the path is used as given — a gateway's
+/// `read_file("README.md")` keeps meaning the working directory — and a
+/// missing file is then reported against the path the model wrote, not the
+/// drafts guess.
+pub fn resolve_existing_in_drafts(drafts_dir: Option<&Path>, path: &str) -> String {
+    let in_drafts = resolve_in_drafts(drafts_dir, path);
+    if in_drafts != path && crate::vfs::exists(Path::new(&in_drafts)) {
+        return in_drafts;
+    }
+    path.to_string()
+}
 #[derive(Debug, Clone, Default)]
 pub struct OsPolicy {
     /// Allowed filesystem roots (read + write). Empty = unrestricted (dev only).
@@ -105,10 +126,14 @@ impl OsPolicy {
     }
 
     /// Validate a path for reading. Returns the canonical path or an error.
+    ///
+    /// A path that does not resolve is reported as what it is — nothing
+    /// there — not as "cannot resolve", which a model reads as a permission
+    /// problem and stops trying spellings it should try.
     pub fn check_read(&self, path: &str) -> Result<PathBuf, String> {
         let p = Path::new(path);
         let canonical = crate::vfs::canonicalize(p)
-            .map_err(|_| format!("Error: cannot resolve path: {}", path))?;
+            .map_err(|_| format!("Error: no such file or directory: {}", path))?;
         if !self.is_readable(&canonical) {
             return Err(format!(
                 "Error: path '{}' is outside the allowed roots; access denied.",
@@ -300,7 +325,10 @@ impl Tool for AuditedTool {
 /// wrapped in [`AuditedTool`] when an `auditor` is given. With `auditor = None`
 /// this is equivalent to [`register`]. `drafts_dir`, when set,
 /// redirects bare-filename `write_file` targets into the runtime drafts bucket
-/// (such writes are `Safe`).
+/// (such writes are `Safe`), and lets every other file tool — `read_file`,
+/// `edit_file`, `list_files`, `search_files` — find a draft by the same bare
+/// name (edits inside the bucket are `Safe` too). One rule, so a model never
+/// has to remember which tool understood the name it just used.
 /// `safe_paths`, when set, is the shared write/edit directory allow-list (writes
 /// inside a trusted folder downgrade to `Safe`).
 pub fn register_audited(
@@ -312,10 +340,17 @@ pub fn register_audited(
 ) {
     let policy = Arc::new(policy);
 
-    // Reads (Safe): registered directly (no audit noise).
-    registry.register(Arc::new(ReadFileTool::new(policy.clone())));
-    registry.register(Arc::new(ListFilesTool::new(policy.clone())));
-    registry.register(Arc::new(SearchFilesTool::new(policy.clone())));
+    // Reads (Safe): registered directly (no audit noise). A bare filename
+    // reads back the draft a bare-filename write_file produced.
+    registry.register(Arc::new(
+        ReadFileTool::new(policy.clone()).with_drafts_dir(drafts_dir.clone()),
+    ));
+    registry.register(Arc::new(
+        ListFilesTool::new(policy.clone()).with_drafts_dir(drafts_dir.clone()),
+    ));
+    registry.register(Arc::new(
+        SearchFilesTool::new(policy.clone()).with_drafts_dir(drafts_dir.clone()),
+    ));
 
     // Writes / edits (Dangerous): confirmation + optional audit wrap.
     let wrap = |t: Arc<dyn Tool>| -> Arc<dyn Tool> {
@@ -330,6 +365,8 @@ pub fn register_audited(
             .with_safe_paths(safe_paths.clone()),
     )));
     registry.register(wrap(Arc::new(
-        EditFileTool::new(policy.clone()).with_safe_paths(safe_paths),
+        EditFileTool::new(policy.clone())
+            .with_drafts_dir(drafts_dir)
+            .with_safe_paths(safe_paths),
     )));
 }

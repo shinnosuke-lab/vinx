@@ -10,6 +10,9 @@ import { OpenTerminalTool } from './open-terminal-tool'
 import { StyleTool } from './style-tool'
 import { ListReleasesTool, RunAppTool, StopAppTool, RemoveAppTool } from './app-tools'
 import { TaskTool } from './task-tool'
+import { WebFetchTool } from './web-fetch-tool'
+import { RecallResultTool } from './recall-result-tool'
+import { AskUserTool } from './ask-user-tool'
 import type { ToolRenderer, ToolRenderProps } from '@agentchat/types'
 
 // Internal alias kept so the ported tool components compile unchanged.
@@ -27,6 +30,7 @@ export const defaultToolRenderers: Record<string, ToolRenderer> = {
   edit_file: EditFileTool,
   list_files: DirListTool,
   search_files: SearchResultTool,
+  web_fetch: WebFetchTool,
   publish: PublishTool,
   open_terminal: OpenTerminalTool,
   set_chat_style: StyleTool,
@@ -35,6 +39,8 @@ export const defaultToolRenderers: Record<string, ToolRenderer> = {
   stop_app: StopAppTool,
   remove_app: RemoveAppTool,
   task: TaskTool,
+  recall_result: RecallResultTool,
+  ask_user: AskUserTool,
 }
 
 export const fallbackRenderer: ToolRenderer = GenericTool

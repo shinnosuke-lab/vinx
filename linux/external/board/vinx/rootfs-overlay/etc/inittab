@@ -1,15 +1,16 @@
 # Vinx Linux inittab (busybox init).
 #
-# Two serial lines, two audiences: ttyS0 is the person's console -- no login,
-# straight to a root shell, because the "machine" is a tab they already own.
-# ttyS1 is agentd, the line the page's run_shell tool speaks over; see
-# /usr/sbin/agentd for the protocol.
+# ttyS0 is the person's console -- no login, straight to a root shell,
+# because the "machine" is a tab they already own. ttyS3 is the control
+# plane (rpcd's; see package/vinx-rpc); ttyS1 sits idle, reserved for the
+# Phase 6 stream mux (the agentd that lived there retired in Phase 3, its
+# job long since rund's via proc.run).
 #
 # devtmpfs is mounted first, before anything opens /dev/null or the serial
-# nodes -- getty and agentd need /dev/ttyS0 and /dev/ttyS1 to exist. Guarded
-# because some boot paths (v86's initramfs) mount it before init runs; the
-# `[ -e /dev/null ]` probe keeps this idempotent and quiet instead of printing
-# "mounting devtmpfs on /dev failed: Resource busy".
+# nodes -- getty needs /dev/ttyS0 to exist. Guarded because some boot paths
+# (v86's initramfs) mount it before init runs; the `[ -e /dev/null ]` probe
+# keeps this idempotent and quiet instead of printing "mounting devtmpfs on
+# /dev failed: Resource busy".
 
 ::sysinit:/bin/sh -c '[ -e /dev/null ] || /bin/mount -t devtmpfs devtmpfs /dev'
 ::sysinit:/bin/mount -t proc proc /proc
@@ -24,25 +25,24 @@
 # Guarded: a page that passes no `filesystem` option (or an old cached wasm)
 # simply leaves /data an empty directory.
 ::sysinit:/bin/sh -c 'mkdir -p /data && mount -t 9p -o trans=virtio,version=9p2000.L host9p /data 2>/dev/null || true'
-# The WebRTC bridge and the BLE link live in the page and die with it, but
-# /data persists across reloads: stale status files would make bridge(1)
-# show a room, or ble(1) a device, that no longer exists. This boot starts
-# with neither, so say so. Hostcall overflow files (.hostcall-*) are the
-# same story: normally deleted by the CLI that made them, stranded only by
-# an interrupted call, and meaningless after a reload.
-::sysinit:/bin/rm -f /data/.bridge-status
-::sysinit:/bin/sh -c 'rm -f /data/.ble-* /data/.hostcall-*'
-# ttyS3 is the hostcall line (js(1), fetch(1) -- see /usr/lib/hostcall.sh):
-# raw and silent from the start, so the page's DONE replies are never cooked
-# or echoed back at it. No getty here on purpose; the CLIs own the port.
-::sysinit:/bin/sh -c 'stty -F /dev/ttyS3 raw -echo 2>/dev/null || true'
+# /data/.vinx/tmp is the session-scoped resource namespace (system-v2
+# §6.8): owners delete their own files, this sweep is the boot-time
+# backstop for whatever an interrupted call stranded. (The .ble-*/.bridge-
+# status polling files retired with the OSC protocol in Phase 3; the ble
+# feed ring lives inside the swept namespace now.)
+::sysinit:/bin/sh -c 'rm -rf /data/.vinx/tmp; mkdir -p /data/.vinx/tmp'
 ::sysinit:/bin/hostname -F /etc/hostname
 ::sysinit:/etc/init.d/rcS
 
 # -i: no /etc/issue -- the branding is /etc/profile.d/00-banner.sh, which can
 # do colour and knows the machine's extra commands.
 ttyS0::respawn:/sbin/getty -i -n -l /sbin/console-shell -L ttyS0 115200 vt100
-ttyS1::respawn:/usr/sbin/agentd
+# ttyS3 is the control plane. rpcd opens and configures the port itself
+# (raw termios, TIOCEXCL, /run/vinx/rpcd.pid -- see package/vinx-rpc), so
+# no tty is named here; rund serves proc.run over rpcd's Unix socket.
+# Both exit on trouble and respawn clean (system-v2 §6.6).
+::respawn:/usr/sbin/rpcd
+::respawn:/usr/sbin/rund
 
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/etc/init.d/rcK

@@ -1,0 +1,113 @@
+#!/bin/sh
+# app-run ID -- the one entrance every app start walks through (system-v2
+# §9.5: running an app by hand and rund running it must behave the same).
+#
+# Unpacks /data/apps/ID.vapp into /run/vinx/pkg/ID (a tmpfs, so a boot
+# starts with none), reads the manifest's exec (default ./run), cd's into
+# the tree and execs. rund spawns this for services -- stdout/stderr
+# already point at the app's log by then; `app run NAME` execs it in the
+# foreground. Failures are exit codes and stderr lines, never silence.
+#
+# The tree is a cache of the package, and it is keyed: `.stamp` inside it
+# records which .vapp bytes it came from, and a package that no longer
+# matches is unpacked afresh. Without the key a boot ran whatever it had
+# unpacked first -- and the loop this system exists for (§13: edit, pack,
+# install, run) re-installs many times per boot.
+
+ID=$1
+case "$ID" in
+	'' | -* | *[!a-z0-9-]*)
+		echo "app-run: not an app id: $ID" >&2
+		exit 2
+		;;
+esac
+VAPP="/data/apps/$ID.vapp"
+PKG="/run/vinx/pkg/$ID"
+
+[ -f "$VAPP" ] || {
+	echo "app-run: $VAPP: no such package (app install FILE.vapp first)" >&2
+	exit 66
+}
+
+# The package's identity: its bytes. Packages are small (8 MiB cap) and the
+# hash is one pass; size+mtime would miss a same-size edit landing within
+# the mirror's timestamp granularity.
+STAMP=$(sha256sum "$VAPP" | cut -c1-64)
+if [ -d "$PKG" ] && [ "$(cat "$PKG/.stamp" 2>/dev/null)" != "$STAMP" ]; then
+	# A stale tree: move it aside rather than delete it in place, so the
+	# name is free for the current package and a service still running
+	# from the old one keeps its files (its cwd follows the rename) --
+	# `app stop && app start` then really does pick the new version up.
+	# Nobody in it: gone now. Somebody: it goes with the next unpack that
+	# finds it idle (below), or with the boot -- /run is a tmpfs.
+	OLD="$PKG.stale.$$"
+	mv "$PKG" "$OLD" 2>/dev/null && { fuser -s "$OLD" 2>/dev/null || rm -rf "$OLD"; }
+fi
+for OLD in "$PKG".stale.*; do
+	[ -d "$OLD" ] && ! fuser -s "$OLD" 2>/dev/null && rm -rf "$OLD"
+done
+if [ ! -d "$PKG" ]; then
+	# Unpack beside the target and move whole: a finished tree appears
+	# atomically, a crashed unpack leaves only debris the next attempt
+	# ignores, and two racers resolve by whoever's mv lands first.
+	STAGE="$PKG.unpack.$$"
+	mkdir -p "$STAGE" || exit 1
+	if ! tar xzf "$VAPP" -C "$STAGE"; then
+		rm -rf "$STAGE"
+		echo "app-run: $VAPP does not unpack (re-install it?)" >&2
+		exit 65
+	fi
+	printf '%s\n' "$STAMP" > "$STAGE/.stamp"
+	mv "$STAGE" "$PKG" 2>/dev/null || rm -rf "$STAGE"
+fi
+[ -d "$PKG" ] || {
+	echo "app-run: could not stage $PKG" >&2
+	exit 1
+}
+
+# A web window (§10.3): stage the UI as one structured {html,css,js}
+# bundle under the session tmp namespace and hand it to the desktop as
+# window.create's bundleRef — a request parameter, never a return value
+# (§6.8). The desktop reads it before replying; the file stays for the
+# boot sweep (a caller-owned temp, harmless to keep while the window
+# lives). A pure web app is done once the window is up; a hybrid one
+# carries on into its backend below, same process group either way.
+UI_TYPE=$(jq -r '.ui.type // empty' "$PKG/app.json" 2>/dev/null)
+if [ "$UI_TYPE" = web ]; then
+	grep -q ' /data 9p ' /proc/mounts || {
+		echo 'app-run: no /data mount to stage the UI through' >&2
+		exit 1
+	}
+	mkdir -p /data/.vinx/tmp || exit 1
+	BUNDLE="/data/.vinx/tmp/app-$ID.bundle"
+	h=$(jq -Rs . < "$PKG/index.html") || {
+		echo "app-run: $ID has no readable index.html (app check would have said so)" >&2
+		exit 65
+	}
+	c='""'
+	[ -f "$PKG/style.css" ] && c=$(jq -Rs . < "$PKG/style.css")
+	j='""'
+	[ -f "$PKG/app.js" ] && j=$(jq -Rs . < "$PKG/app.js")
+	printf '{"html":%s,"css":%s,"js":%s}' "$h" "$c" "$j" > "$BUNDLE" || exit 1
+	jq -cn --arg app "$ID" --arg path "$BUNDLE" --argjson size "$(wc -c < "$BUNDLE")" \
+		'{surface: "web", app: $app, title: $app, bundleRef: {path: $path, size: $size}}' |
+		rpc call window.create - -t 30 >/dev/null || exit 1
+	echo "app-run: window $ID is up"
+	EXEC=$(jq -r '.exec // empty' "$PKG/app.json" 2>/dev/null)
+	[ -n "$EXEC" ] && [ "$EXEC" != null ] || exit 0
+else
+	EXEC=$(jq -r '.exec // "./run"' "$PKG/app.json" 2>/dev/null)
+	[ -n "$EXEC" ] && [ "$EXEC" != null ] || EXEC=./run
+fi
+
+cd "$PKG" || exit 1
+# The exec line may carry arguments; split it on purpose (globbing off).
+set -f
+# shellcheck disable=SC2086
+set -- $EXEC
+set +f
+[ -e "$1" ] || {
+	echo "app-run: $ID has no $1 (app check would have said so)" >&2
+	exit 127
+}
+exec "$@"

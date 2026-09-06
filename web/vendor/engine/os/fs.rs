@@ -16,11 +16,23 @@ use crate::types::{RiskLevel, ToolDefinition, ToolParameter, ToolParameters, Too
 
 pub struct ReadFileTool {
     policy: Arc<OsPolicy>,
+    /// Where a bare filename is looked up first — the bucket a bare-filename
+    /// `write_file` lands in (see [`crate::os::resolve_existing_in_drafts`]).
+    drafts_dir: Option<PathBuf>,
 }
 
 impl ReadFileTool {
     pub fn new(policy: Arc<OsPolicy>) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            drafts_dir: None,
+        }
+    }
+
+    /// Make a bare filename mean the draft of that name when one exists.
+    pub fn with_drafts_dir(mut self, drafts_dir: Option<PathBuf>) -> Self {
+        self.drafts_dir = drafts_dir;
+        self
     }
 }
 
@@ -31,7 +43,9 @@ impl Tool for ReadFileTool {
             "read_file",
             "Read text file contents with line numbers. Large files (>500 lines) \
              without a range return metadata + head/tail preview; use \
-             start_line/end_line for a precise range. Line numbers start at 1.",
+             start_line/end_line for a precise range. Line numbers start at 1. \
+             A bare filename (no directory) means the draft of that name, where a \
+             bare-filename write_file put it.",
             ToolParameters::object(
                 HashMap::from([
                     (
@@ -57,6 +71,7 @@ impl Tool for ReadFileTool {
         if path.is_empty() {
             return ToolResult::text("Error: path is required").with_success(false);
         }
+        let path = &super::resolve_existing_in_drafts(self.drafts_dir.as_deref(), path);
         let resolved = match self.policy.check_read(path) {
             Ok(p) => p,
             Err(e) => return ToolResult::text(e).with_success(false),
@@ -335,6 +350,10 @@ pub struct EditFileTool {
     /// Shared directory allow-list: an edit whose target lives inside an
     /// allow-listed folder downgrades to `Safe`. `None` = always confirm.
     safe_paths: Option<Arc<SafePathAllowList>>,
+    /// Where a bare filename is looked up first — the bucket a bare-filename
+    /// `write_file` lands in (see [`crate::os::resolve_existing_in_drafts`]).
+    /// Edits inside it are `Safe`, as the writes that made it were.
+    drafts_dir: Option<PathBuf>,
 }
 
 impl EditFileTool {
@@ -342,6 +361,7 @@ impl EditFileTool {
         Self {
             policy,
             safe_paths: None,
+            drafts_dir: None,
         }
     }
 
@@ -349,6 +369,16 @@ impl EditFileTool {
     pub fn with_safe_paths(mut self, safe_paths: Option<Arc<SafePathAllowList>>) -> Self {
         self.safe_paths = safe_paths;
         self
+    }
+
+    /// Make a bare filename mean the draft of that name when one exists.
+    pub fn with_drafts_dir(mut self, drafts_dir: Option<PathBuf>) -> Self {
+        self.drafts_dir = drafts_dir;
+        self
+    }
+
+    fn resolve_target(&self, path: &str) -> String {
+        super::resolve_existing_in_drafts(self.drafts_dir.as_deref(), path)
     }
 }
 
@@ -360,8 +390,12 @@ impl Tool for EditFileTool {
             "Replace `old_str` with `new_str` in a text file. PRECONDITIONS: \
              (1) read_file FIRST so old_str matches the live bytes; (2) old_str must \
              match EXACTLY ONCE unless replace_all=true; (3) include enough context to \
-             be unique. Whitespace is significant. new_str may be empty (deletion). \
-             Requires confirmation.",
+             be unique; (4) to INSERT, new_str must repeat old_str plus the new text \
+             (new_str equal to old_str is rejected as a no-op). Whitespace is \
+             significant. new_str may be empty (deletion). \
+             A bare filename (no directory) means the draft of that name, where a \
+             bare-filename write_file put it — no confirmation there; other paths \
+             require confirmation.",
             ToolParameters::object(
                 HashMap::from([
                     ("path".into(), ToolParameter::string("File path")),
@@ -385,9 +419,21 @@ impl Tool for EditFileTool {
     }
 
     fn risk(&self, args: &serde_json::Value) -> RiskLevel {
+        // Resolve the redirect (bare filename → existing draft) BEFORE
+        // consulting the allow-list, so matching lines up with the file the
+        // edit actually touches.
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let target = self.resolve_target(path);
+        // Drafts edits are Safe for the same reason drafts writes are: the
+        // bucket is sandboxed and disposable, and handing the result to the
+        // user is a separate step.
+        if let Some(drafts) = &self.drafts_dir {
+            if Path::new(&target).starts_with(drafts) {
+                return RiskLevel::Safe;
+            }
+        }
         match &self.safe_paths {
-            Some(list) if list.is_allowed_for(path) => RiskLevel::Safe,
+            Some(list) if list.is_allowed_for(&target) => RiskLevel::Safe,
             _ => RiskLevel::Dangerous,
         }
     }
@@ -410,6 +456,7 @@ impl Tool for EditFileTool {
             )
             .with_success(false);
         }
+        let path = &self.resolve_target(path);
         let resolved = match self.policy.check_write(path) {
             Ok(p) => p,
             Err(e) => return ToolResult::text(e).with_success(false),
@@ -465,11 +512,6 @@ async fn execute_edit_file(
         }
     };
 
-    if old_str == new_str {
-        return ToolResult::text("Error: old_str and new_str are identical; nothing to do.")
-            .with_success(false);
-    }
-
     let matches = locate_all(&body, old_str);
     if matches.is_empty() {
         return ToolResult::text(format!(
@@ -490,6 +532,27 @@ async fn execute_edit_file(
              unique, or pass replace_all=true.",
             matches.len(),
             display,
+            lines
+        ))
+        .with_success(false);
+    }
+
+    // Identical strings are a no-op — almost always an INSERT whose new_str
+    // was cut short after copying the anchor. Checked after locating, so the
+    // reply still tells the model where its anchor sits and how to fix the
+    // call, instead of costing a round-trip that teaches it nothing.
+    if old_str == new_str {
+        let lines = matches
+            .iter()
+            .map(|&pos| line_of(&body, pos).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return ToolResult::text(format!(
+            "Error: new_str is identical to old_str — a no-op, nothing was changed. \
+             old_str does match in {} (line{} {}). To INSERT text, new_str must be \
+             old_str plus the new text; to DELETE, pass an empty new_str.",
+            display,
+            if matches.len() == 1 { "" } else { "s" },
             lines
         ))
         .with_success(false);
@@ -517,11 +580,24 @@ async fn execute_edit_file(
 
 pub struct ListFilesTool {
     policy: Arc<OsPolicy>,
+    /// A bare name that names an existing draft lists that draft — the one
+    /// rule every file tool follows for bare names (see
+    /// [`crate::os::resolve_existing_in_drafts`]).
+    drafts_dir: Option<PathBuf>,
 }
 
 impl ListFilesTool {
     pub fn new(policy: Arc<OsPolicy>) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            drafts_dir: None,
+        }
+    }
+
+    /// Resolve a bare filename against this drafts dir when the draft exists.
+    pub fn with_drafts_dir(mut self, drafts_dir: Option<PathBuf>) -> Self {
+        self.drafts_dir = drafts_dir;
+        self
     }
 }
 
@@ -557,6 +633,7 @@ impl Tool for ListFilesTool {
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path = &super::resolve_existing_in_drafts(self.drafts_dir.as_deref(), path);
         let recursive = args
             .get("recursive")
             .and_then(|v| v.as_bool())

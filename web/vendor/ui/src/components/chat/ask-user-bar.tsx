@@ -188,7 +188,7 @@ export function AskUserBar({ questions, timeoutSecs, onActivity, onSubmit, onCan
   )
 
   return (
-    <div className="bg-background px-4 pb-2 pt-1">
+    <div className="animate-rise-in bg-background px-4 pb-2 pt-1">
       <div className="mx-auto max-w-3xl">
         {/* Wrap the card in a flex column with a viewport-relative max height
          * so a long list of questions/options scrolls inside the card instead

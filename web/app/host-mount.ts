@@ -9,9 +9,10 @@
  *     size+mtime fingerprint moved is read, hashed and — unless the guest
  *     already has those exact bytes — pushed with putFile. Files that left
  *     the disk are rm'd from the guest.
- *   - guest→host, every third round (~15 s): the guest lists /data/host with
- *     the same fingerprint trick share-store uses, and changed files are read
- *     back and written to the real disk through createWritable.
+ *   - guest→host, every third round (~15 s): the page walks its own 9p
+ *     inodes under host/ with the same fingerprint trick share-store uses,
+ *     and changed files are read back and written to the real disk through
+ *     createWritable.
  *
  * The content hash is what stops the ring: a push flips the receiving side's
  * fingerprint, but the re-read bytes hash to what was just synced, so the
@@ -33,9 +34,9 @@
 
 import { sha256 as sha256Bytes } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { shq } from '../runtime/src/device-vm';
 import type { VinxVm } from './vm';
 import { machineId } from './pane-id';
+import { isRegularMode } from './share-diff';
 
 export const MAX_MOUNT_FILE_BYTES = 8 * 1024 * 1024;
 export const MAX_MOUNT_TOTAL_BYTES = 64 * 1024 * 1024;
@@ -197,53 +198,66 @@ export function startMount(
 		}
 
 		if (push.length) {
-			const dirs = new Set<string>(['/data/host']);
+			// Parents made on the page's own 9p tree (§8.2) — putFile walks
+			// but never mkdirs, and no guest round trip is owed for it.
+			const dirs = new Set<string>(['host']);
 			for (const { path } of push) {
 				const i = path.lastIndexOf('/');
-				if (i > 0) dirs.add(`/data/host/${path.slice(0, i)}`);
+				if (i > 0) dirs.add(`host/${path.slice(0, i)}`);
 			}
-			await vm.runShell(`mkdir -p ${[...dirs].map(shq).join(' ')}`, 15);
+			for (const dir of dirs) await vm.ensureDir(dir);
 			for (const { path, bytes } of push) {
 				await vm.putFile(`host/${path}`, bytes);
 			}
 		}
 
-		// Gone from the disk: gone from the guest (RAM, so this is safe).
-		const rm: string[] = [];
-		for (const path of hostFp.keys()) {
+		// Gone from the disk: gone from the guest (RAM, so this is safe) —
+		// unlinked page-side, same tree the push wrote into.
+		for (const path of [...hostFp.keys()]) {
 			if (files.has(path)) continue;
 			hostFp.delete(path);
 			synced.delete(path);
 			guestFp.delete(path);
-			rm.push(`/data/host/${shq(path)}`);
+			vm.deleteData(`host/${path}`);
 		}
-		if (rm.length) await vm.runShell(`rm -f ${rm.join(' ')}`, 15);
+	}
+
+	/** The guest side of /data/host, walked on the page's own 9p inodes
+	 * (share-store's listing moved the same way — §15 Phase 2): regular
+	 * files only, dot-names skipped whole, depth capped like scanHost. */
+	async function scanGuest(
+		rel: string,
+		prefix: string,
+		depth: number,
+		out: Map<string, { size: number; mtime: number }>,
+	): Promise<void> {
+		if (depth > MAX_MOUNT_DEPTH) return;
+		for (const e of await vm.listData(rel)) {
+			if (e.name.startsWith('.')) continue;
+			if (e.dir) {
+				await scanGuest(`${rel}/${e.name}`, `${prefix}${e.name}/`, depth + 1, out);
+			} else if (isRegularMode(e.mode)) {
+				out.set(prefix + e.name, { size: e.size, mtime: e.mtime });
+			}
+		}
 	}
 
 	async function guestSweep(): Promise<void> {
-		// Same listing protocol as share-store: size|mtime|name, name last.
-		const ls = await vm.runShell(
-			'[ -d /data/host ] || exit 9; cd /data/host && ' +
-				`find . -maxdepth ${MAX_MOUNT_DEPTH} -type f | while IFS= read -r f; do ` +
-				`printf '%s|%s|%s\\n' "$(wc -c < "$f")" "$(date -r "$f" +%s)" "\${f#./}"; done; true`,
-			20,
-		);
-		if (ls.exit_code !== 0) return;
+		const files = new Map<string, { size: number; mtime: number }>();
+		try {
+			await scanGuest('host', '', 1, files);
+		} catch {
+			return; // no /data/host yet: nothing has been pushed or made
+		}
 
 		const seen = new Set<string>();
-		for (const line of ls.output.split('\n')) {
-			const first = line.indexOf('|');
-			const second = first === -1 ? -1 : line.indexOf('|', first + 1);
-			if (second === -1) continue;
-			const size = Number(line.slice(0, first));
-			const mtime = Number(line.slice(first + 1, second));
-			const path = line.slice(second + 1).trim();
-			if (!Number.isFinite(size) || !Number.isFinite(mtime) || !mountablePath(path)) continue;
+		for (const [path, stat] of files) {
+			if (!mountablePath(path)) continue;
 			seen.add(path);
-			const fp = `${size}|${mtime}`;
+			const fp = `${stat.size}|${stat.mtime}`;
 			if (guestFp.get(path) === fp) continue;
 			guestFp.set(path, fp);
-			if (size > MAX_MOUNT_FILE_BYTES) {
+			if (stat.size > MAX_MOUNT_FILE_BYTES) {
 				noteOnce(`big:${path}`, `mount: ${path} is over 8 MB, not written back`);
 				continue;
 			}
@@ -260,7 +274,7 @@ export function startMount(
 				console.warn(`[mount] could not write ${path} back:`, e);
 			}
 		}
-		for (const path of guestFp.keys()) {
+		for (const path of [...guestFp.keys()]) {
 			if (!seen.has(path)) guestFp.delete(path); // deleted in the guest; the disk keeps its copy
 		}
 	}

@@ -244,6 +244,19 @@ describe('calls', () => {
 			params: { session: 's', approved: true, approveAll: true },
 		});
 	});
+
+	it('reads a workspace file back for the open_file card, bytes or null', async () => {
+		const { client, worker } = await connected();
+		const hit = client.readWorkspaceFile('hello.html');
+		const miss = client.readWorkspaceFile('gone.html');
+		await vi.waitFor(() => expect(worker.sent).toHaveLength(2));
+		expect(worker.sent[0]).toMatchObject({ method: 'readWorkspaceFile', params: { path: 'hello.html' } });
+		const bytes = new TextEncoder().encode('<h1>hi</h1>');
+		worker.reply(0, bytes);
+		worker.reply(1, null);
+		await expect(hit).resolves.toEqual(bytes);
+		await expect(miss).resolves.toBeNull();
+	});
 });
 
 describe('streams', () => {
@@ -292,5 +305,115 @@ describe('streams', () => {
 		const { worker } = await connected();
 		// A turn can be mid-publish when a view unmounts; that must not throw.
 		expect(() => worker.emit({ stream: 'ghost', frame: 'event: content\ndata: {}\n\n' })).not.toThrow();
+	});
+});
+
+describe('downloads', () => {
+	it('hands a download from the engine to the page', async () => {
+		const seen: [string, Uint8Array][] = [];
+		const client = new AgentClient({
+			workerUrl: 'worker.js',
+			onDownload: (filename, bytes) => seen.push([filename, bytes]),
+		});
+		const worker = FakeWorker.last;
+		worker.ready();
+		await client.whenReady();
+
+		const bytes = new TextEncoder().encode('<h1>hi</h1>');
+		worker.emit({ download: true, filename: 'hi.html', bytes });
+
+		expect(seen).toEqual([['hi.html', bytes]]);
+		// One way: nothing goes back to the worker for it.
+		expect(worker.sent).toEqual([]);
+	});
+
+	it('drops a download nobody handles instead of throwing', async () => {
+		const { client, worker } = connect();
+		worker.ready();
+		await client.whenReady();
+		expect(() =>
+			worker.emit({ download: true, filename: 'x.bin', bytes: new Uint8Array([1, 2, 3]) }),
+		).not.toThrow();
+	});
+});
+
+describe('install_app', () => {
+	const app = {
+		id: 'focus',
+		title: 'Focus',
+		html: new TextEncoder().encode('<h1>hi</h1>'),
+		js: new TextEncoder().encode('vinx.notify("x")'),
+	};
+
+	/** Wait for the reply the client posts after the handler settles. */
+	const flush = () => new Promise((r) => setTimeout(r, 0));
+
+	it('hands the parts to the page and posts the line back under the same id', async () => {
+		const seen: unknown[] = [];
+		const client = new AgentClient({
+			workerUrl: 'worker.js',
+			onInstallApp: async (a) => {
+				seen.push(a);
+				return `Installed "${a.title}" (${a.id}) on the Apps page`;
+			},
+		});
+		const worker = FakeWorker.last;
+		worker.ready();
+		await client.whenReady();
+
+		worker.emit({ installApp: true, installId: 7, app });
+		await flush();
+
+		expect(seen).toEqual([app]);
+		expect(worker.sent).toEqual([
+			{
+				installAppResult: true,
+				installId: 7,
+				ok: true,
+				text: 'Installed "Focus" (focus) on the Apps page',
+			},
+		]);
+	});
+
+	it('turns a refusal into ok:false with the message verbatim', async () => {
+		const client = new AgentClient({
+			workerUrl: 'worker.js',
+			onInstallApp: async () => {
+				throw new Error('E ID_INVALID id: "Focus" is not a valid id');
+			},
+		});
+		const worker = FakeWorker.last;
+		worker.ready();
+		await client.whenReady();
+
+		worker.emit({ installApp: true, installId: 8, app });
+		await flush();
+
+		expect(worker.sent).toEqual([
+			{
+				installAppResult: true,
+				installId: 8,
+				ok: false,
+				text: 'E ID_INVALID id: "Focus" is not a valid id',
+			},
+		]);
+	});
+
+	it('answers, not hangs, when the page has no installer', async () => {
+		const { client, worker } = connect();
+		worker.ready();
+		await client.whenReady();
+
+		worker.emit({ installApp: true, installId: 9, app });
+		await flush();
+
+		expect(worker.sent).toEqual([
+			{
+				installAppResult: true,
+				installId: 9,
+				ok: false,
+				text: 'this page cannot install apps',
+			},
+		]);
 	});
 });

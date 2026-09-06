@@ -8,13 +8,11 @@
 # whose words float across every bridged screen as an overlay: nothing
 # needs to be running on the receiving machines.
 #
-# The request rides the private OSC; the page answers through
-# /data/.bridge-status, a key=value file this script polls and `show`
-# pretty-prints. Console-only, like open(1) and camera(1): run_shell
-# output is not OSC-parsed.
-. /usr/lib/vinx.sh
-
-STATUS=/data/.bridge-status
+# Commands are network.bridge.* control-plane calls (rpc(1) on ttyS3):
+# start/join block until the room is on, show reads the live roster -- a
+# room the person opened with panel clicks answers here too. They work
+# from the console and from run_shell alike, and a failure is an error
+# you hear, not a poll that times out.
 
 usage() {
 	cat >&2 <<'EOF'
@@ -30,7 +28,7 @@ EOF
 self_host() { cat /run/inbrowser-host 2>/dev/null; }
 self_ip() { echo "10.0.2.$(self_host)"; }
 
-# NAME goes into JSON and the roster everyone sees: one word, safe charset.
+# NAME goes into the roster everyone sees: one word, safe charset.
 check_name() {
 	case "$1" in
 	'' | *[!a-zA-Z0-9._-]* )
@@ -40,37 +38,17 @@ check_name() {
 	esac
 }
 
-req() { printf '\033]7770;bridge;%s\a\n' "$(vm_b64s "$1")"; }
-
-field() { sed -n "s/^$1=//p" "$STATUS" 2>/dev/null; }
-
-# Wait for state=on (or failed, or silence) for $1 seconds.
-wait_on() {
-	i=0
-	while [ "$i" -lt "$1" ]; do
-		case "$(field state)" in
-		on) return 0 ;;
-		failed)
-			echo "bridge: $(field error)" >&2
-			return 1
-			;;
-		esac
-		sleep 1
-		i=$((i + 1))
-	done
-	echo 'bridge: no reply from the page (is this the console? still connecting?)' >&2
-	return 1
-}
-
+# The live room, as the page answers it; show() renders one snapshot.
 show() {
-	case "$(field state)" in
+	res=$(rpc call network.bridge.status '{}') || return 1
+	case "$(printf '%s' "$res" | jq -r '.state')" in
 	on) ;;
-	starting | joining)
+	joining)
 		echo 'bridge: still connecting...'
 		return 0
 		;;
 	failed)
-		echo "bridge: failed -- $(field error)" >&2
+		echo "bridge: failed -- $(printf '%s' "$res" | jq -r '.error')" >&2
 		return 1
 		;;
 	*)
@@ -78,13 +56,15 @@ show() {
 		return 1
 		;;
 	esac
-	echo "bridge: room $(field room) ($(field role)) -- $(field members) machine(s)"
+	echo "bridge: room $(printf '%s' "$res" | jq -r '.room') ($(printf '%s' "$res" | jq -r '.role')) -- $(printf '%s' "$res" | jq -r '.members | length') machine(s)"
 	me=$(self_ip)
-	sed -n 's/^member=//p' "$STATUS" | while read -r name ip tag; do
-		mark=' '
-		[ "$ip" = "$me" ] && mark='*'
-		printf '  %s %-16s %-15s %s\n' "$mark" "$name" "$ip" "$tag"
-	done
+	printf '%s' "$res" |
+		jq -r '.members[] | "\(.name) \(.ip)\(if .host then " host" else "" end)"' |
+		while read -r name ip tag; do
+			mark=' '
+			[ "$ip" = "$me" ] && mark='*'
+			printf '  %s %-16s %-15s %s\n' "$mark" "$name" "$ip" "$tag"
+		done
 	echo "  (* this machine -- bridge say HELLO floats on every screen)"
 }
 
@@ -97,14 +77,14 @@ start)
 	[ "${1:-}" = -n ] && { name=${2:?bridge: -n needs a NAME}; shift 2; }
 	[ $# -eq 0 ] || usage
 	check_name "$name"
-	rm -f "$STATUS"
-	req "{\"op\":\"start\",\"name\":\"$name\",\"ip\":\"$(self_ip)\"}"
 	echo 'bridge: opening a room...'
-	wait_on 25 || exit 1
+	res=$(jq -cn --arg name "$name" --arg ip "$(self_ip)" '{name: $name, ip: $ip}' |
+		rpc call network.bridge.start - -t 30) || exit 1
+	room=$(printf '%s' "$res" | jq -r '.room')
 	echo ''
 	echo "bridge: the room is open. friends join it with:"
 	echo ''
-	echo "    bridge join $(field room)"
+	echo "    bridge join $room"
 	echo ''
 	echo 'bridge: chat with `bridge say HELLO` -- it floats on every screen'
 	;;
@@ -122,15 +102,15 @@ join)
 		exit 2
 		;;
 	esac
-	rm -f "$STATUS"
-	req "{\"op\":\"join\",\"code\":\"$code\",\"name\":\"$name\",\"ip\":\"$(self_ip)\"}"
 	echo "bridge: joining room $code (this can take a few seconds)..."
-	wait_on 45 || exit 1
+	jq -cn --arg code "$code" --arg name "$name" --arg ip "$(self_ip)" \
+		'{code: $code, name: $name, ip: $ip}' |
+		rpc call network.bridge.join - -t 50 >/dev/null || exit 1
 	# The frame channel can open a beat before the roster arrives; give the
 	# member list a moment to fill in so the first show is not just us.
 	i=0
 	while [ "$i" -lt 5 ]; do
-		m=$(field members)
+		m=$(rpc call network.bridge.status '{}' 2>/dev/null | jq -r '.members | length')
 		[ "${m:-1}" -ge 2 ] 2>/dev/null && break
 		sleep 1
 		i=$((i + 1))
@@ -151,28 +131,21 @@ say)
 		[ $# -ge 1 ] || usage
 		;;
 	esac
-	case "$(field state)" in
-	on) ;;
-	*)
-		echo 'bridge: not connected (bridge start, or bridge join CODE)' >&2
-		exit 1
-		;;
-	esac
-	# One clean line into hand-built JSON: control characters out, the two
-	# JSON specials escaped, length capped so a paste cannot flood the room.
-	text=$(printf '%s' "$*" | tr -d '\000-\037' | cut -c1-256 |
-		sed 's/\\/\\\\/g; s/"/\\"/g')
+	# One clean line: control characters out, length capped so a paste
+	# cannot flood the room (jq handles the JSON escaping).
+	text=$(printf '%s' "$*" | tr -d '\000-\037' | cut -c1-256)
 	[ -n "$text" ] || usage
 	if [ -n "$to" ]; then
-		req "{\"op\":\"say\",\"to\":\"$to\",\"text\":\"$text\"}"
+		jq -cn --arg text "$text" --arg to "$to" '{text: $text, to: $to}' |
+			rpc call network.bridge.say - >/dev/null || exit 1
 	else
-		req "{\"op\":\"say\",\"text\":\"$text\"}"
+		jq -cn --arg text "$text" '{text: $text}' |
+			rpc call network.bridge.say - >/dev/null || exit 1
 	fi
 	echo 'bridge: sent'
 	;;
 stop)
-	req '{"op":"stop"}'
-	echo 'bridge: disconnected'
+	rpc call network.bridge.stop '{}' >/dev/null && echo 'bridge: disconnected'
 	;;
 *)
 	usage

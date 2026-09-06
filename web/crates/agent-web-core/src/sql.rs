@@ -129,7 +129,8 @@ impl Connection {
     /// The caller installs the VFS first; this stays agnostic so the same code
     /// runs against the in-memory VFS in tests and IndexedDB in the browser.
     pub fn open(path: &str) -> Result<Self> {
-        let cpath = CString::new(path).map_err(|e| Error::new(ffi::SQLITE_MISUSE, e.to_string()))?;
+        let cpath =
+            CString::new(path).map_err(|e| Error::new(ffi::SQLITE_MISUSE, e.to_string()))?;
         let mut handle = ptr::null_mut();
         let rc = unsafe {
             ffi::sqlite3_open_v2(
@@ -173,13 +174,7 @@ impl Connection {
         let csql = CString::new(sql).map_err(|e| Error::new(ffi::SQLITE_MISUSE, e.to_string()))?;
         let mut stmt = ptr::null_mut();
         let rc = unsafe {
-            ffi::sqlite3_prepare_v2(
-                self.handle,
-                csql.as_ptr(),
-                -1,
-                &mut stmt,
-                ptr::null_mut(),
-            )
+            ffi::sqlite3_prepare_v2(self.handle, csql.as_ptr(), -1, &mut stmt, ptr::null_mut())
         };
         if rc != ffi::SQLITE_OK {
             return Err(Error::new(rc, unsafe { errmsg(self.handle) }));
@@ -314,9 +309,11 @@ impl Statement<'_> {
         if p.is_null() {
             return None;
         }
-        Some(unsafe { CStr::from_ptr(p as *const _) }
-            .to_string_lossy()
-            .into_owned())
+        Some(
+            unsafe { CStr::from_ptr(p as *const _) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     /// Text of column `i`, empty string for NULL.

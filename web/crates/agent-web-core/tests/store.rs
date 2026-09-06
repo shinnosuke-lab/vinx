@@ -117,7 +117,10 @@ fn archived_tool_results_are_recallable_by_id() {
         .lookup_archived_tool_result("s1", "call_7")
         .unwrap()
         .expect("an archived result is found by its call_id");
-    assert_eq!(tool, "read_file", "the issuing assistant row names the tool");
+    assert_eq!(
+        tool, "read_file",
+        "the issuing assistant row names the tool"
+    );
     assert_eq!(content, "the original bytes");
 
     assert!(
@@ -162,8 +165,14 @@ fn recall_falls_through_to_the_archive_after_compaction() {
     let args = serde_json::json!({ "call_id": "call_9" });
     let (result, success) = resolve_recall(&args, &compacted, None, Some(&s), Some("s1"));
     assert!(success, "archive fall-through failed: {result}");
-    assert!(result.contains("42 devices found"), "the original bytes: {result}");
-    assert!(result.contains("run_shell"), "the tool name orients the model: {result}");
+    assert!(
+        result.contains("42 devices found"),
+        "the original bytes: {result}"
+    );
+    assert!(
+        result.contains("run_shell"),
+        "the tool name orients the model: {result}"
+    );
 
     let (result, success) = resolve_recall(&args, &compacted, None, None, Some("s1"));
     assert!(!success, "no store means an honest miss, not silence");
@@ -173,7 +182,8 @@ fn recall_falls_through_to_the_archive_after_compaction() {
 #[wasm_bindgen_test]
 fn origin_is_written_once_and_updated_at_moves() {
     let s = store();
-    s.save("s1", &[ChatMessage::user("hi")], "tui", None).unwrap();
+    s.save("s1", &[ChatMessage::user("hi")], "tui", None)
+        .unwrap();
     let first = s.list().unwrap().into_iter().next().unwrap();
     assert_eq!(first.origin, "tui");
 
@@ -299,8 +309,10 @@ fn search_ignores_system_skill_and_tool_messages() {
 #[wasm_bindgen_test]
 fn blank_query_lists_recent_sessions_without_snippets() {
     let s = store();
-    s.save("a", &[ChatMessage::user("one")], "web", None).unwrap();
-    s.save("b", &[ChatMessage::user("two")], "web", None).unwrap();
+    s.save("a", &[ChatMessage::user("one")], "web", None)
+        .unwrap();
+    s.save("b", &[ChatMessage::user("two")], "web", None)
+        .unwrap();
 
     let hits = s.search("   ", 10, None).unwrap();
     assert_eq!(hits.len(), 2);
@@ -354,7 +366,11 @@ fn like_metacharacters_are_matched_literally() {
     s.save("dash", &[ChatMessage::user("axb")], "web", None)
         .unwrap();
     let hits = s.search("a_b", 10, None).unwrap();
-    assert_eq!(hits.len(), 1, "`_` is a literal, not a single-char wildcard");
+    assert_eq!(
+        hits.len(),
+        1,
+        "`_` is a literal, not a single-char wildcard"
+    );
     assert_eq!(hits[0].id, "under");
 }
 
@@ -391,9 +407,15 @@ fn snippets_are_char_indexed_and_capped() {
     assert_eq!(hits[0].snippets.len(), 2, "but only two are excerpted");
 
     for snip in &hits[0].snippets {
-        assert!(snip.contains("网关重启了"), "excerpt covers the match: {snip}");
+        assert!(
+            snip.contains("网关重启了"),
+            "excerpt covers the match: {snip}"
+        );
         // Radius is 60 chars each side, plus the term and two ellipses.
-        assert!(snip.chars().count() <= 60 + 5 + 60 + 2, "excerpt stays short");
+        assert!(
+            snip.chars().count() <= 60 + 5 + 60 + 2,
+            "excerpt stays short"
+        );
     }
     assert!(
         hits[0].snippets[1].contains("again"),
@@ -404,14 +426,19 @@ fn snippets_are_char_indexed_and_capped() {
 #[wasm_bindgen_test]
 fn title_of_distinguishes_unnamed_from_missing() {
     let s = store();
-    s.save("s1", &[ChatMessage::user("hi")], "web", None).unwrap();
+    s.save("s1", &[ChatMessage::user("hi")], "web", None)
+        .unwrap();
 
     assert_eq!(
         s.title_of("s1").unwrap().as_deref(),
         Some(""),
         "an existing but unnamed session reports an empty title"
     );
-    assert_eq!(s.title_of("nope").unwrap(), None, "a missing session is None");
+    assert_eq!(
+        s.title_of("nope").unwrap(),
+        None,
+        "a missing session is None"
+    );
 
     s.set_title("s1", "named").unwrap();
     assert_eq!(s.title_of("s1").unwrap().as_deref(), Some("named"));
@@ -448,7 +475,10 @@ fn a_namespace_gives_each_gateway_its_own_database() {
     );
     assert_eq!(db_name(Some("  ")), "sessions.db", "blank is no namespace");
 
-    assert_eq!(db_name(Some("192.168.1.104:60000")), "sessions-192-168-1-104-60000.db");
+    assert_eq!(
+        db_name(Some("192.168.1.104:60000")),
+        "sessions-192-168-1-104-60000.db"
+    );
     assert_ne!(
         db_name(Some("192.168.1.104:60000")),
         db_name(Some("192.168.1.105:60000")),
@@ -481,8 +511,13 @@ fn resolve_id_prefix_sees_hidden_task_sessions() {
     assert_eq!(s.resolve_id_prefix("task-cccc3333").unwrap(), vec![task_id]);
 
     // A shared prefix reports every candidate (the tool renders "ambiguous").
-    s.save("task-cccc3333-fork", &[ChatMessage::user("x")], "task", None)
-        .unwrap();
+    s.save(
+        "task-cccc3333-fork",
+        &[ChatMessage::user("x")],
+        "task",
+        None,
+    )
+    .unwrap();
     assert_eq!(s.resolve_id_prefix("task-cccc3333").unwrap().len(), 2);
 
     // No match is a clean empty, not an error.
@@ -545,7 +580,8 @@ async fn read_session_reads_hidden_task_transcripts() {
 #[wasm_bindgen_test]
 fn update_changes_only_what_is_given() {
     let s = store();
-    s.save("s1", &[ChatMessage::user("hi")], "web", None).unwrap();
+    s.save("s1", &[ChatMessage::user("hi")], "web", None)
+        .unwrap();
     s.update("s1", Some("first"), Some(true)).unwrap();
 
     s.update("s1", None, Some(false)).unwrap();
@@ -557,4 +593,94 @@ fn update_changes_only_what_is_given() {
     let row = s.list().unwrap().into_iter().next().unwrap();
     assert_eq!(row.title, "second");
     assert!(!row.pinned, "pinned survives a title-only update");
+}
+
+#[wasm_bindgen_test]
+fn archive_scopes_the_list_and_a_new_turn_unarchives() {
+    use agent_web_core::store::SessionScope;
+    let s = store();
+    s.save("a", &[ChatMessage::user("a")], "web", None).unwrap();
+    s.save("b", &[ChatMessage::user("b")], "web", None).unwrap();
+
+    s.set_archived("a", true).unwrap();
+    s.set_archived("missing", true).unwrap(); // unknown ids are a harmless no-op
+
+    let active: Vec<_> = s.list().unwrap().into_iter().map(|r| r.id).collect();
+    assert_eq!(active, vec!["b"], "the default list hides archived sessions");
+    let archived = s.list_scoped(SessionScope::Archived).unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].id, "a");
+    assert!(archived[0].archived_at.is_some(), "the summary carries the archive stamp");
+    assert_eq!(s.list_scoped(SessionScope::All).unwrap().len(), 2);
+
+    // Writing to an archived session brings it back: the user is clearly
+    // using it again.
+    s.save("a", &[ChatMessage::user("a"), ChatMessage::user("again")], "web", None)
+        .unwrap();
+    assert_eq!(s.list().unwrap().len(), 2);
+    assert!(s.list_scoped(SessionScope::Archived).unwrap().is_empty());
+
+    // Explicit un-archive works too.
+    s.set_archived("b", true).unwrap();
+    s.set_archived("b", false).unwrap();
+    assert_eq!(s.list().unwrap().len(), 2);
+
+    // The turn's opening `touch` revives as well, so the session is back in
+    // the live list when the turn starts, not when it ends.
+    s.set_archived("b", true).unwrap();
+    s.touch("b", "web", false).unwrap();
+    assert!(s.list_scoped(SessionScope::Archived).unwrap().is_empty());
+}
+
+#[wasm_bindgen_test]
+fn full_auto_is_remembered_per_session() {
+    let s = store();
+    assert!(!s.full_auto("nobody").unwrap(), "an unknown session is not in full-auto");
+
+    // Flipped before the first turn: no row to update yet, so the flag rides
+    // in on the touch that creates the row.
+    s.set_full_auto("fresh", true).unwrap(); // harmless no-op
+    assert!(!s.full_auto("fresh").unwrap());
+    s.touch("fresh", "web", true).unwrap();
+    assert!(s.full_auto("fresh").unwrap());
+
+    // Flipped mid-session: written straight to the row, and neither saving
+    // the transcript nor the next turn's touch (which carries the live value)
+    // loses it.
+    s.save("s1", &[ChatMessage::user("hi")], "web", None).unwrap();
+    assert!(!s.full_auto("s1").unwrap(), "off by default");
+    s.set_full_auto("s1", true).unwrap();
+    assert!(s.full_auto("s1").unwrap());
+    s.save("s1", &[ChatMessage::user("hi"), ChatMessage::user("more")], "web", None)
+        .unwrap();
+    assert!(s.full_auto("s1").unwrap(), "save leaves the flag alone");
+    s.touch("s1", "web", true).unwrap();
+    assert!(s.full_auto("s1").unwrap());
+    s.set_full_auto("s1", false).unwrap();
+    assert!(!s.full_auto("s1").unwrap());
+}
+
+#[wasm_bindgen_test]
+fn category_is_a_trimmed_optional_label() {
+    let s = store();
+    s.save("s1", &[ChatMessage::user("hi")], "web", None).unwrap();
+    s.set_category("s1", Some("  work ")).unwrap();
+    let row = s.list().unwrap().into_iter().next().unwrap();
+    assert_eq!(row.category.as_deref(), Some("work"), "labels are trimmed");
+
+    // Blank clears, like an explicit None.
+    s.set_category("s1", Some("   ")).unwrap();
+    assert_eq!(s.list().unwrap()[0].category, None);
+    s.set_category("s1", Some("home")).unwrap();
+    s.set_category("s1", None).unwrap();
+    assert_eq!(s.list().unwrap()[0].category, None);
+
+    s.set_category("missing", Some("x")).unwrap(); // harmless no-op
+
+    // Title/pin updates leave the category alone.
+    s.set_category("s1", Some("keep")).unwrap();
+    s.update("s1", Some("renamed"), Some(true)).unwrap();
+    let row = s.list().unwrap().into_iter().next().unwrap();
+    assert_eq!(row.category.as_deref(), Some("keep"));
+    assert!(row.archived_at.is_none());
 }

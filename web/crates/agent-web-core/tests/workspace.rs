@@ -22,7 +22,9 @@ use wasm_bindgen_test::*;
 /// left behind.
 fn open(name: &str) {
     vfs::detach();
-    vfs::attach(Box::new(Workspace::open(name).expect("a workspace database")));
+    vfs::attach(Box::new(
+        Workspace::open(name).expect("a workspace database"),
+    ));
 }
 
 #[wasm_bindgen_test]
@@ -34,7 +36,10 @@ fn files_survive_being_reopened() {
 
     open("reopen.db");
 
-    assert_eq!(vfs::read_to_string("/skills/demo/SKILL.md").unwrap(), "# demo");
+    assert_eq!(
+        vfs::read_to_string("/skills/demo/SKILL.md").unwrap(),
+        "# demo"
+    );
     assert_eq!(
         vfs::read("/runtime/uploads/logo.png").unwrap(),
         vec![0x89, b'P', b'N', b'G', 0x0d]
@@ -89,7 +94,10 @@ fn deleting_a_skill_deletes_it_from_storage_too() {
         !vfs::exists("/skills/gone"),
         "an uninstalled skill came back after a reload"
     );
-    assert!(vfs::exists("/skills/kept/SKILL.md"), "the wrong subtree went");
+    assert!(
+        vfs::exists("/skills/kept/SKILL.md"),
+        "the wrong subtree went"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -99,8 +107,14 @@ fn one_file_removed_leaves_its_neighbours() {
     vfs::write("/notes/b.md", "b").unwrap();
 
     vfs::remove_file("/notes/a.md").unwrap();
-    assert!(vfs::remove_file("/notes").is_err(), "a directory is not a file");
-    assert!(vfs::remove_file("/notes/a.md").is_err(), "and it is already gone");
+    assert!(
+        vfs::remove_file("/notes").is_err(),
+        "a directory is not a file"
+    );
+    assert!(
+        vfs::remove_file("/notes/a.md").is_err(),
+        "and it is already gone"
+    );
 
     open("one-file.db");
     assert!(!vfs::exists("/notes/a.md"));

@@ -92,9 +92,16 @@ async fn a_package_cannot_write_outside_where_it_is_staged() {
     .unwrap_err();
 
     assert_eq!(refused.status, 400);
-    assert!(refused.message.contains("unsafe path"), "{}", refused.message);
+    assert!(
+        refused.message.contains("unsafe path"),
+        "{}",
+        refused.message
+    );
     assert_eq!(vfs::read_to_string("/notes.md").unwrap(), "mine");
-    assert!(registry.get("demo").is_none(), "a refused package installs nothing");
+    assert!(
+        registry.get("demo").is_none(),
+        "a refused package installs nothing"
+    );
 }
 
 /// A zip declares how big each entry becomes, so a small download can ask for
@@ -126,16 +133,27 @@ async fn what_is_not_a_skill_says_so_rather_than_installing_half_of_itself() {
     let garbage = skills::import(&registry, b"this is not a zip").unwrap_err();
     assert_eq!(garbage.status, 400);
 
-    let no_manifest = skills::import(&registry, &package(&[("demo/README.md", b"hi")])).unwrap_err();
-    assert!(no_manifest.message.contains("SKILL.md"), "{}", no_manifest.message);
+    let no_manifest =
+        skills::import(&registry, &package(&[("demo/README.md", b"hi")])).unwrap_err();
+    assert!(
+        no_manifest.message.contains("SKILL.md"),
+        "{}",
+        no_manifest.message
+    );
 
     // `reset` and `none` turn a skill off in the palette, so a skill by that
     // name could never be selected.
-    let reserved = skills::import(&registry, &package(&[("s/SKILL.md", &skill_md("reset", "1.0.0"))]))
-        .unwrap_err();
+    let reserved = skills::import(
+        &registry,
+        &package(&[("s/SKILL.md", &skill_md("reset", "1.0.0"))]),
+    )
+    .unwrap_err();
     assert_eq!(reserved.status, 409);
 
-    assert!(skills::listing(&registry)["skills"].as_array().unwrap().is_empty());
+    assert!(skills::listing(&registry)["skills"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 /// Reinstalling is how a skill is updated, and the old copy has to go: files
@@ -152,11 +170,24 @@ async fn installing_over_a_skill_replaces_it_rather_than_merging() {
     )
     .unwrap();
 
-    skills::import(&registry, &package(&[("demo/SKILL.md", &skill_md("demo", "2.0.0"))])).unwrap();
+    skills::import(
+        &registry,
+        &package(&[("demo/SKILL.md", &skill_md("demo", "2.0.0"))]),
+    )
+    .unwrap();
 
-    assert_eq!(registry.get("demo").unwrap().version.as_deref(), Some("2.0.0"));
+    assert_eq!(
+        registry.get("demo").unwrap().version.as_deref(),
+        Some("2.0.0")
+    );
     assert!(!vfs::exists("/skills/demo/gone.md"));
-    assert_eq!(skills::listing(&registry)["skills"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        skills::listing(&registry)["skills"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// The archive stays where it was downloaded to only for as long as it takes to
@@ -164,12 +195,22 @@ async fn installing_over_a_skill_replaces_it_rather_than_merging() {
 #[wasm_bindgen_test]
 async fn nothing_is_left_behind_in_the_staging_area() {
     let registry = workspace();
-    skills::import(&registry, &package(&[("demo/SKILL.md", &skill_md("demo", "1.0.0"))])).unwrap();
+    skills::import(
+        &registry,
+        &package(&[("demo/SKILL.md", &skill_md("demo", "1.0.0"))]),
+    )
+    .unwrap();
     let _ = skills::import(&registry, b"not a zip");
     let _ = skills::preview(&package(&[("demo/SKILL.md", &skill_md("demo", "1.0.0"))]));
 
-    let staged = vfs::read_dir(agent_web_core::files::TMP).unwrap().flatten().count();
-    assert_eq!(staged, 0, "an import leaves the staging area as it found it");
+    let staged = vfs::read_dir(agent_web_core::files::TMP)
+        .unwrap()
+        .flatten()
+        .count();
+    assert_eq!(
+        staged, 0,
+        "an import leaves the staging area as it found it"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -213,7 +254,10 @@ async fn deleting_a_skill_takes_its_switches_with_it() {
 
     skills::delete(&registry, "demo").unwrap();
     assert!(!vfs::exists("/skills/demo"));
-    assert!(skills::listing(&registry)["skills"].as_array().unwrap().is_empty());
+    assert!(skills::listing(&registry)["skills"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     skills::import(&registry, &bytes).unwrap();
     let reinstalled = skills::listing(&registry);
@@ -244,7 +288,11 @@ async fn an_icon_is_served_as_what_it_is() {
     assert_eq!(bytes, vec![0x89, b'P', b'N', b'G']);
     assert_eq!(mime, "image/png");
 
-    skills::import(&registry, &package(&[("bare/SKILL.md", &skill_md("bare", "1.0.0"))])).unwrap();
+    skills::import(
+        &registry,
+        &package(&[("bare/SKILL.md", &skill_md("bare", "1.0.0"))]),
+    )
+    .unwrap();
     assert!(skills::icon(&registry, "bare").is_none());
     assert!(skills::icon(&registry, "absent").is_none());
 }

@@ -59,7 +59,14 @@ APP_URL="http://127.0.0.1:$PORT/"
 # dist/). Baked into the bundle, so it is exported before building.
 export SKILLS_REPO="http://127.0.0.1:$PORT/skills"
 
-echo "==> building the page for $APP_URL"
+# The app shell (system-v2 §10.3) ships beside the page — app/public/
+# app-frame.html lands in dist/ — and the desktop resolves it relative to
+# its own document, so it is served by the same origin as everything else.
+# VINX_APP_FRAME_URL stays unset: the suite proves the default, not a deploy
+# that moved the shell to another site.
+APP_FRAME_URL="${APP_URL}app-frame.html"
+
+echo "==> building the page for $APP_URL (app shell at $APP_FRAME_URL)"
 npm run build >/dev/null
 
 echo "==> seeding a skills repository at $SKILLS_REPO"
@@ -118,6 +125,6 @@ else
 	echo "==> no VM images (../linux/build.sh); the console leg will be skipped"
 fi
 
-export APP_URL MOCK_LLM_URL VM_IMAGES
+export APP_URL APP_FRAME_URL MOCK_LLM_URL VM_IMAGES
 echo "==> $APP_URL (model at $MOCK_LLM_URL)"
 node app/test/browser.mjs

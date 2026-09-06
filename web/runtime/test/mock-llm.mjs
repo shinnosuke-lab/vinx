@@ -48,18 +48,69 @@ function chunk(delta, finish = null) {
 	return `data: ${JSON.stringify(body)}\n\n`;
 }
 
+/**
+ * The trailing usage record an OpenAI-compatible stream sends when asked for
+ * one (`stream_options.include_usage`): no choices, just the counts. The
+ * engine turns it into a `usage` frame and calibrates its token estimate
+ * from `prompt_tokens`, so the scenario that streams it also proves the
+ * counts survive the trip.
+ */
+function usageChunk(prompt_tokens, completion_tokens) {
+	const body = {
+		id: 'chatcmpl-mock',
+		object: 'chat.completion.chunk',
+		created: 1700000000,
+		model: 'mock',
+		choices: [],
+		usage: { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },
+	};
+	return `data: ${JSON.stringify(body)}\n\n`;
+}
+
 /** Did this conversation already come back from a tool? */
 function hasToolResult(messages) {
 	return messages.some((m) => m.role === 'tool');
 }
 
 const scenarios = {
-	/** Plain prose, split so the client has to stitch deltas together. */
+	/**
+	 * Plain prose, split so the client has to stitch deltas together, with
+	 * the usage record real providers append after the last choice.
+	 */
 	'mock-text': async (_req, write) => {
 		write(chunk({ role: 'assistant', content: '' }));
 		write(chunk({ content: 'Hello' }));
 		write(chunk({ content: ', world' }));
 		write(chunk({}, 'stop'));
+		write(usageChunk(1234, 5));
+		write('data: [DONE]\n\n');
+	},
+
+	/**
+	 * The provider's context-overflow verdict, once. The first request is
+	 * refused before the stream (see the 400 branch in the handler); the engine
+	 * is expected to compact its history — its summarizer's request is answered
+	 * here with a summary — and replay, and the replay (whose history now opens
+	 * with the summary) gets the prose. Stateless: every decision is read off
+	 * the request, so the scenario survives any number of runs against one mock.
+	 */
+	'mock-overflow-once': async (req, write) => {
+		const text = (m) => String(m.content ?? '');
+		const summarizing = req.messages.some(
+			(m) => m.role === 'system' && text(m).startsWith('You are a summarizer'),
+		);
+		const compacted = req.messages.some(
+			(m) => m.role === 'user' && text(m).startsWith('[Conversation Summary]'),
+		);
+		const reply = summarizing
+			? 'The user shared a report and the assistant acknowledged it.'
+			: compacted
+				? 'Fits now'
+				: 'Noted.';
+		write(chunk({ role: 'assistant', content: '' }));
+		write(chunk({ content: reply }));
+		write(chunk({}, 'stop'));
+		write(usageChunk(40, 3));
 		write('data: [DONE]\n\n');
 	},
 
@@ -139,7 +190,7 @@ const scenarios = {
 			['mock-gateway-info', 'gateway_info', {}],
 			['mock-run-shell', 'run_shell', { command: 'echo hi' }],
 			// Where a bare command lands: the persistent directory, and the
-			// browser suite reads the answer back to hold agentd to it.
+			// browser suite reads the answer back to hold rund to it.
 			['mock-pwd-shell', 'run_shell', { command: 'pwd' }],
 			// The VM's structured tools: the safe ones prove the missing
 			// confirmation gate, the unsafe one proves its presence, and
@@ -162,8 +213,9 @@ const scenarios = {
 			// The whole tool is one button on its card; the browser suite
 			// clicks it and asserts where the popup went.
 			['mock-open-terminal', 'open_terminal', {}],
-			// A RUN line tens of KB long: the serial channel must carry it
-			// whole (agentd checks the payload length), and wc proves it did.
+			// A command tens of KB long: far past the 4 KiB control frame, so
+			// the runShell adapter must stage it as a scriptRef (§6.8) and wc
+			// proves every byte ran.
 			[
 				'mock-long-shell',
 				'run_shell',
@@ -174,10 +226,11 @@ const scenarios = {
 			// The page-side executor, straight through the tool: an expression
 			// answers REPL-style, and 42 in the echoed result proves it ran.
 			['mock-run-js', 'run_js', { code: '6*7' }],
-			// The same executor reached the long way round: run_shell -> agentd
-			// -> js(1) -> ttyS3 -> the page. This is the leg an OSC-based
-			// channel could never serve (agentd captures stdout), so it gets
-			// its own scenario.
+			// The same executor reached the long way round: run_shell ->
+			// proc.run -> js(1) -> debug.js back up the same wire -> the
+			// page. A live re-entrancy proof since both legs share ttyS3,
+			// and the leg an OSC-based channel could never serve (stdout is
+			// captured), so it gets its own scenario.
 			['mock-js-shell', 'run_shell', { command: "js -e '6*7'" }],
 			// Kept for the wasm device-tool test (crates/.../device_tools.rs),
 			// which drives the engine's generic HTTP tool path with its own
@@ -192,6 +245,9 @@ const scenarios = {
 			// The task registers: intercepted, validated, acknowledged —
 			// the call itself staying in the history is the storage.
 			['mock-task-state', 'update_task_state', { state: 'goal: prove the registers' }],
+			// Over the 2000-character target, under the 4000 cap: accepted with
+			// a nudge in the ack rather than refused.
+			['mock-task-state-long', 'update_task_state', { state: 'goal: ' + 'x'.repeat(2500) }],
 		].map(([scenario, tool, args]) => [
 			scenario,
 			async (req, write) => {
@@ -219,6 +275,187 @@ const scenarios = {
 			},
 		]),
 	),
+
+	/**
+	 * The workspace round trip a real model took on 2026-09-04 and lost: write
+	 * a draft by bare filename, edit it by the same bare name, then hand it to
+	 * the person — with the machine off, since none of it needs one. The last
+	 * leg echoes every tool result so the browser suite can read them back.
+	 */
+	'mock-draft-download': async (req, write) => {
+		const results = req.messages.filter((m) => m.role === 'tool');
+		const legs = [
+			['write_file', { path: 'hello.html', content: '<h1>hello</h1>\n' }],
+			['edit_file', { path: 'hello.html', old_str: 'hello', new_str: 'hello, world' }],
+			['download_file', { path: 'hello.html' }],
+		];
+		const leg = legs[results.length];
+		if (!leg) {
+			write(chunk({ content: `tool said: ${results.map((r) => r.content).join(' | ')}` }));
+			write(chunk({}, 'stop'));
+			write('data: [DONE]\n\n');
+			return;
+		}
+		write(
+			chunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: `call_${results.length + 1}`,
+						type: 'function',
+						function: { name: leg[0], arguments: JSON.stringify(leg[1]) },
+					},
+				],
+			}),
+		);
+		write(chunk({}, 'tool_calls'));
+		write('data: [DONE]\n\n');
+	},
+
+	/**
+	 * The other door: a draft shown rather than saved. write_file by bare
+	 * name, then open_file by the same name; the last leg echoes the results
+	 * so the browser suite can read what the model was told.
+	 */
+	'mock-open-file': async (req, write) => {
+		const results = req.messages.filter((m) => m.role === 'tool');
+		const legs = [
+			['write_file', { path: 'hello.html', content: '<!doctype html><title>hi</title><h1>hello, tab</h1>\n' }],
+			['open_file', { path: 'hello.html' }],
+		];
+		const leg = legs[results.length];
+		if (!leg) {
+			write(chunk({ content: `tool said: ${results.map((r) => r.content).join(' | ')}` }));
+			write(chunk({}, 'stop'));
+			write('data: [DONE]\n\n');
+			return;
+		}
+		write(
+			chunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: `call_${results.length + 1}`,
+						type: 'function',
+						function: { name: leg[0], arguments: JSON.stringify(leg[1]) },
+					},
+				],
+			}),
+		);
+		write(chunk({}, 'tool_calls'));
+		write('data: [DONE]\n\n');
+	},
+
+	/**
+	 * The third door: an app, not a file. Three drafts by bare name — the
+	 * window's body fragment, stylesheet and script — then install_app by
+	 * those names; the last leg echoes the results so the browser suite can
+	 * read what the model was told. Machine off throughout: the point. The
+	 * person asked for the window "every time I open this page", so the
+	 * model passes autostart — the browser suite checks the page honours it.
+	 */
+	'mock-install-app': async (req, write) => {
+		const results = req.messages.filter((m) => m.role === 'tool');
+		const legs = [
+			['write_file', { path: 'index.html', content: '<h1 id="marker">tick</h1>\n<p class="note">from install_app</p>\n' }],
+			['write_file', { path: 'style.css', content: '.note{color:teal}\n' }],
+			['write_file', { path: 'app.js', content: "document.getElementById('marker').textContent = 'hello from app.js';\n" }],
+			[
+				'install_app',
+				{ id: 'tick', title: 'Tick Tock', description: 'a marker app', html: 'index.html', css: 'style.css', js: 'app.js', autostart: true },
+			],
+		];
+		const leg = legs[results.length];
+		if (!leg) {
+			write(chunk({ content: `tool said: ${results.map((r) => r.content).join(' | ')}` }));
+			write(chunk({}, 'stop'));
+			write('data: [DONE]\n\n');
+			return;
+		}
+		write(
+			chunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: `call_${results.length + 1}`,
+						type: 'function',
+						function: { name: leg[0], arguments: JSON.stringify(leg[1]) },
+					},
+				],
+			}),
+		);
+		write(chunk({}, 'tool_calls'));
+		write('data: [DONE]\n\n');
+	},
+
+	/**
+	 * The refusal leg of the same door: a fragment under a name `app install`
+	 * would refuse. The echo is what the model was told; the browser suite
+	 * checks it is the guest's words, and that nothing landed.
+	 */
+	'mock-install-app-bad': async (req, write) => {
+		const results = req.messages.filter((m) => m.role === 'tool');
+		const legs = [
+			['write_file', { path: 'bad.html', content: '<h1>x</h1>\n' }],
+			['install_app', { id: 'Bad App', html: 'bad.html' }],
+		];
+		const leg = legs[results.length];
+		if (!leg) {
+			write(chunk({ content: `tool said: ${results.map((r) => r.content).join(' | ')}` }));
+			write(chunk({}, 'stop'));
+			write('data: [DONE]\n\n');
+			return;
+		}
+		write(
+			chunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: `call_${results.length + 1}`,
+						type: 'function',
+						function: { name: leg[0], arguments: JSON.stringify(leg[1]) },
+					},
+				],
+			}),
+		);
+		write(chunk({}, 'tool_calls'));
+		write('data: [DONE]\n\n');
+	},
+
+	/**
+	 * The same door with nothing said about autostart. The browser suite
+	 * seeds the mirror's autostart list with this id before the install, the
+	 * way a mirror used to keep a removed app's line: a fresh install is not
+	 * an enable, so the line must go — and only that one.
+	 */
+	'mock-install-app-plain': async (req, write) => {
+		const results = req.messages.filter((m) => m.role === 'tool');
+		const legs = [
+			['write_file', { path: 'tock.html', content: '<h1 id="marker">tock</h1>\n' }],
+			['install_app', { id: 'tock', title: 'Tock', html: 'tock.html' }],
+		];
+		const leg = legs[results.length];
+		if (!leg) {
+			write(chunk({ content: `tool said: ${results.map((r) => r.content).join(' | ')}` }));
+			write(chunk({}, 'stop'));
+			write('data: [DONE]\n\n');
+			return;
+		}
+		write(
+			chunk({
+				tool_calls: [
+					{
+						index: 0,
+						id: `call_${results.length + 1}`,
+						type: 'function',
+						function: { name: leg[0], arguments: JSON.stringify(leg[1]) },
+					},
+				],
+			}),
+		);
+		write(chunk({}, 'tool_calls'));
+		write('data: [DONE]\n\n');
+	},
 
 	/**
 	 * A model stuck re-recalling the same missing call_id, forever. The loop's
@@ -345,6 +582,16 @@ const scenarios = {
 		write('data: [DONE]\n\n');
 	},
 
+	/** The tool names this request offered, sorted — what the model can
+	 * actually call, as the wire says it. The browser suite reads it to pin
+	 * that a powered-off machine's tools are not on offer. */
+	'mock-echo-tools': async (req, write) => {
+		const names = (req.tools ?? []).map((t) => t?.function?.name ?? t?.name ?? '?').sort();
+		write(chunk({ content: `tools: ${names.join(' ')}` }));
+		write(chunk({}, 'stop'));
+		write('data: [DONE]\n\n');
+	},
+
 	/** Junk between valid records: skipped, not fatal. */
 	'mock-noise': async (_req, write) => {
 		write(': keep-alive comment\n\n');
@@ -357,6 +604,95 @@ const scenarios = {
 	/** A stream that stops without `[DONE]` or a finish reason. */
 	'mock-truncated': async (_req, write) => {
 		write(chunk({ content: 'cut off' }));
+	},
+
+	/**
+	 * A scripted agent building an app the way the skill teaches (§13):
+	 * scaffold with `app new`, edit a file with write_file, `app check
+	 * --json`, pack, install, then run/start it. The kind comes from the
+	 * user's message ("web app" / "service" / "command"), the id from a
+	 * `named X` clause; each turn issues the next tool call in the plan,
+	 * looking only at how many tool results have come back — a model
+	 * following a plan, not a stub echoing one result. The final turn
+	 * reports what `app list --json` said.
+	 */
+	'mock-app-builder': async (req, write) => {
+		const user = [...req.messages].reverse().find((m) => m.role === 'user')?.content ?? '';
+		const id = (/named ([a-z0-9][a-z0-9-]{0,31})/.exec(user) ?? [])[1] ?? 'built-by-mock';
+		const kind = /web app/i.test(user) ? 'web' : /service/i.test(user) ? 'service' : 'command';
+		const n = req.messages.filter((m) => m.role === 'tool').length;
+		const shell = (command, timeout = 60) => ({
+			name: 'run_shell',
+			arguments: JSON.stringify({ command, timeout }),
+		});
+		// The web edit is written the way a model writes a web page by habit
+		// — a whole document, a <link> to its stylesheet, a <script src> —
+		// and its app.js keeps state in localStorage. Neither is the window's
+		// contract (index.html is a body fragment; the frame has no storage);
+		// the shell tolerates both and `app check` names them, which is what
+		// the browser suite asserts.
+		const edit =
+			kind === 'web'
+				? n === 1
+					? {
+							name: 'write_file',
+							arguments: JSON.stringify({
+								path: `/data/work/${id}/index.html`,
+								content:
+									`<!DOCTYPE html>\n<html><head><meta charset="utf-8"><title>${id}</title>\n` +
+									`<link rel="stylesheet" href="style.css"></head>\n` +
+									`<body><h1 id="title">${id}</h1>\n<p id="marker">built-by-the-model</p>\n` +
+									`<button id="ping">notify</button>\n<script src="app.js"></script></body></html>\n`,
+							}),
+						}
+					: {
+							name: 'write_file',
+							arguments: JSON.stringify({
+								path: `/data/work/${id}/app.js`,
+								content:
+									`const n = Number(localStorage.getItem('opens') || 0) + 1;\n` +
+									`localStorage.setItem('opens', String(n));\n` +
+									`document.getElementById('title').textContent = 'hello from ${id} #' + n;\n` +
+									`document.getElementById('ping').onclick = () => vinx.call('notify.show', { text: 'ping' });\n`,
+							}),
+						}
+				: {
+						name: 'write_file',
+						arguments: JSON.stringify({
+							path: `/data/work/${id}/run`,
+							content:
+								kind === 'service'
+									? `#!/bin/sh\nwhile :; do echo "${id} alive $(date)"; sleep 3; done\n`
+									: `#!/bin/sh\necho "${id} ran once"\n`,
+						}),
+					};
+		const plan = [
+			shell(`app new ${id} --${kind}`),
+			edit,
+			...(kind === 'web' ? [edit] : []), // the second web edit (app.js); `edit` reads n
+			shell(`app check /data/work/${id} --json`),
+			shell(`app pack /data/work/${id} && app install /data/work/${id}.vapp`),
+			kind === 'web'
+				? shell(`app run ${id} >/dev/null 2>&1 & sleep 1; echo window-requested`)
+				: kind === 'service'
+					? shell(`app start ${id}`)
+					: shell(`app run ${id}`),
+			shell(`app list --json`, 30),
+		];
+		if (n < plan.length) {
+			write(
+				chunk({
+					tool_calls: [{ index: 0, id: `call_build_${n}`, type: 'function', function: plan[n] }],
+				}),
+			);
+			write(chunk({}, 'tool_calls'));
+			write('data: [DONE]\n\n');
+			return;
+		}
+		const last = [...req.messages].reverse().find((m) => m.role === 'tool')?.content ?? '';
+		write(chunk({ content: `built ${id} (${kind}); app list said: ${last}` }));
+		write(chunk({}, 'stop'));
+		write('data: [DONE]\n\n');
 	},
 };
 
@@ -601,6 +937,50 @@ const server = createServer((req, res) => {
 			head(res, 401, json);
 			res.end('{"error":{"message":"bad key"}}');
 			return;
+		}
+		// An upstream that takes its time before the first byte: no headers
+		// for a while, then plain prose. A client that honours its stop flag
+		// only once the stream is open sits through the whole wait.
+		if (body.model === 'mock-slow-headers') {
+			await new Promise((r) => setTimeout(r, 3000));
+			if (req.destroyed || res.destroyed) return;
+			head(res, 200, {
+				'Content-Type': 'text/event-stream',
+				'Cache-Control': 'no-cache',
+				Connection: 'keep-alive',
+			});
+			await scenarios['mock-text'](body, (s) => res.write(s));
+			res.end();
+			return;
+		}
+		// The overflow verdict, word for word as OpenAI phrases it. A live user
+		// message that says "overflow" gets it — unless the history has already
+		// been compacted (it opens with a summary) or this is the summarizer's
+		// own request; both of those stream. Any other message streams too, so
+		// a test can lay down history before provoking the verdict.
+		if (body.model === 'mock-overflow-once') {
+			const text = (m) => String(m.content ?? '');
+			const live = [...body.messages].reverse().find((m) => m.role === 'user');
+			const replay = body.messages.some(
+				(m) =>
+					(m.role === 'system' && text(m).startsWith('You are a summarizer')) ||
+					(m.role === 'user' && text(m).startsWith('[Conversation Summary]')),
+			);
+			if (!replay && live && /overflow/i.test(text(live))) {
+				head(res, 400, json);
+				res.end(
+					JSON.stringify({
+						error: {
+							message:
+								"This model's maximum context length is 8192 tokens. However, your messages resulted in 9107 tokens. Please reduce the length of the messages.",
+							type: 'invalid_request_error',
+							param: 'messages',
+							code: 'context_length_exceeded',
+						},
+					}),
+				);
+				return;
+			}
 		}
 
 		const scenario = scenarios[body.model];

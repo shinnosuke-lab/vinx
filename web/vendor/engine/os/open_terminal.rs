@@ -1,9 +1,9 @@
 //! `open_terminal` — lazy UI tool: surface a "open terminal" button in chat.
 //!
 //! The tool itself performs no action on the host. The web frontend renders
-//! the call as a button that opens the terminal page (`terminal/` under the
-//! site root, wherever the site is deployed) in a new browser tab, so the
-//! user (not the model) triggers the actual navigation.
+//! the call as a button that opens a console for the person — on the chat
+//! page this machine's console panel in place (`app/open-terminal-tool.tsx`),
+//! elsewhere the terminal page — so the user (not the model) triggers it.
 
 use std::collections::HashMap;
 
@@ -31,9 +31,9 @@ impl Tool for OpenTerminalTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "open_terminal",
-            "Open an interactive shell terminal in a new browser tab for the \
-             user. Use when the user wants to run commands themselves or asks \
-             for a terminal/shell. No parameters.",
+            "Offer the user a console on the machine: the call renders a \
+             button they click to open it. Use when the user wants to run \
+             commands themselves or asks for a terminal/shell. No parameters.",
             ToolParameters::object(HashMap::new(), vec![]),
         )
     }

@@ -75,8 +75,12 @@ async fn an_attached_text_file_is_one_the_model_can_read() {
 #[wasm_bindgen_test]
 async fn an_image_is_stored_under_a_canonical_extension() {
     workspace();
-    let png = uploads::store("shot.PNG", "image/png; charset=binary", &[0x89, b'P', b'N', b'G'])
-        .unwrap();
+    let png = uploads::store(
+        "shot.PNG",
+        "image/png; charset=binary",
+        &[0x89, b'P', b'N', b'G'],
+    )
+    .unwrap();
 
     assert_eq!(png.kind, "image");
     assert!(png.id.ends_with(".png"), "{}", png.id);
@@ -123,7 +127,12 @@ async fn what_cannot_be_stored_says_why_and_with_which_status() {
     assert!(image.message.contains("10MB"), "{}", image.message);
 
     // 11MB is over the image cap but under the file one.
-    assert!(uploads::store("x.bin", "application/octet-stream", &vec![0u8; 11 * 1024 * 1024]).is_ok());
+    assert!(uploads::store(
+        "x.bin",
+        "application/octet-stream",
+        &vec![0u8; 11 * 1024 * 1024]
+    )
+    .is_ok());
 }
 
 #[wasm_bindgen_test]

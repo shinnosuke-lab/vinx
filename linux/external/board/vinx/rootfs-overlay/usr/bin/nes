@@ -1,0 +1,14 @@
+#!/bin/sh
+# nes -- the console (the binary is /usr/libexec/nes, built by nes.mk);
+# this wrapper is the fb-run doorway every framebuffer program passes:
+# one FB program at a time, and the terminal comes back sane on every
+# exit path -- the old "nes restores stty only when it exits cleanly"
+# debt is fb-run's to settle now (§10.5).
+#
+# `nes list` never touches the framebuffer (it prints the LAN's hosts and
+# exits), so it skips the lock: discovering a game must work while one is
+# being played. join/host draw, and queue behind the lock like the rest.
+case "${1:-}" in
+	list) exec /usr/libexec/nes "$@" ;;
+esac
+exec fb-run /usr/libexec/nes "$@"

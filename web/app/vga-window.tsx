@@ -1,19 +1,21 @@
 /**
- * The machine's VGA screen and the floating window around it: what the
- * footer's screen chip toggles over the console.
+ * The machine's VGA screen and its floating window: what the footer's
+ * screen chip toggles over the console. The window chrome itself is the
+ * desktop's generic DesktopWindow (§15 Phase 5 unhooked it from this
+ * panel); what stays here is the VGA content — the adopted v86 screen
+ * element, the PS/2 keyboard/mouse forwarding, the pixel-exact fit.
  */
 
 import {
-	useCallback,
 	useEffect,
 	useRef,
-	useState,
 	type KeyboardEvent as ReactKeyboardEvent,
 	type PointerEvent as ReactPointerEvent,
 } from 'react';
 
 import { sharedVm } from './vm';
-import { Icon, ICON_MAX, ICON_MONITOR, ICON_RESTORE, ICON_X } from './icons';
+import { DesktopWindow } from './desktop-window';
+import { ICON_MONITOR } from './icons';
 
 /**
  * The machine's VGA screen, adopted from the VM (which keeps v86's screen
@@ -73,7 +75,10 @@ function VgaPanel() {
 		const fit = () => {
 			const canvas = el?.querySelector('canvas');
 			if (!canvas || !canvas.width || !panel) return;
-			const dpr = window.devicePixelRatio || 1;
+			// The panel's own window, not the module's, out of habit — the
+			// two are one document today, but the DPI belongs to wherever
+			// the panel actually renders.
+			const dpr = (panel.ownerDocument.defaultView ?? window).devicePixelRatio || 1;
 			const availW = panel.clientWidth * dpr;
 			const availH = panel.clientHeight * dpr;
 			if (!availW || !availH) return;
@@ -85,7 +90,11 @@ function VgaPanel() {
 			canvas.style.height = `${(canvas.height * device) / dpr}px`;
 			canvas.style.imageRendering = whole ? 'pixelated' : 'auto';
 		};
-		const ro = new ResizeObserver(fit);
+		// The observer of the panel's own window: an observer constructed
+		// in one document never fires for elements living in another, so
+		// build it where the panel is.
+		const View = (panel?.ownerDocument.defaultView ?? window) as typeof window;
+		const ro = new View.ResizeObserver(fit);
 		if (panel) ro.observe(panel);
 		const unmode = vm.onScreenModeChange(fit);
 		fit();
@@ -201,311 +210,40 @@ function VgaPanel() {
 /** Where the floating screen window keeps its geometry between sessions. */
 const SCREEN_RECT_KEY = 'vinx.screen.rect';
 
-const MIN_W = 240;
-const MIN_H = 180;
-/** Title bar (26px) plus the 1px borders the window box adds around it. */
-const CHROME_H = 28;
-const CHROME_W = 2;
-
-interface ScreenRect {
-	x: number;
-	y: number;
-	w: number;
-	h: number;
-	max: boolean;
-	/** Which guest mode ("256x224") the size was last set for — by the
-	 * auto-fit or by hand. The fit effect only recomputes when the mode
-	 * key changes, so reopening the same game keeps a hand-set size
-	 * instead of stomping it back to the integer fit. */
-	fit?: string;
-}
-
-function loadScreenRect(): ScreenRect | null {
-	try {
-		const r = JSON.parse(localStorage.getItem(SCREEN_RECT_KEY) ?? '') as ScreenRect;
-		const sane = [r.x, r.y, r.w, r.h].every(Number.isFinite);
-		if (!sane) return null;
-		return { ...r, max: !!r.max, fit: typeof r.fit === 'string' ? r.fit : undefined };
-	} catch {
-		return null;
-	}
-}
-
-/** The eight resize handles around the window, named like compass points. */
-const RESIZE_EDGES = ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'] as const;
-type ResizeEdge = (typeof RESIZE_EDGES)[number];
-
 /**
- * The floating window around the VGA panel: a title bar to drag it by (or
- * double-click to maximize), handles on every edge and corner to resize it,
- * and buttons to maximize or close it. Closing only hides the window — the
- * footer's screen chip brings it back, and v86 keeps painting throughout.
- * Geometry persists in localStorage, clamped back into the pane on reopen.
- *
- * `fitTo` is the auto-open handshake: when the guest mode-sets to its own
- * resolution (see terminal.tsx), the window sizes itself to the largest
- * integer multiple of that mode the pane can hold — pixel-perfect out of
- * the box, before anyone touches a handle.
+ * The VGA panel in a DesktopWindow: what the footer's screen chip toggles.
+ * Closing only hides the window — the chip brings it back, and v86 keeps
+ * painting throughout. `fitTo` is the auto-open handshake: when the guest
+ * mode-sets to its own resolution (see terminal.tsx), the window sizes
+ * itself to the largest integer multiple of that mode the pane can hold,
+ * and resizes stay aspect-locked with a whole-multiple snap.
  */
 export function VgaWindow({
 	onClose,
 	fitTo,
+	footer = 24,
+	zIndex,
+	onRaise,
 }: {
 	onClose: () => void;
 	fitTo?: { w: number; h: number } | null;
+	footer?: number;
+	zIndex?: number;
+	onRaise?: () => void;
 }) {
-	const win = useRef<HTMLDivElement>(null);
-	// Position and size live outside React: dragging writes styles directly
-	// (a re-render per pointermove would fight the canvas), React only hears
-	// about the maximize flag because the buttons need it.
-	const geom = useRef<ScreenRect>(loadScreenRect() ?? { x: -1, y: -1, w: 480, h: 386, max: false });
-	const [maximized, setMaximized] = useState(geom.current.max);
-
-	const persist = useCallback(() => {
-		try {
-			localStorage.setItem(SCREEN_RECT_KEY, JSON.stringify(geom.current));
-		} catch {
-			/* private mode: the window just forgets */
-		}
-	}, []);
-
-	// Clamp the remembered rect into the pane and write it as inline styles;
-	// maximized means the pane is the window.
-	const apply = useCallback(() => {
-		const el = win.current;
-		const pane = el?.parentElement;
-		if (!el || !pane) return;
-		const g = geom.current;
-		if (g.max) {
-			el.style.left = '0';
-			el.style.top = '0';
-			el.style.width = '100%';
-			// The footer (status dot, chips) stays visible under a maximized
-			// window; 24px is its fixed height in terminal.css.
-			el.style.height = 'calc(100% - 24px)';
-			return;
-		}
-		const pw = pane.clientWidth;
-		const ph = pane.clientHeight;
-		g.w = Math.min(Math.max(g.w, MIN_W), Math.max(pw, MIN_W));
-		g.h = Math.min(Math.max(g.h, MIN_H), Math.max(ph, MIN_H));
-		if (g.x < 0 || g.y < 0) {
-			// First open: bottom-right corner, clear of the footer strip.
-			g.x = pw - g.w - 12;
-			g.y = ph - g.h - 36;
-		}
-		g.x = Math.max(0, Math.min(g.x, pw - g.w));
-		g.y = Math.max(0, Math.min(g.y, ph - g.h));
-		el.style.left = `${g.x}px`;
-		el.style.top = `${g.y}px`;
-		el.style.width = `${g.w}px`;
-		el.style.height = `${g.h}px`;
-	}, []);
-
-	useEffect(() => {
-		apply();
-	}, [apply, maximized]);
-
-	// Size the window to the guest's mode, at the largest integer multiple
-	// the pane can hold — but only when the mode is new. A remembered fit
-	// key equal to the current mode means the stored size is already for
-	// this mode (auto-fit or the user's own resize) and stays untouched;
-	// without the key check, every reopen stomped a hand-set size. A
-	// maximized window stays maximized (the panel letterboxes).
-	useEffect(() => {
-		if (!fitTo) return;
-		const pane = win.current?.parentElement;
-		const g = geom.current;
-		if (!pane || g.max) return;
-		const key = `${fitTo.w}x${fitTo.h}`;
-		if (g.fit === key) return;
-		const n = Math.max(
-			1,
-			Math.floor(
-				Math.min(
-					(pane.clientWidth - CHROME_W) / fitTo.w,
-					(pane.clientHeight - 36 - CHROME_H) / fitTo.h,
-				),
-			),
-		);
-		g.w = Math.max(MIN_W, fitTo.w * n + CHROME_W);
-		g.h = Math.max(MIN_H, fitTo.h * n + CHROME_H);
-		g.fit = key;
-		apply();
-		persist();
-	}, [fitTo, apply, persist]);
-
-	useEffect(() => {
-		const el = win.current;
-		const pane = el?.parentElement;
-		if (!el || !pane) return;
-		// A shrinking pane must not strand the window outside the visible
-		// area; re-clamp. (Resizing the window itself goes through the
-		// handles below, which persist on release.)
-		const ro = new ResizeObserver(() => apply());
-		ro.observe(pane);
-		return () => ro.disconnect();
-	}, [apply]);
-
-	const dragStart = (e: ReactPointerEvent<HTMLDivElement>) => {
-		if (geom.current.max || e.button !== 0) return;
-		const bar = e.currentTarget;
-		const dx = e.clientX - geom.current.x;
-		const dy = e.clientY - geom.current.y;
-		bar.setPointerCapture(e.pointerId);
-		const move = (ev: PointerEvent) => {
-			geom.current.x = ev.clientX - dx;
-			geom.current.y = ev.clientY - dy;
-			apply();
-		};
-		const up = () => {
-			bar.removeEventListener('pointermove', move);
-			bar.removeEventListener('pointerup', up);
-			bar.removeEventListener('pointercancel', up);
-			persist();
-		};
-		bar.addEventListener('pointermove', move);
-		bar.addEventListener('pointerup', up);
-		// A cancelled gesture (touch/pen) must clean up too, or the leaked
-		// move listener makes the window chase a merely hovering pointer.
-		bar.addEventListener('pointercancel', up);
-	};
-
-	// One pointer-capture drag per handle: east/south move the far edge,
-	// west/north move the near edge and the origin with it, corners do both.
-	//
-	// With a known guest mode (fitTo) the resize is really one number — the
-	// content scale — so the drag is aspect-locked: the axis the pointer
-	// drives sets the scale, the other dimension follows, and releasing
-	// snaps to the nearest whole multiple. The panel is then exactly the
-	// content's shape, so no black frame on all four sides, ever; free
-	// resizing (no fitTo: the fbcon console) letterboxes one axis at most
-	// (see VgaPanel's fit).
-	const resizeStart = (edge: ResizeEdge) => (e: ReactPointerEvent<HTMLDivElement>) => {
-		if (geom.current.max || e.button !== 0) return;
-		e.preventDefault();
-		const handle = e.currentTarget;
-		const start = { ...geom.current };
-		const px = e.clientX;
-		const py = e.clientY;
-		const lock = fitTo ? { ...fitTo } : null;
-		// The smallest scale at which the window still meets both minimums.
-		const minScale = lock
-			? Math.max((MIN_W - CHROME_W) / lock.w, (MIN_H - CHROME_H) / lock.h)
-			: 0;
-		/** Aspect-locked window size for a scale, moving the near edges the
-		 * way the free path does. */
-		const sizeTo = (scale: number) => {
-			if (!lock) return;
-			const g = geom.current;
-			const w = Math.round(lock.w * scale) + CHROME_W;
-			const h = Math.round(lock.h * scale) + CHROME_H;
-			if (edge.includes('w')) g.x = start.x + (start.w - w);
-			if (edge.includes('n')) g.y = start.y + (start.h - h);
-			g.w = w;
-			g.h = h;
-		};
-		handle.setPointerCapture(e.pointerId);
-		const move = (ev: PointerEvent) => {
-			const dx = ev.clientX - px;
-			const dy = ev.clientY - py;
-			const g = geom.current;
-			if (lock) {
-				// Each axis the handle owns proposes a scale; the larger one
-				// wins, so corner drags follow the pointer's outward axis.
-				const w = edge.includes('e') ? start.w + dx : edge.includes('w') ? start.w - dx : null;
-				const h = edge.includes('s') ? start.h + dy : edge.includes('n') ? start.h - dy : null;
-				const scale = Math.max(
-					minScale,
-					w === null ? -Infinity : (w - CHROME_W) / lock.w,
-					h === null ? -Infinity : (h - CHROME_H) / lock.h,
-				);
-				sizeTo(scale);
-				apply();
-				return;
-			}
-			if (edge.includes('e')) g.w = Math.max(MIN_W, start.w + dx);
-			if (edge.includes('s')) g.h = Math.max(MIN_H, start.h + dy);
-			if (edge.includes('w')) {
-				const w = Math.max(MIN_W, start.w - dx);
-				g.x = start.x + (start.w - w);
-				g.w = w;
-			}
-			if (edge.includes('n')) {
-				const h = Math.max(MIN_H, start.h - dy);
-				g.y = start.y + (start.h - h);
-				g.h = h;
-			}
-			apply();
-		};
-		const up = () => {
-			handle.removeEventListener('pointermove', move);
-			handle.removeEventListener('pointerup', up);
-			handle.removeEventListener('pointercancel', up);
-			const g = geom.current;
-			if (lock) {
-				// Snap to a whole multiple of the mode: whole-pixel scaling
-				// (crisp) and a panel that fits the content exactly. Below
-				// 1x there is no whole multiple; the aspect-true size stays.
-				const scale = (g.w - CHROME_W) / lock.w;
-				sizeTo(scale >= 1 ? Math.max(1, Math.round(scale)) : Math.max(minScale, scale));
-				apply();
-			}
-			// A hand-set size is the law for this mode from now on: the fit
-			// effect must not overwrite it on the next open (fit keys match).
-			g.fit = lock ? `${lock.w}x${lock.h}` : undefined;
-			persist();
-		};
-		handle.addEventListener('pointermove', move);
-		handle.addEventListener('pointerup', up);
-		handle.addEventListener('pointercancel', up);
-	};
-
-	const toggleMax = () => {
-		geom.current.max = !geom.current.max;
-		setMaximized(geom.current.max);
-		persist();
-	};
-
 	return (
-		<div ref={win} className={`vga-window${maximized ? ' max' : ''}`}>
-			<div
-				className="vga-title"
-				onPointerDown={dragStart}
-				onDoubleClick={(e) => {
-					if (!(e.target as HTMLElement).closest('.vga-btn')) toggleMax();
-				}}
-			>
-				<Icon d={ICON_MONITOR} size={12} />
-				<span className="vga-title-text">screen</span>
-				<button
-					type="button"
-					className="vga-btn"
-					title={maximized ? 'Restore the window' : 'Maximize over the pane'}
-					onPointerDown={(e) => e.stopPropagation()}
-					onClick={toggleMax}
-				>
-					<Icon d={maximized ? ICON_RESTORE : ICON_MAX} size={12} />
-				</button>
-				<button
-					type="button"
-					className="vga-btn"
-					title="Close the screen window (the machine keeps rendering)"
-					onPointerDown={(e) => e.stopPropagation()}
-					onClick={onClose}
-				>
-					<Icon d={ICON_X} size={12} />
-				</button>
-			</div>
+		<DesktopWindow
+			title="screen"
+			icon={ICON_MONITOR}
+			closeTitle="Close the screen window (the machine keeps rendering)"
+			onClose={onClose}
+			storageKey={SCREEN_RECT_KEY}
+			fitTo={fitTo}
+			footer={footer}
+			zIndex={zIndex}
+			onRaise={onRaise}
+		>
 			<VgaPanel />
-			{!maximized &&
-				RESIZE_EDGES.map((edge) => (
-					<div
-						key={edge}
-						className={`vga-resize vga-resize-${edge}`}
-						onPointerDown={resizeStart(edge)}
-					/>
-				))}
-		</div>
+		</DesktopWindow>
 	);
 }

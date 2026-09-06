@@ -4,7 +4,7 @@
 //! `file-line-text` for context lines, `--` between non-adjacent ranges.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,11 +16,25 @@ use crate::types::{ToolDefinition, ToolParameter, ToolParameters, ToolResult};
 
 pub struct SearchFilesTool {
     policy: Arc<OsPolicy>,
+    /// A bare filename that names an existing draft searches that draft — the
+    /// same rule `read_file` and `edit_file` follow, so a model that just
+    /// wrote `notes.html` can grep it by the name it used (see
+    /// [`crate::os::resolve_existing_in_drafts`]).
+    drafts_dir: Option<PathBuf>,
 }
 
 impl SearchFilesTool {
     pub fn new(policy: Arc<OsPolicy>) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            drafts_dir: None,
+        }
+    }
+
+    /// Resolve a bare filename against this drafts dir when the draft exists.
+    pub fn with_drafts_dir(mut self, drafts_dir: Option<PathBuf>) -> Self {
+        self.drafts_dir = drafts_dir;
+        self
     }
 }
 
@@ -83,6 +97,7 @@ impl Tool for SearchFilesTool {
             return ToolResult::text("Error: pattern is required").with_success(false);
         }
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path = &super::resolve_existing_in_drafts(self.drafts_dir.as_deref(), path);
         let file_ext = args.get("file_ext").and_then(|v| v.as_str());
         let max_results = args
             .get("max_results")
@@ -213,13 +228,19 @@ fn run_search(
         }
         let text = String::from_utf8_lossy(&content);
         let lines: Vec<&str> = text.lines().collect();
+        // The path as the model wrote it, with the file's position under it —
+        // or just the path when the search root IS the file: joining an empty
+        // remainder used to print `notes.html/:736:`.
         let rel = file
             .strip_prefix(resolved)
             .map(|p| {
+                let p = p.to_string_lossy();
                 if display == "." {
-                    p.to_string_lossy().to_string()
+                    p.to_string()
+                } else if p.is_empty() {
+                    display.trim_end_matches('/').to_string()
                 } else {
-                    format!("{}/{}", display.trim_end_matches('/'), p.to_string_lossy())
+                    format!("{}/{}", display.trim_end_matches('/'), p)
                 }
             })
             .unwrap_or_else(|_| file.to_string_lossy().to_string());

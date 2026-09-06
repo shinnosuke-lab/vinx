@@ -44,7 +44,12 @@ fn a_burst_of_saves_stays_ordered() {
     assert_eq!(listed, expected, "newest first, in true insertion order");
 
     // Timestamps are strictly increasing, not merely distinct.
-    let stamps: Vec<String> = s.list().unwrap().into_iter().map(|r| r.updated_at).collect();
+    let stamps: Vec<String> = s
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.updated_at)
+        .collect();
     for pair in stamps.windows(2) {
         assert!(
             pair[0] > pair[1],

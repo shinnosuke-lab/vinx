@@ -23,13 +23,14 @@ export type { DeviceConfig, Gateway } from './device';
 export { VM_ENDPOINT, vmCallHandler, vmDeviceConfig, vmToolsPayload } from './device-vm';
 export type { ShellDevice, TerminalReader, VmExtras } from './device-vm';
 export { PROTOCOL_VERSION } from './protocol';
-export type { Frame, Method, Ready, Reply, Request } from './protocol';
+export type { Frame, Method, Ready, Reply, Request, WebAppSource } from './protocol';
 
 import { serveAttachments } from './attachments';
 import { AgentClient, type ClientOptions, type HostStatus } from './client';
 import { ConfigStore } from './config';
 import { type DeviceConfig, fetchDeviceConfig } from './device';
 import {
+	NO_MACHINE_PAYLOAD,
 	type ShellDevice,
 	type TerminalReader,
 	VM_ENDPOINT,
@@ -38,6 +39,7 @@ import {
 	vmToolsPayload,
 } from './device-vm';
 import { installFetchShim, type ShimOptions } from './shim';
+import type { WebAppSource } from './protocol';
 
 export interface MountOptions extends ClientOptions, ShimOptions {
 	/**
@@ -64,6 +66,21 @@ export interface MountOptions extends ClientOptions, ShimOptions {
 	 */
 	vm?: ShellDevice;
 	/**
+	 * The machine's power, when the person decides it (the chat page asks
+	 * before booting; a machine left off costs nothing). Given, the VM's
+	 * tools follow the state: installed as the machine comes up, taken back
+	 * when it is off or failed — so a model working beside a powered-off
+	 * machine is not offered a shell it cannot have, and is briefed to say
+	 * so instead. The engine re-reads its tools and briefing every turn, so
+	 * a change lands on the next message. Without this the tools are
+	 * installed once, at mount (the terminal page: its machine is always
+	 * on while the page is).
+	 *
+	 * `listener` is called with the current state at once, then on change;
+	 * the return value unsubscribes.
+	 */
+	onPower?: (listener: (up: boolean) => void) => () => void;
+	/**
 	 * This engine sits beside the terminal page's console — the same machine
 	 * the person is typing into. Briefs the model that the console shares the
 	 * VM's filesystem and processes.
@@ -76,9 +93,20 @@ export interface MountOptions extends ClientOptions, ShimOptions {
 	terminal?: TerminalReader;
 	/**
 	 * How `download_file` hands bytes to the person — a browser download,
-	 * which only page code can trigger. Without it the tool is not declared.
+	 * which only page code can trigger. Serves both halves of the tool: the
+	 * machine's (a guest file, while it is up) and the workspace's (a draft
+	 * the model wrote, machine or not). Without it the machine's variant is
+	 * not declared and the workspace's reports that the page cannot deliver.
 	 */
 	download?: (filename: string, bytes: Uint8Array) => void;
+	/**
+	 * How the workspace's `install_app` puts a pure web app on the Apps page —
+	 * the app layer owns the machine's mirror and the package format, so the
+	 * runtime only carries the parts across. Resolves with the line the model
+	 * reads, rejects with the refusal (the machine's finding codes). Without
+	 * it the tool reports that this page cannot install apps.
+	 */
+	installApp?: (app: WebAppSource) => Promise<string>;
 	/**
 	 * The page-side JavaScript executor behind the `run_js` tool (the app's
 	 * hostcall.ts). Without it the tool is not declared.
@@ -151,6 +179,60 @@ export async function deviceTools(
 }
 
 /**
+ * Keep the engine's toolbox in step with the machine's power (see
+ * MountOptions.onPower). Installs and removals are serialised behind one
+ * promise: the state can flip faster than the worker answers (a boot
+ * cancelled at once), and the registry must end in the state of the LAST
+ * event, not of the last reply to land. Down, the machine's tools are
+ * replaced by the no-machine briefing (a payload of no tools and one
+ * paragraph), so the model is told why the shell is not there.
+ *
+ * Exported for its tests; `mount` is the caller.
+ */
+export function followPower(
+	client: Pick<AgentClient, 'installTools' | 'uninstallTools'>,
+	payload: unknown,
+	onPower: (listener: (up: boolean) => void) => () => void,
+): {
+	unwatch: () => void;
+	/** Resolves once every event so far has reached the engine. */
+	settled: () => Promise<void>;
+	/** The names the engine holds now (empty while down). */
+	names: () => string[];
+	/** Whether the machine's tools are in. */
+	up: () => boolean;
+} {
+	const offered = ((payload as { tools?: { name: string }[] }).tools ?? []).map((t) => t.name);
+	let queue: Promise<void> = Promise.resolve();
+	let installed = false; // the machine's tools are in the registry
+	let briefed = false; // the no-machine briefing is in place instead
+	let names: string[] = [];
+	const unwatch = onPower((up) => {
+		queue = queue.then(async () => {
+			if (up && !installed) {
+				installed = true;
+				briefed = false;
+				names = await client.installTools(payload, VM_ENDPOINT);
+			} else if (!up && !briefed) {
+				if (installed) {
+					installed = false;
+					await client.uninstallTools(offered);
+				}
+				briefed = true;
+				names = [];
+				await client.installTools(NO_MACHINE_PAYLOAD, VM_ENDPOINT);
+			}
+		});
+	});
+	return {
+		unwatch,
+		settled: () => queue,
+		names: () => names,
+		up: () => installed,
+	};
+}
+
+/**
  * Bring up the worker, apply the stored configuration, and route `/api/*` to it.
  *
  * Resolves once the engine has loaded and been configured, so a caller that
@@ -158,10 +240,13 @@ export async function deviceTools(
  * worker that is not there yet, or a first turn refused as unconfigured.
  */
 export async function mount(options: MountOptions = {}): Promise<Mounted> {
+	// The workspace's download_file and install_app need the page whether or
+	// not there is a machine; the machine's tools need the VM bridge on top.
+	const base = { ...options, onDownload: options.download, onInstallApp: options.installApp };
 	const client = new AgentClient(
 		options.vm
 			? {
-					...options,
+					...base,
 					onVmCall: vmCallHandler(options.vm, {
 						terminal: options.terminal,
 						download: options.download,
@@ -169,7 +254,7 @@ export async function mount(options: MountOptions = {}): Promise<Mounted> {
 						onShared: options.onShared,
 					}),
 				}
-			: options,
+			: base,
 	);
 	const status = await client.whenReady();
 
@@ -178,6 +263,10 @@ export async function mount(options: MountOptions = {}): Promise<Mounted> {
 	let device: DeviceConfig | null = null;
 	let names: string[] = [];
 	let descriptors: unknown[] = [];
+	let unwatchPower = () => {};
+	// What /api/tools answers: fixed once installed, or live for a device
+	// whose tools follow its power.
+	let toolsNow: () => unknown[] = () => descriptors;
 	if (options.vm) {
 		device = vmDeviceConfig();
 		const payload = vmToolsPayload({
@@ -186,8 +275,21 @@ export async function mount(options: MountOptions = {}): Promise<Mounted> {
 			download: options.download != null,
 			runJs: options.runJs != null,
 		});
-		names = await client.installTools(payload, VM_ENDPOINT);
-		descriptors = (payload as { tools: unknown[] }).tools;
+		const offered = (payload as { tools: { name: string }[] }).tools;
+		if (options.onPower) {
+			const follower = followPower(client, payload, options.onPower);
+			unwatchPower = follower.unwatch;
+			// Whatever the first event said, the registry reflects it before
+			// the UI renders — a first turn must not race the install.
+			await follower.settled();
+			names = follower.names();
+			descriptors = offered;
+			// Kept live for the shim's /api/tools: the list below is a getter.
+			toolsNow = () => (follower.up() ? offered : []);
+		} else {
+			names = await client.installTools(payload, VM_ENDPOINT);
+			descriptors = offered;
+		}
 	} else if (options.device) {
 		// Both of these run before the shim, deliberately — see `deviceTools`.
 		device = await fetchDeviceConfig(options.device);
@@ -221,7 +323,9 @@ export async function mount(options: MountOptions = {}): Promise<Mounted> {
 		);
 	}
 
-	const uninstall = installFetchShim(client, { ...options, config, tools: descriptors });
+	// The tool list is read per request: with `onPower` it changes under
+	// the shim, and /api/tools must say what the model holds right now.
+	const uninstall = installFetchShim(client, { ...options, config, tools: toolsNow });
 	// Attachments in the transcript are `<img>` and `<a>`, which never reach
 	// the shim; see `serveAttachments`. Skipped where there is no document, as
 	// in the tests that drive the client directly.
@@ -234,6 +338,7 @@ export async function mount(options: MountOptions = {}): Promise<Mounted> {
 		tools: names,
 		device,
 		close() {
+			unwatchPower();
 			unwatch();
 			uninstall();
 			client.close();

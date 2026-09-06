@@ -5,4 +5,6 @@
 declare const __APP_VERSION__: string;
 declare const __BUILD_TIME__: string;
 declare const __SKILLS_REPO__: string;
+declare const __APPS_REPO__: string;
+declare const __APP_FRAME_URL__: string;
 declare const __DEFAULTS__: { baseUrl: string; model: string; apiKey: string };

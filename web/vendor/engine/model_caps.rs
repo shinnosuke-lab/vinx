@@ -68,7 +68,10 @@ const K3_MAX_COMPLETION_TOKENS: u32 = 131_072;
 /// model's accepted list is clamped instead of passed through.
 pub(crate) fn known_family(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    crate::client::is_glm(&m) || m.contains("kimi") || crate::client::is_kimi_k3(&m) || m.contains("deepseek")
+    crate::client::is_glm(&m)
+        || m.contains("kimi")
+        || crate::client::is_kimi_k3(&m)
+        || m.contains("deepseek")
 }
 
 /// Whether a GLM model accepts the `thinking={type:...}` request field:
@@ -108,46 +111,48 @@ pub fn model_caps(model: &str) -> ModelCaps {
     let vision = crate::client::model_supports_vision(model);
     let context_tokens = crate::context::model_context_tokens(model);
 
-    let (thinking, effort_levels, default_effort): (Thinking, &'static [&'static str], Option<&'static str>) =
-        if crate::client::is_glm(&m) {
-            match glm_version(&m) {
-                // glm-5.3+: forced thinking, low/high/max (other values error).
-                Some(v) if v >= (5, 3) => (Thinking::Forced, LOW_HIGH_MAX, Some("max")),
-                // glm-5.2: dynamic thinking; accepts low/high/max (server maps
-                // low→high, xhigh→max; none/minimal disable thinking).
-                Some((5, 2)) => (Thinking::Dynamic, LOW_HIGH_MAX, Some("max")),
-                // glm-5.1 / glm-5 / glm-5-turbo: reasoning_effort unsupported
-                // (only GLM-5.2 and above take the parameter).
-                Some(v) if v >= (5, 0) => (Thinking::Dynamic, &[], None),
-                // glm-4.7 / glm-4.5V force thinking; 4.5/4.6 are dynamic.
-                Some((4, 7)) => (Thinking::Forced, &[], None),
-                Some(v) if v >= (4, 5) => {
-                    if vision && v == (4, 5) {
-                        // glm-4.5V forces thinking (unlike text glm-4.5).
-                        (Thinking::Forced, &[], None)
-                    } else {
-                        (Thinking::Dynamic, &[], None)
-                    }
+    let (thinking, effort_levels, default_effort): (
+        Thinking,
+        &'static [&'static str],
+        Option<&'static str>,
+    ) = if crate::client::is_glm(&m) {
+        match glm_version(&m) {
+            // glm-5.3+: forced thinking, low/high/max (other values error).
+            Some(v) if v >= (5, 3) => (Thinking::Forced, LOW_HIGH_MAX, Some("max")),
+            // glm-5.2: dynamic thinking; accepts low/high/max (server maps
+            // low→high, xhigh→max; none/minimal disable thinking).
+            Some((5, 2)) => (Thinking::Dynamic, LOW_HIGH_MAX, Some("max")),
+            // glm-5.1 / glm-5 / glm-5-turbo: reasoning_effort unsupported
+            // (only GLM-5.2 and above take the parameter).
+            Some(v) if v >= (5, 0) => (Thinking::Dynamic, &[], None),
+            // glm-4.7 / glm-4.5V force thinking; 4.5/4.6 are dynamic.
+            Some((4, 7)) => (Thinking::Forced, &[], None),
+            Some(v) if v >= (4, 5) => {
+                if vision && v == (4, 5) {
+                    // glm-4.5V forces thinking (unlike text glm-4.5).
+                    (Thinking::Forced, &[], None)
+                } else {
+                    (Thinking::Dynamic, &[], None)
                 }
-                // Older GLM (< 4.5): no thinking field support at all.
-                _ => (Thinking::Unknown, &[], None),
             }
-        } else if crate::client::is_kimi_k3(&m) {
-            // K3 always reasons; top-level reasoning_effort low/high/max.
-            (Thinking::Forced, LOW_HIGH_MAX, Some("max"))
-        } else if m.contains("kimi") {
-            // K2.x: thinking toggle exists but reasoning_effort is unsupported.
-            (Thinking::Dynamic, &[], None)
-        } else if m.contains("deepseek") {
-            // v4: thinking on by default; effort low/high/max, default high
-            // (medium/xhigh are server-mapped to high).
-            (Thinking::Dynamic, LOW_HIGH_MAX, Some("high"))
-        } else {
-            (Thinking::Unknown, &[], None)
-        };
+            // Older GLM (< 4.5): no thinking field support at all.
+            _ => (Thinking::Unknown, &[], None),
+        }
+    } else if crate::client::is_kimi_k3(&m) {
+        // K3 always reasons; top-level reasoning_effort low/high/max.
+        (Thinking::Forced, LOW_HIGH_MAX, Some("max"))
+    } else if m.contains("kimi") {
+        // K2.x: thinking toggle exists but reasoning_effort is unsupported.
+        (Thinking::Dynamic, &[], None)
+    } else if m.contains("deepseek") {
+        // v4: thinking on by default; effort low/high/max, default high
+        // (medium/xhigh are server-mapped to high).
+        (Thinking::Dynamic, LOW_HIGH_MAX, Some("high"))
+    } else {
+        (Thinking::Unknown, &[], None)
+    };
 
-    let max_completion_tokens =
-        crate::client::is_kimi_k3(&m).then_some(K3_MAX_COMPLETION_TOKENS);
+    let max_completion_tokens = crate::client::is_kimi_k3(&m).then_some(K3_MAX_COMPLETION_TOKENS);
 
     ModelCaps {
         vision,

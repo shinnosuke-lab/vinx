@@ -26,7 +26,7 @@ export function Lightbox({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 animate-in fade-in-0 duration-100"
+      className="animate-fade-in fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
       onClick={onClose}
       role="dialog"
       aria-modal="true"

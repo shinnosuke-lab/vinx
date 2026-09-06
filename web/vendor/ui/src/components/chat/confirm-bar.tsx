@@ -2,8 +2,7 @@ import { useMemo, useState } from "react"
 import { AlertTriangle, ShieldCheck, X } from "lucide-react"
 import { Button } from "@agentchat/components/ui/button"
 import { t } from "@agentchat/lib/i18n"
-import { humanizeToolName } from "./tool-call-block"
-import { tryParseJson } from "./tools/shared"
+import { humanizeToolName, tryParseJson } from "./tools/shared"
 
 interface ConfirmBarProps {
   toolName: string
@@ -70,6 +69,13 @@ const CMD_TOOLS = new Set([
   "ssh_exec",
   "vinx_run",
 ])
+
+/** Command-style tools: the kernel's own plus any host bridge tool that follows
+ *  the `*_exec` / `*_run` / `*_shell` naming convention (their args carry a
+ *  `command`/`cmd` string, which is what the summary shows). */
+function isCmdTool(name: string): boolean {
+  return CMD_TOOLS.has(name) || /_(exec|run|shell)$/.test(name)
+}
 
 const WRITE_TOOLS = new Set([
   "write_file",
@@ -168,7 +174,7 @@ function getConfirmSummary(name: string, args: string): string | null {
     return parts.length > 0 ? parts.join(" · ") : null
   }
 
-  if (CMD_TOOLS.has(name)) {
+  if (isCmdTool(name)) {
     const cmd =
       (typeof parsed.command === "string" && parsed.command) ||
       (typeof parsed.cmd === "string" && parsed.cmd) ||
@@ -390,7 +396,7 @@ function ScheduleAuthorizeBar({
   }
 
   return (
-    <div className="bg-background px-4 pb-2 pt-1">
+    <div className="animate-rise-in bg-background px-4 pb-2 pt-1">
       <div className="mx-auto max-w-3xl">
         <div className="rounded-sm border border-border bg-card px-3 py-2.5">
           <div className="flex items-center gap-2">
@@ -505,7 +511,7 @@ export function ConfirmBar({
   const summary = getConfirmSummary(toolName, toolArgs)
 
   return (
-    <div className="bg-background px-4 pb-2 pt-1">
+    <div className="animate-rise-in bg-background px-4 pb-2 pt-1">
       <div className="mx-auto max-w-3xl">
         <div className="flex items-center gap-2 rounded-sm border border-border bg-card px-3 py-2">
           <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warning" />

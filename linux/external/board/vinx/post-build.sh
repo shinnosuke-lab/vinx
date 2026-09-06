@@ -10,6 +10,10 @@ mkdir -p "$target/usr/include" "$target/usr/lib/tcc"
 cp -a "$STAGING_DIR/usr/include/." "$target/usr/include/"
 install -m 644 "$STAGING_DIR/usr/lib/tcc/libtcc1.a" \
 	"$target/usr/lib/tcc/libtcc1.a"
+# The control plane's C client (system-v2 §6.10): the one static archive
+# that must survive finalize, so `tcc x.c -lvinxrpc` works on the target.
+install -m 644 "$STAGING_DIR/usr/lib/libvinxrpc.a" \
+	"$target/usr/lib/libvinxrpc.a"
 
 # vim ships without its runtime (BR2_PACKAGE_VIM_RUNTIME off), but the
 # unconditional `make installpack`/`installtools` still drop ~1.3 MB of

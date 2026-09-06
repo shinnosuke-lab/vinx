@@ -37,6 +37,14 @@ export const ICON_X = 'M18 6 6 18M6 6l12 12';
 /** lucide maximize-2 / minimize-2 — the screen window's other title button. */
 export const ICON_MAX = 'M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7';
 export const ICON_RESTORE = 'M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7';
+/** lucide power — the machine capsule's on/off switch. */
+export const ICON_POWER = 'M12 2v10M18.4 6.6a9 9 0 1 1-12.77.04';
+/** lucide droplet — the window's background-opacity cycler. */
+export const ICON_DROPLET =
+	'M12 22a7 7 0 0 0 7-7c0-2-1-3.9-3-5.5s-3.5-4-4-6.5c-.5 2.5-2 4.9-4 6.5C6 11.1 5 13 5 15a7 7 0 0 0 7 7z';
+/** lucide square-terminal — a PTY window (§6.9). */
+export const ICON_TERMINAL =
+	'm7 11 2-2-2-2M11 13h4M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z';
 /** lucide sparkles — the voice of "ask the assistant". */
 export const ICON_SPARK =
 	'M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z';

@@ -1,18 +1,25 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState, type RefObject } from "react"
 import {
   Check,
   ChevronRight,
   Clock,
+  Download,
   ExternalLink,
   Gauge,
   Loader2,
+  Printer,
   Sparkles,
   TriangleAlert,
-  X,
   XCircle,
 } from "lucide-react"
 import { cn } from "@agentchat/lib/utils"
 import { t, tf } from "@agentchat/lib/i18n"
+import { formatBudget } from "@agentchat/lib/duration"
+import {
+  deriveMessageTitle,
+  printSoloElementToPdf,
+  saveMarkdownFile,
+} from "@agentchat/lib/export"
 import { useChatRuntime } from "@agentchat/lib/chat-runtime"
 import { Markdown } from "../markdown"
 import { CopyButton, tryParseJson } from "./shared"
@@ -69,17 +76,59 @@ function formatLiveMs(ms: number): string {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
 }
 
+/** Markdown-download + print-to-PDF icon pair for one task block (prompt or
+ *  result), visually matching the sibling `CopyButton`. The PDF export prints
+ *  the block's rendered element in isolation (solo print rules hide the rest
+ *  of the transcript); the MD export saves the raw text. */
+function ExportButtons({
+  text,
+  elRef,
+  title,
+}: {
+  text: string
+  elRef: RefObject<HTMLElement | null>
+  title: string
+}) {
+  return (
+    <>
+      <button
+        onClick={(e) => {
+          e.stopPropagation()
+          saveMarkdownFile(text, title)
+        }}
+        className="shrink-0 rounded p-0.5 text-muted-foreground/40 transition-colors hover:text-muted-foreground"
+        title={t("saveAsMarkdown")}
+      >
+        <Download className="h-3 w-3" />
+      </button>
+      <button
+        onClick={(e) => {
+          e.stopPropagation()
+          if (elRef.current) printSoloElementToPdf(elRef.current, title)
+        }}
+        className="shrink-0 rounded p-0.5 text-muted-foreground/40 transition-colors hover:text-muted-foreground"
+        title={t("saveAsPdf")}
+      >
+        <Printer className="h-3 w-3" />
+      </button>
+    </>
+  )
+}
+
 /** Dedicated renderer for the `task` sub-agent tool. Header status row
- *  (state + elapsed + child settings), live activity + in-card cancel while
- *  running (fed by the chat runtime keyed on `callId`), the prompt collapsed
- *  behind a one-line entry, and the result report unpacked (markdown answer,
- *  error banner, deep link to the child transcript). */
+ *  (state + elapsed + child settings), live activity while running (fed by
+ *  the chat runtime keyed on `callId`; cancelling is the sub-task strip's job
+ *  above the composer — the card itself carries no controls), the prompt
+ *  collapsed behind a one-line entry, and the result report unpacked
+ *  (markdown answer, error banner, deep link to the child transcript). */
 export function TaskTool({ args, result, isRunning, callId }: ToolDisplayProps) {
   const [promptExpanded, setPromptExpanded] = useState(false)
   const runtime = useChatRuntime()
 
   const parsedArgs = tryParseJson(args)
   const prompt = typeof parsedArgs?.prompt === "string" ? parsedArgs.prompt.trim() : ""
+  const description =
+    typeof parsedArgs?.description === "string" ? parsedArgs.description.trim() : ""
   const skill = typeof parsedArgs?.skill === "string" ? parsedArgs.skill : ""
   const model = typeof parsedArgs?.model === "string" ? parsedArgs.model : ""
   const effort =
@@ -108,11 +157,29 @@ export function TaskTool({ args, result, isRunning, callId }: ToolDisplayProps) 
       : live?.startedAt !== undefined
         ? formatLiveMs(Date.now() - live.startedAt)
         : null
+  // Past the wall-clock budget while still running: normal for a short
+  // stretch (the child gets a wind-down grace), but worth flagging.
+  const overBudget =
+    running &&
+    timeoutSecs !== null &&
+    live?.startedAt !== undefined &&
+    Date.now() - live.startedAt > timeoutSecs * 1000
 
+  // Finished: the report names the persisted transcript. Running: the live
+  // `subagent` frames carry the child session id, so the link works while the
+  // child is still going (the sub-session view follows it in real time).
+  const transcriptSessionId = report?.transcript_session_id ?? live?.sessionId
   const transcriptHref =
-    report?.transcript_session_id && runtime?.sessionHref
-      ? runtime.sessionHref(report.transcript_session_id)
+    transcriptSessionId && runtime?.sessionHref
+      ? runtime.sessionHref(transcriptSessionId)
       : null
+
+  // Export targets: the prompt's <pre> and the result's rendered markdown.
+  // File names lead with the task's human label so a batch of exports from
+  // sibling tasks stays tellable apart.
+  const promptRef = useRef<HTMLPreElement>(null)
+  const resultRef = useRef<HTMLDivElement>(null)
+  const exportTitle = deriveMessageTitle(description || prompt)
 
   const badge = (icon: React.ReactNode, text: string, key: string, title?: string) => (
     <span
@@ -127,7 +194,7 @@ export function TaskTool({ args, result, isRunning, callId }: ToolDisplayProps) 
 
   return (
     <div className="mt-1 space-y-2.5 pb-1">
-      {/* Status row: state + elapsed + child settings; cancel on the right. */}
+      {/* Status row: state + elapsed + child settings. */}
       <div className="flex flex-wrap items-center gap-1">
         {running ? (
           <span className="inline-flex items-center gap-1 rounded-[3px] bg-primary/10 px-1.5 py-px text-[10px] text-primary">
@@ -153,23 +220,36 @@ export function TaskTool({ args, result, isRunning, callId }: ToolDisplayProps) 
             </span>
           )
         )}
-        {elapsed && badge(<Clock className="h-2.5 w-2.5" />, elapsed, "elapsed")}
+        {elapsed && (
+          <span
+            key="elapsed"
+            title={overBudget ? t("taskOverBudget") : undefined}
+            className={cn(
+              "inline-flex items-center gap-1 rounded-[3px] px-1.5 py-px text-[10px]",
+              overBudget ? "bg-warning/10 text-warning" : "bg-muted text-muted-foreground",
+            )}
+          >
+            <Clock className="h-2.5 w-2.5" />
+            {elapsed}
+          </span>
+        )}
         {skill && badge(<Sparkles className="h-2.5 w-2.5" />, skill, "skill")}
         {model && badge(null, model, "model")}
         {effort && badge(<Gauge className="h-2.5 w-2.5" />, effort, "effort")}
         {timeoutSecs !== null &&
-          badge(null, tf("taskTimeoutBadge", timeoutSecs), "timeout")}
-        {running && callId && runtime?.cancelTask && (
-          <button
-            onClick={() => runtime.cancelTask?.(callId)}
-            disabled={cancelling}
-            title={t("subagentCancel")}
-            className="ml-auto inline-flex items-center gap-1 rounded-[3px] px-1.5 py-px text-[10px] text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:pointer-events-none disabled:opacity-40"
-          >
-            <X className="h-2.5 w-2.5" />
-            {t("subagentCancel")}
-          </button>
-        )}
+          badge(
+            null,
+            tf("taskTimeoutBadge", formatBudget(timeoutSecs)),
+            "timeout",
+            // While running, hovering the budget answers the question the
+            // elapsed readout next to it raises: how much is left.
+            running && live?.startedAt !== undefined && !overBudget
+              ? tf(
+                  "taskTimeLeft",
+                  formatLiveMs(timeoutSecs * 1000 - (Date.now() - live.startedAt)),
+                )
+              : undefined,
+          )}
       </div>
 
       {/* Live activity: what the child is executing right now. */}
@@ -199,10 +279,22 @@ export function TaskTool({ args, result, isRunning, callId }: ToolDisplayProps) 
                 {tf("taskPromptChars", prompt.length.toLocaleString())}
               </span>
             </button>
-            {promptExpanded && <CopyButton text={prompt} />}
+            {promptExpanded && (
+              <div className="flex items-center gap-0.5">
+                <CopyButton text={prompt} />
+                <ExportButtons
+                  text={prompt}
+                  elRef={promptRef}
+                  title={`${exportTitle} · ${t("taskPromptLabel")}`}
+                />
+              </div>
+            )}
           </div>
           {promptExpanded && (
-            <pre className="mt-1 overflow-hidden whitespace-pre-wrap rounded-md bg-muted/30 px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground hover:overflow-auto">
+            <pre
+              ref={promptRef}
+              className="mt-1 overflow-hidden whitespace-pre-wrap rounded-md bg-muted/30 px-3 py-2 font-mono text-[11px] leading-relaxed text-muted-foreground hover:overflow-auto"
+            >
               {prompt}
             </pre>
           )}
@@ -222,9 +314,16 @@ export function TaskTool({ args, result, isRunning, callId }: ToolDisplayProps) 
             <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/50">
               {t("taskResultLabel")}
             </span>
-            <CopyButton text={report.result} />
+            <div className="flex items-center gap-0.5">
+              <CopyButton text={report.result} />
+              <ExportButtons
+                text={report.result}
+                elRef={resultRef}
+                title={`${exportTitle} · ${t("taskResultLabel")}`}
+              />
+            </div>
           </div>
-          <div className="rounded-md bg-muted/30 px-3 py-2">
+          <div ref={resultRef} className="rounded-md bg-muted/30 px-3 py-2">
             <Markdown content={report.result} className="text-xs" />
           </div>
         </div>

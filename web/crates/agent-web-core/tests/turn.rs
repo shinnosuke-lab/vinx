@@ -141,7 +141,11 @@ async fn a_turn_streams_prose_from_a_real_endpoint() {
     let h = Harness::against("mock-text");
 
     h.run("hi");
-    assert!(h.settled().await, "the turn never finished: {:?}", h.events());
+    assert!(
+        h.settled().await,
+        "the turn never finished: {:?}",
+        h.events()
+    );
 
     assert_eq!(
         h.text(),
@@ -156,6 +160,35 @@ async fn a_turn_streams_prose_from_a_real_endpoint() {
     assert!(!h.events().contains(&"error".to_string()));
 }
 
+/// Providers append a usage record after the last choice when asked for one;
+/// the engine reports it as its own frame, after the answer and before `done`,
+/// so the UI can show a turn's cost and the estimator can calibrate itself
+/// on the real `prompt_tokens`.
+#[wasm_bindgen_test]
+async fn token_usage_is_reported_after_the_answer() {
+    require_mock!();
+    let h = Harness::against("mock-text");
+
+    h.run("hi");
+    assert!(
+        h.settled().await,
+        "the turn never finished: {:?}",
+        h.events()
+    );
+
+    let usage = h.payloads("usage");
+    assert_eq!(usage.len(), 1, "exactly one usage frame per model round: {usage:?}");
+    assert_eq!(usage[0]["prompt_tokens"], 1234);
+    assert_eq!(usage[0]["completion_tokens"], 5);
+    // Nothing cached on this stream — reported as zero, not omitted.
+    assert_eq!(usage[0]["cached_tokens"], 0);
+    assert_eq!(usage[0]["model"], "mock-text");
+    let events = h.events();
+    let usage_at = events.iter().position(|e| e == "usage").unwrap();
+    let done_at = events.iter().rposition(|e| e == "done").unwrap();
+    assert!(usage_at < done_at, "usage must land before done: {events:?}");
+}
+
 /// The composer's picker sends its choice with the message rather than saving
 /// it, so the endpoint and key stay the configured ones and only the model
 /// changes. The mock keys its scenarios off the model name, which makes a turn
@@ -167,7 +200,11 @@ async fn a_turn_can_name_a_model_the_host_was_not_configured_with() {
     let h = Harness::against("mock-text");
 
     h.run_with("hi", r#"{"model":"mock-reasoning"}"#);
-    assert!(h.settled().await, "the turn never finished: {:?}", h.events());
+    assert!(
+        h.settled().await,
+        "the turn never finished: {:?}",
+        h.events()
+    );
     assert_eq!(
         h.text(),
         "answer",
@@ -213,10 +250,7 @@ async fn a_streamed_answer_is_persisted_and_replays_on_reattach() {
 
     let detail: serde_json::Value = serde_json::from_str(&h.host.session("chat").unwrap()).unwrap();
     let messages = detail["messages"].as_array().expect("a saved transcript");
-    let roles: Vec<&str> = messages
-        .iter()
-        .filter_map(|m| m["role"].as_str())
-        .collect();
+    let roles: Vec<&str> = messages.iter().filter_map(|m| m["role"].as_str()).collect();
     assert_eq!(
         roles,
         vec!["user", "assistant"],
@@ -270,7 +304,7 @@ async fn a_finished_turn_names_the_session_it_ran_in() {
     // the same check as above from the other side: what protects the rename is
     // that the title is no longer empty, not that a title was derived once.
     h.host
-        .update_session("chat", Some("device audit".into()), None)
+        .update_session("chat", Some("device audit".into()), None, None, None)
         .unwrap();
     h.host.detach("s1");
     h.frames.borrow_mut().clear();
@@ -428,7 +462,11 @@ async fn recall_result_is_intercepted_and_a_miss_is_structured() {
     let h = Harness::against("mock-recall-miss");
 
     h.run("recall something");
-    assert!(h.settled().await, "the turn never finished: {:?}", h.events());
+    assert!(
+        h.settled().await,
+        "the turn never finished: {:?}",
+        h.events()
+    );
 
     assert!(
         !h.events().contains(&"confirm".to_string()),
@@ -455,7 +493,11 @@ async fn update_task_state_is_intercepted_and_acknowledged() {
     let h = Harness::against("mock-task-state");
 
     h.run("work on something long");
-    assert!(h.settled().await, "the turn never finished: {:?}", h.events());
+    assert!(
+        h.settled().await,
+        "the turn never finished: {:?}",
+        h.events()
+    );
 
     assert!(
         !h.events().contains(&"confirm".to_string()),
@@ -470,6 +512,30 @@ async fn update_task_state_is_intercepted_and_acknowledged() {
     );
 }
 
+/// A block over the 2000-character target but under the 4000 cap is kept —
+/// refusing it would only make the model retry a slightly shorter one at the
+/// full price — and the ack says so, so the next write shrinks.
+#[wasm_bindgen_test]
+async fn an_over_target_task_state_is_accepted_with_a_nudge() {
+    require_mock!();
+    let h = Harness::against("mock-task-state-long");
+
+    h.run("work on something long");
+    assert!(
+        h.settled().await,
+        "the turn never finished: {:?}",
+        h.events()
+    );
+
+    let results = h.payloads("tool_result");
+    assert!(!results.is_empty(), "the call was never answered");
+    let body = results[0]["result"].as_str().unwrap_or_default();
+    assert!(
+        body.contains("Task state recorded") && body.contains("over the 2000"),
+        "accepted, but told to trim next time: {body}"
+    );
+}
+
 /// The intercepted synthetics must not bypass the consecutive-failure
 /// breaker: a model re-recalling the same missing call_id gets three
 /// structured misses, and the fourth identical call is [BLOCKED].
@@ -479,7 +545,11 @@ async fn a_repeatedly_missed_recall_trips_the_breaker() {
     let h = Harness::against("mock-recall-breaker");
 
     h.run("recall the same ghost forever");
-    assert!(h.settled().await, "the turn never finished: {:?}", h.events());
+    assert!(
+        h.settled().await,
+        "the turn never finished: {:?}",
+        h.events()
+    );
 
     let results = h.payloads("tool_result");
     assert_eq!(
@@ -521,6 +591,140 @@ async fn an_upstream_error_status_is_reported_on_the_stream() {
     );
 }
 
+/// vinx: the provider's overflow verdict (HTTP 400 `context_length_exceeded`)
+/// is not an error the user sees — the loop compacts what is OLDER than the
+/// live message (forced) and replays once. The turn ends in prose; the failed
+/// round left nothing behind; the compaction shows as a status, not as an
+/// error; the message that provoked the verdict is still in the history
+/// verbatim.
+#[wasm_bindgen_test]
+async fn a_context_overflow_verdict_compacts_and_replays_once() {
+    require_mock!();
+    let h = Harness::against("mock-overflow-once");
+
+    // History to shed: a first exchange the mock simply acknowledges.
+    let report = format!("Here is the report: {}", "lorem ipsum ".repeat(300));
+    h.run(&report);
+    assert!(h.settled().await, "the opening turn must settle");
+    assert_eq!(h.text(), "Noted.");
+    h.host.detach("s1");
+    h.frames.borrow_mut().clear();
+
+    h.run("does it overflow?");
+    assert!(h.settled().await, "the replayed turn must settle");
+
+    let events = h.events();
+    assert!(
+        !events.contains(&"error".to_string()),
+        "an overflow verdict must be absorbed by compaction, not surfaced: {events:?}"
+    );
+    assert_eq!(h.text(), "Fits now", "the replay's prose is the turn's answer");
+    let statuses: Vec<String> = h
+        .payloads("status")
+        .iter()
+        .filter_map(|p| p["text"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        statuses.iter().any(|t| t.starts_with("Compacting context")),
+        "the forced compaction must announce itself: {statuses:?}"
+    );
+    // The history now opens with the summary the mock's summarizer wrote —
+    // proof the replay went out over a compacted transcript, not a retry of
+    // the same bytes.
+    let session: serde_json::Value =
+        serde_json::from_str(&h.host.session("chat").expect("a session")).expect("a session document");
+    let history = session["messages"].as_array().expect("messages");
+    assert!(
+        history.iter().any(|m| m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("[Conversation Summary]"))),
+        "no summary in the persisted history: {history:?}"
+    );
+    assert!(
+        history.iter().any(|m| m["role"] == "user" && m["content"] == "does it overflow?"),
+        "the live message must survive the compaction verbatim: {history:?}"
+    );
+    assert!(
+        !history.iter().any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("Here is the report"))),
+        "the older exchange is what should have been summarized: {history:?}"
+    );
+}
+
+/// vinx: when the message that overflowed IS the live one and nothing older is
+/// left to shed, compaction cannot help — summarizing the message to a 500-char
+/// head would have the model answer a question it never saw. The verdict is
+/// surfaced instead (the user can shorten the message), the history is left
+/// intact, and the compaction reports itself as skipped rather than pretending.
+#[wasm_bindgen_test]
+async fn an_overflowing_message_is_refused_rather_than_summarized_away() {
+    require_mock!();
+    let h = Harness::against("mock-overflow-once");
+
+    let paste = format!("overflow test: {}", "lorem ipsum ".repeat(300));
+    h.run(&paste);
+    assert!(h.settled().await, "the refused turn must settle");
+
+    let events = h.events();
+    assert!(
+        events.contains(&"error".to_string()),
+        "with nothing older to shed the provider's verdict must surface: {events:?}"
+    );
+    let statuses: Vec<String> = h
+        .payloads("status")
+        .iter()
+        .filter_map(|p| p["text"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        statuses.iter().any(|t| t.contains("exceeds the model's context window")),
+        "the skipped compaction must say why: {statuses:?}"
+    );
+    let session: serde_json::Value =
+        serde_json::from_str(&h.host.session("chat").expect("a session")).expect("a session document");
+    let history = session["messages"].as_array().expect("messages");
+    assert!(
+        !history.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("[Conversation Summary]"))),
+        "the live message must not have been summarized away: {history:?}"
+    );
+    assert!(
+        history.iter().any(|m| m["role"] == "user" && m["content"] == paste),
+        "the user's message must be in the history verbatim: {history:?}"
+    );
+}
+
+/// The classifier behind that replay: status-gated, phrase-matched. A 200
+/// whose content merely talks about context length, or a 429 quoting a token
+/// limit, is not an overflow.
+#[wasm_bindgen_test]
+fn only_a_4xx_naming_the_context_limit_reads_as_overflow() {
+    use agent_web_core::client::error_is_context_overflow as overflow;
+    assert!(overflow(
+        "LLM API error: 400 Bad Request {\"error\":{\"code\":\"context_length_exceeded\"}}"
+    ));
+    assert!(overflow(
+        "LLM API error: 400 Bad Request {\"error\":{\"message\":\"Input exceeded model token limit\"}}"
+    ));
+    assert!(overflow(
+        "LLM API error: 413 Payload Too Large {\"error\":{\"message\":\"prompt is too long\"}}"
+    ));
+    assert!(overflow(
+        "LLM API error: 400 Bad Request {\"message\":\"The input token count (300000) exceeds the maximum\"}"
+    ));
+    assert!(!overflow("LLM API error: 429 Too Many Requests token limit reached, retry later"));
+    // Groq's tokens-per-minute overrun: same status family, same "too large"
+    // wording, but a rate limit — a wait, not a compaction.
+    assert!(!overflow(
+        "LLM API error: 413 Payload Too Large {\"error\":{\"message\":\"Request too large for model \
+         `llama-3.3-70b` in organization `org` on tokens per minute (TPM): Limit 6000, Requested 7001\",\
+         \"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}"
+    ));
+    assert!(!overflow("LLM API error: 400 Bad Request {\"error\":{\"message\":\"invalid temperature\"}}"));
+    assert!(!overflow("LLM API error: 401 Unauthorized bad key"));
+    assert!(!overflow("LLM stream ended before a terminal marker; maximum context length"));
+}
+
 #[wasm_bindgen_test]
 async fn a_rejected_key_is_reported_rather_than_retried_forever() {
     require_mock!();
@@ -552,7 +756,10 @@ async fn a_message_sent_during_a_turn_waits_and_then_runs() {
     let h = Harness::against("mock-slow");
 
     h.run("hi");
-    assert!(h.wait_for("content", 200).await, "the first turn never started");
+    assert!(
+        h.wait_for("content", 200).await,
+        "the first turn never started"
+    );
 
     let ack: serde_json::Value =
         serde_json::from_str(&h.host.send("chat", "and then this", r#"{"queue":true}"#)).unwrap();
@@ -593,6 +800,34 @@ async fn a_message_sent_during_a_turn_waits_and_then_runs() {
     assert_eq!(asked, vec!["hi", "and then this"]);
 }
 
+/// Stop must work while the upstream is still silent — before a single byte
+/// of the response, where nothing is streaming and no delta loop is polling
+/// the flag. The mock withholds its headers for 3s; a cancel at ~300ms has
+/// to close the turn well inside that, with no prose and no error.
+#[wasm_bindgen_test]
+async fn a_stop_during_the_wait_for_headers_ends_the_turn_at_once() {
+    require_mock!();
+    let h = Harness::against("mock-slow-headers");
+
+    h.run("hi");
+    wasmtimer::tokio::sleep(Duration::from_millis(300)).await;
+    let started = wasmtimer::std::Instant::now();
+    h.host.cancel("chat");
+
+    assert!(h.settled().await, "the cancelled turn never settled");
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(2000),
+        "stop waited for the upstream instead of aborting the request: {took:?}"
+    );
+    let events = h.events();
+    assert!(
+        events.contains(&"done".to_string()) && !events.contains(&"error".to_string()),
+        "a stop is a clean end, not a failure: {events:?}"
+    );
+    assert_eq!(h.text(), "", "nothing from the aborted request may leak through");
+}
+
 /// "Send now": the message joins the turn already running rather than waiting
 /// for it, and the model answers it in the same turn.
 #[wasm_bindgen_test]
@@ -630,7 +865,11 @@ async fn a_delegated_task_reports_back_from_a_hidden_transcript() {
     let h = Harness::against("mock-task");
 
     h.run("delegate something");
-    assert!(h.settled().await, "the turn never finished: {:?}", h.events());
+    assert!(
+        h.settled().await,
+        "the turn never finished: {:?}",
+        h.events()
+    );
 
     // The parent answers from the child's report and nothing else: the child's
     // context never joins the parent's, which is the point of delegating.
@@ -649,15 +888,47 @@ async fn a_delegated_task_reports_back_from_a_hidden_transcript() {
         h.events()
     );
     assert_eq!(subagent[0]["task_id"], "call_task_1");
+    // Every envelope names the task (its `description`) and the child's
+    // transcript session, so a viewer that missed the parent's tool_start can
+    // still title the progress row and deep-link to the live sub-session.
+    for frame in &subagent {
+        assert_eq!(frame["label"], "count to one", "unlabelled frame: {frame}");
+        assert!(
+            frame["session_id"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("task-")),
+            "frame without the child's session: {frame}"
+        );
+    }
 
-    // What the parent model was handed, and where the transcript went.
+    // What the parent model was handed, and where the transcript went. The
+    // parent stream resolves the task call exactly once: `run_batch` emits it
+    // as the child ends, and the loop must not repeat it.
+    let parent_results: Vec<_> = h
+        .payloads("tool_result")
+        .into_iter()
+        .filter(|r| r["id"] == "call_task_1")
+        .collect();
+    assert_eq!(
+        parent_results.len(),
+        1,
+        "the task call resolved {} times on the parent stream: {:?}",
+        parent_results.len(),
+        h.events()
+    );
     let report: serde_json::Value =
-        serde_json::from_str(h.payloads("tool_result")[0]["result"].as_str().unwrap()).unwrap();
+        serde_json::from_str(parent_results[0]["result"].as_str().unwrap()).unwrap();
     assert_eq!(report["ok"], true);
     assert_eq!(report["result"], "the child reporting in");
-    let transcript = report["transcript_session_id"].as_str().expect("a transcript id");
+    let transcript = report["transcript_session_id"]
+        .as_str()
+        .expect("a transcript id");
+    assert_eq!(
+        subagent[0]["session_id"], transcript,
+        "the envelopes and the report disagree on the child's session"
+    );
 
-    let sessions: serde_json::Value = serde_json::from_str(&h.host.sessions().unwrap()).unwrap();
+    let sessions: serde_json::Value = serde_json::from_str(&h.host.sessions(None).unwrap()).unwrap();
     let listed: Vec<&str> = sessions
         .as_array()
         .unwrap()
@@ -679,6 +950,36 @@ async fn a_delegated_task_reports_back_from_a_hidden_transcript() {
             .any(|m| m["content"].as_str() == Some("the child reporting in")),
         "the child's transcript was not persisted: {child}"
     );
+    // ...and titled with the task's label, not left as an untitled "New chat"
+    // (auto-titling only runs for user chats).
+    assert_eq!(
+        child["meta"]["title"], "count to one",
+        "the child's transcript was not titled: {child}"
+    );
+}
+
+/// The label a task rides under: its `description`, else the prompt's first
+/// line, capped at 80 chars.
+#[wasm_bindgen_test]
+fn a_task_is_labelled_by_description_then_prompt() {
+    use agent_web_core::agent_task::task_label;
+    let label = task_label(&serde_json::json!({
+        "description": "  count to one  ",
+        "prompt": "Count to one and report back.",
+    }));
+    assert_eq!(label, "count to one");
+
+    let label = task_label(&serde_json::json!({
+        "description": "",
+        "prompt": "\n  Summarise the log.\nThen stop.",
+    }));
+    assert_eq!(label, "Summarise the log.");
+
+    let long = "x".repeat(200);
+    let label = task_label(&serde_json::json!({ "prompt": long }));
+    assert_eq!(label.chars().count(), 80);
+
+    assert_eq!(task_label(&serde_json::json!({})), "");
 }
 
 #[wasm_bindgen_test]
@@ -689,13 +990,12 @@ async fn the_session_is_no_longer_running_once_the_turn_ends() {
     h.run("hi");
     assert!(h.settled().await);
 
-    let sessions: serde_json::Value = serde_json::from_str(&h.host.sessions().unwrap()).unwrap();
+    let sessions: serde_json::Value = serde_json::from_str(&h.host.sessions(None).unwrap()).unwrap();
     assert_eq!(
         sessions[0]["running"], false,
         "a finished turn must release the session, or the next send is refused"
     );
     // And the proof that it is released: another turn is accepted.
-    let ack: serde_json::Value =
-        serde_json::from_str(&h.host.send("chat", "again", "{}")).unwrap();
+    let ack: serde_json::Value = serde_json::from_str(&h.host.send("chat", "again", "{}")).unwrap();
     assert_eq!(ack["accepted"], true);
 }

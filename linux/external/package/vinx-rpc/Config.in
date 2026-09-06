@@ -1,0 +1,9 @@
+config BR2_PACKAGE_VINX_RPC
+	bool "vinx-rpc"
+	help
+	  The machine's control plane (docs/system-v2.zh-CN.md §6): rpcd
+	  holds /dev/ttyS3 exclusively and speaks VX1/VXA frames carrying
+	  a JSON-RPC subset to the hosting page; everything else in the
+	  guest reaches it over /run/vinx/rpc.sock. rund serves proc.run;
+	  rpc(1) is the CLI that js(1)/fetch(1) ride; libvinxrpc.a with
+	  vinx_rpc.h is the tcc-linkable client (§6.10).

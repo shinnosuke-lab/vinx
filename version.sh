@@ -19,6 +19,12 @@ NAME_VER=$NAME.$VER
 # keeps working either way.
 SKILLS_REPO=${SKILLS_REPO:-}
 
+# An apps repository (apps-hub): an index.json and the .vapp packages it
+# names. The page keeps only entries whose env lists "vinx" -- the hub
+# serves every runtime. Empty hides the Apps page's repository tab the
+# same way SKILLS_REPO does the skills market.
+APPS_REPO=${APPS_REPO:-}
+
 # What the page starts with when nobody has configured an endpoint: the
 # settings panel is seeded with this on first load and is authoritative
 # afterwards, so changing these does not move a browser that has already been

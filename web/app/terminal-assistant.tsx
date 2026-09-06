@@ -10,10 +10,11 @@
  *
  * What makes this assistant different from the main chat is one mount flag:
  * `console: true`. It briefs the model that the console on ttyS0 shares this
- * machine — the same filesystem and processes its own `run_shell` sees on
- * ttyS1 — so a file it writes is there at the person's prompt, and theirs is
- * there for it. Upstream's v1 assistant sits beside a PTY it cannot touch;
- * this one shares the box for real, because both lines are the same VM.
+ * machine — the same filesystem and processes its own `run_shell` reaches
+ * through proc.run on the control plane — so a file it writes is there at
+ * the person's prompt, and theirs is there for it. Upstream's v1 assistant
+ * sits beside a PTY it cannot touch; this one shares the box for real,
+ * because both lines are the same VM.
  *
  * The VM is the same instance the console booted (`sharedVm()`), so opening
  * the panel does not start a second Linux.
@@ -34,13 +35,18 @@ import { shareLocalFile, requestSnapshot } from './share-store';
 import { installBundledSkill } from './bundled-skill';
 import { guardRunningTurns, type LeaveGuard } from './leaving';
 import { RunShellTool } from './run-shell-tool';
+import { OpenFileTool } from './open-file-tool';
+import { InstallAppTool } from './install-app-tool';
+import { installWebApp } from './app-install';
 import { VM_TOOL_CARDS } from './vm-tool-cards';
+import { attachWorkspace } from './workspace-files';
 import { readTerminal } from './terminal-buffer';
 import { triggerDownload } from './downloads';
 import workerUrl from '../runtime/src/worker.ts?worker&url';
 
-/** Every VM tool drawn as itself, exactly as on the chat page. */
-const TOOL_CARDS = { run_shell: RunShellTool, ...VM_TOOL_CARDS };
+/** Every VM tool drawn as itself, exactly as on the chat page — and the
+ *  workspace's open_file and install_app, whose cards are Open buttons. */
+const TOOL_CARDS = { run_shell: RunShellTool, open_file: OpenFileTool, install_app: InstallAppTool, ...VM_TOOL_CARDS };
 
 /**
  * One engine per page, however many opens ask. The promise is the lock: a
@@ -53,7 +59,8 @@ function ensureEngine(): Promise<void> {
 		let leaving: LeaveGuard | null = null;
 		const agent = await mount({
 			workerUrl,
-			// The same Linux the console booted. run_shell rides its ttyS1.
+			// The same Linux the console booted. run_shell rides its ttyS3
+			// control plane.
 			vm: sharedVm(),
 			// One namespace for the whole page, so the panel's sessions land
 			// in the main page's history, marked by their origin.
@@ -65,6 +72,9 @@ function ensureEngine(): Promise<void> {
 			terminal: { read: readTerminal },
 			// download_file's way out of the VM.
 			download: triggerDownload,
+			// install_app lands a pure web app on this machine (/data/apps and
+			// its mirror); `app run` or the card opens its window here.
+			installApp: (app) => installWebApp(sharedVm(), app),
 			// run_js executes on this page's main thread; see app/hostcall.ts.
 			runJs,
 			// Attachments to the panel land in /data/share/local too, exactly as
@@ -84,6 +94,7 @@ function ensureEngine(): Promise<void> {
 		// A turn runs in this tab, so closing it stops the turn; same guard as
 		// the chat page.
 		leaving = guardRunningTurns(agent.client);
+		attachWorkspace(agent.client);
 		if (!agent.configured) console.info('no model endpoint yet — the panel will say so');
 		// Not awaited, as on the chat page: the panel can open while the
 		// Linux reference installs behind it.

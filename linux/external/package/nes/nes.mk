@@ -32,8 +32,11 @@ define NES_BUILD_CMDS
 		-o nes $(NES_SRCS) $(TARGET_LDFLAGS) -llua
 endef
 
+# /usr/libexec, not /usr/bin: the person's `nes` is the rootfs overlay's
+# sh wrapper, which routes through fb-run (one FB program at a time, stty
+# restored on every exit -- §10.5); this is the machine it runs.
 define NES_INSTALL_TARGET_CMDS
-	$(INSTALL) -D -m 755 $(@D)/nes $(TARGET_DIR)/usr/bin/nes
+	$(INSTALL) -D -m 755 $(@D)/nes $(TARGET_DIR)/usr/libexec/nes
 endef
 
 $(eval $(generic-package))

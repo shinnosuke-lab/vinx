@@ -27,13 +27,14 @@ use wasm_bindgen::prelude::*;
 use crate::agent_loop::{run_agent_turn, TurnParams};
 use crate::agent_task::{ConfirmRouter, TaskRunner};
 use crate::client::LlmClient;
+use crate::context::{fresh_context_state, SharedContextState};
 use crate::event::{AgentEvent, AskAnswer, AskUserResponse, ConfirmResponse};
 use crate::os::SafePathAllowList;
 use crate::skill::{
     prepare_user_skill_activation, resolve_active_skill, ActiveSkill, SkillAction, SkillRegistry,
 };
 use crate::sse;
-use crate::store::SessionStore;
+use crate::store::{SessionScope, SessionStore, MAX_CATEGORY_CHARS};
 use crate::tool::ToolRegistry;
 use crate::turn::{stage_turn, TurnLedger};
 use crate::types::{Attachment, ChatMessage, Role};
@@ -232,10 +233,19 @@ struct Inner {
     /// Per-session full-auto, shared with whatever loop is running so a toggle
     /// mid-turn applies to the next tool call.
     ///
-    /// Memory-only, as upstream's is: it dies with the page, never leaks to
-    /// another session, and is never persisted. That is why "always allow"
-    /// survives a second question in the same session but not a reload.
+    /// The live copy of `sessions.full_auto`: seeded from the store on first
+    /// use and written through on every flip (see `auto_flag` / `set_auto`),
+    /// which is what makes the badge survive a reload.
     auto: RefCell<HashMap<String, Arc<AtomicBool>>>,
+    /// Per-session context state the loop reads and writes across turns: the
+    /// Level-1 prune cut (held so the request prefix stays byte-identical
+    /// between rounds and the provider's prompt cache keeps hitting) and the
+    /// calibrated chars-per-token ratio. Memory-only by design — a reload
+    /// starts from a fresh estimate and re-plans the cut on the first request.
+    /// Reset whenever the history is rewritten under it (rewind, import) and
+    /// dropped with the session; the loop resets the cut itself after a
+    /// Level-2 compaction.
+    context: RefCell<HashMap<String, SharedContextState>>,
 }
 
 impl Inner {
@@ -250,22 +260,54 @@ impl Inner {
     ///
     /// Creating on demand is what lets the toggle be flipped before the first
     /// turn, which is when someone who already knows what they are doing flips
-    /// it.
+    /// it. A flag created for a session the store already knows starts from
+    /// the persisted value, so full-auto survives a reload; the store is the
+    /// resting place, this map the live copy the running turn reads.
+    /// The session's shared context state, created on first use.
+    fn context_state(&self, session_id: &str) -> SharedContextState {
+        self.context
+            .borrow_mut()
+            .entry(session_id.to_string())
+            .or_insert_with(fresh_context_state)
+            .clone()
+    }
+
+    /// Forget what the loop learned about a history that no longer exists in
+    /// that shape. Cheap to call when there is nothing to forget.
+    fn reset_context_state(&self, session_id: &str) {
+        self.context.borrow_mut().remove(session_id);
+    }
+
     fn auto_flag(&self, session_id: &str) -> Arc<AtomicBool> {
         self.auto
             .borrow_mut()
             .entry(session_id.to_string())
-            .or_default()
+            .or_insert_with(|| {
+                let persisted = self.store.full_auto(session_id).unwrap_or(false);
+                Arc::new(AtomicBool::new(persisted))
+            })
             .clone()
     }
 
+    /// Flip the flag and persist it. The write is a no-op for a session with
+    /// no row yet; `touch` carries the flag into the row the first turn
+    /// creates. Best effort: a failed write costs a reload's worth of memory,
+    /// not the turn.
+    fn set_auto(&self, session_id: &str, enabled: bool) {
+        self.auto_flag(session_id).store(enabled, Ordering::Relaxed);
+        let _ = self.store.set_full_auto(session_id, enabled);
+    }
+
     /// Whether full-auto is on, without creating a flag for a session nobody
-    /// has sent to. Reading is not a reason to remember the session.
+    /// has sent to. Reading is not a reason to remember the session; a session
+    /// not yet in the map answers with what the store remembers.
     fn auto_state(&self, session_id: &str) -> bool {
-        self.auto
+        let live = self
+            .auto
             .borrow()
             .get(session_id)
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            .map(|flag| flag.load(Ordering::Relaxed));
+        live.unwrap_or_else(|| self.store.full_auto(session_id).unwrap_or(false))
     }
 
     /// Streams currently watching a session, whether or not a turn is running.
@@ -465,8 +507,9 @@ impl AgentHost {
     /// names that were registered, so the caller can see what was rejected
     /// rather than wondering why the model never calls something.
     ///
-    /// Registering the same tool twice is refused by the registry, so this is
-    /// not idempotent — call it once, at startup.
+    /// The registry replaces on collision, so installing again after the
+    /// machine reboots is fine; pair each install with `uninstall_tools` when
+    /// the machine goes away so the workspace tools return.
     #[wasm_bindgen(js_name = installTools)]
     pub fn install_tools(&self, payload: &str, endpoint: &str) -> Result<Vec<String>, JsValue> {
         let payload: crate::tools::ToolsPayload = serde_json::from_str(payload)
@@ -477,16 +520,29 @@ impl AgentHost {
         }
         let installed = crate::tools::install(&self.inner.registry, payload, endpoint.to_string());
         // A device that ships read_file and write_file has taken the file-tool
-        // names over (the registry replaces on collision). The two vfs-only
+        // names over (the registry replaces on collision). The vfs-only
         // survivors would keep a second, invisible filesystem in the model's
         // toolbox — with the device present the workspace is UI plumbing, not
         // model surface — so they retire, and the briefing switches stories.
+        // download_file / open_file / install_app are on that list only when
+        // the device did not bring its own: if it did, the name already points
+        // at the device's. (The VM has download_file; for open_file it has
+        // open(1), for install_app the `app` CLI.)
         let owns = ["read_file", "write_file"]
             .iter()
             .all(|n| installed.iter().any(|i| i == n));
         if owns {
-            self.inner.registry.unregister("list_files");
-            self.inner.registry.unregister("search_files");
+            for name in [
+                "list_files",
+                "search_files",
+                "download_file",
+                "open_file",
+                "install_app",
+            ] {
+                if !installed.iter().any(|i| i == name) {
+                    self.inner.registry.unregister(name);
+                }
+            }
         }
         self.inner.device_owns_files.set(owns);
         // Now that every tool is registered, a skill declaring `allowed-tools`
@@ -497,6 +553,73 @@ impl AgentHost {
             .skills
             .set_known_tools(self.inner.registry.names());
         Ok(installed)
+    }
+
+    /// Take the device's capabilities back — the inverse of `install_tools`,
+    /// for a device that comes and goes (the in-page machine the user may
+    /// leave powered off). Every named tool leaves the registry, the
+    /// workspace tools that a device owning read_file/write_file had retired
+    /// (list_files, search_files, the workspace's download_file) come back,
+    /// and the device's briefing is dropped so the next turn's system message
+    /// stops describing a machine the model cannot reach. The turn in flight
+    /// keeps the definitions it already took; the next one reads the registry
+    /// afresh (see `send`).
+    #[wasm_bindgen(js_name = uninstallTools)]
+    pub fn uninstall_tools(&self, names: Vec<String>) -> Vec<String> {
+        let mut removed = Vec::new();
+        for name in names {
+            if self.inner.registry.unregister(&name) {
+                removed.push(name);
+            }
+        }
+        if self.inner.device_owns_files.get() {
+            let safe_paths = self.inner.safe_paths.clone();
+            crate::files::install(&self.inner.registry, safe_paths);
+            self.inner.device_owns_files.set(false);
+        }
+        self.inner.system_prompt.borrow_mut().clear();
+        self.inner
+            .skills
+            .set_known_tools(self.inner.registry.names());
+        removed
+    }
+
+    /// Install the page's half of the workspace `download_file`: a
+    /// `(filename: string, bytes: Uint8Array) => void` the tool calls with a
+    /// file the person asked for. The engine runs in a worker, which cannot
+    /// click an `<a download>`; the function is expected to post the bytes to
+    /// the main thread, which can (see `runtime/src/worker.ts`). Pass
+    /// `undefined` to take it back. Without one the tool reports that this
+    /// page cannot hand files over, rather than pretending it did.
+    #[wasm_bindgen(js_name = setDownloader)]
+    pub fn set_downloader(&self, downloader: Option<js_sys::Function>) {
+        crate::files::set_downloader(downloader);
+    }
+
+    /// The page's half of the workspace `open_file`: the bytes behind a path
+    /// the model offered, for the Open button on that call's card to hand to
+    /// the browser at click time. A bare filename names a draft, as it did
+    /// for the model. `None` when the workspace has no such file any more
+    /// (or it is a directory, or over the hand-over cap) — the card says so
+    /// instead of opening an empty tab. Vetted the same way as `download_file`,
+    /// so the page can show nothing the model could not have sent.
+    #[wasm_bindgen(js_name = readWorkspaceFile)]
+    pub fn read_workspace_file(&self, path: &str) -> Option<Vec<u8>> {
+        crate::files::read_for_person(path)
+    }
+
+    /// Install the page's half of the workspace `install_app`: an
+    /// `(app: {id, title?, description?, html, css?, js?}) => Promise<string>`
+    /// (the parts as Uint8Arrays) that puts a pure web app on the Apps page and
+    /// resolves with the line the model should read — or rejects with the
+    /// refusal, in the machine's own finding codes. The engine runs in a
+    /// worker, which has neither the machine's mirror nor the Apps page; the
+    /// function is expected to post the parts to the main thread and await
+    /// its answer (see `runtime/src/worker.ts`). Pass `undefined` to take it
+    /// back. Without one the tool reports that this page cannot install apps.
+    #[wasm_bindgen(js_name = setAppInstaller)]
+    pub fn set_app_installer(&self, installer: Option<js_sys::Function>) {
+        crate::files::set_app_installer(installer);
     }
 
     /// Every tool the model currently holds, in registration order — the
@@ -586,7 +709,13 @@ impl AgentHost {
 
     /// Keep the look currently on screen under a name.
     #[wasm_bindgen(js_name = saveTheme)]
-    pub fn save_theme(&self, name: &str, css: &str, js: &str, session_id: Option<String>) -> String {
+    pub fn save_theme(
+        &self,
+        name: &str,
+        css: &str,
+        js: &str,
+        session_id: Option<String>,
+    ) -> String {
         crate::answer::envelope(
             crate::themes::save(name, css, js, session_id.as_deref()).map(|()| Empty {}),
         )
@@ -746,8 +875,10 @@ impl AgentHost {
         };
         messages.truncate(cut);
 
-        // Anything parked was written against the context that just went away.
+        // Anything parked was written against the context that just went away,
+        // and so was the prune cut.
         inner.queued.borrow_mut().remove(session_id);
+        inner.reset_context_state(session_id);
         let skill = crate::turn::replay_skill_marker(&messages)
             .and_then(|name| resolve_active_skill(&inner.skills, &name, false).ok());
         if let Err(e) = inner.store.save(
@@ -822,16 +953,16 @@ impl AgentHost {
             .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok());
         let response = match (approved, approve_all) {
             (true, true) => ConfirmResponse::ApproveAll,
-            (true, false) => ConfirmResponse::Approve { amended_args: amended },
+            (true, false) => ConfirmResponse::Approve {
+                amended_args: amended,
+            },
             (false, _) => ConfirmResponse::Deny,
         };
         // Flipped here as well as inside the loop, which also flips it on
         // receipt: a client that reads session state right after this POST has
         // to already see the badge it just turned on.
         if approved && approve_all {
-            self.inner
-                .auto_flag(session_id)
-                .store(true, Ordering::Relaxed);
+            self.inner.set_auto(session_id, true);
         }
         if let Some(turn) = self.inner.turns.borrow().get(session_id) {
             if let Some(id) = call_id.as_deref() {
@@ -850,9 +981,7 @@ impl AgentHost {
     /// next tool call rather than the next turn.
     #[wasm_bindgen(js_name = setAuto)]
     pub fn set_auto(&self, session_id: &str, enabled: bool) {
-        self.inner
-            .auto_flag(session_id)
-            .store(enabled, Ordering::Relaxed);
+        self.inner.set_auto(session_id, enabled);
     }
 
     // ── the write/edit allow-list, mirroring /api/safe-paths ──
@@ -999,6 +1128,47 @@ impl AgentHost {
         edited
     }
 
+    /// "Send now" for a message that is ALREADY parked (`POST
+    /// /api/chat/queue/promote`): move it to the queue front and tell the
+    /// running turn to wind down — the same machinery as `cancel`, except the
+    /// queue survives — so the pump starts it the moment the turn ends. Same
+    /// semantics as a `send` with `interrupt: true`, minus the re-send: the
+    /// item's attachments and model override ride along untouched.
+    ///
+    /// Answers whether `id` named a parked message; `false` means it was
+    /// already started by the drain or removed by another tab, and the UI
+    /// resolves that from the next `queue` snapshot. Whether a running turn
+    /// had to be interrupted is not something the caller can act on, so it is
+    /// not reported.
+    #[wasm_bindgen(js_name = queuePromote)]
+    pub fn queue_promote(&self, session_id: &str, id: f64) -> bool {
+        let id = id as u64;
+        let promoted = {
+            let mut queued = self.inner.queued.borrow_mut();
+            queued.get_mut(session_id).is_some_and(|q| {
+                match q.iter().position(|i| i.id == id) {
+                    Some(0) => true,
+                    Some(pos) => {
+                        if let Some(item) = q.remove(pos) {
+                            q.push_front(item);
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            })
+        };
+        if !promoted {
+            return false;
+        }
+        self.inner.publish_queue(session_id);
+        if let Some(turn) = self.inner.turns.borrow().get(session_id) {
+            turn.cancel.store(true, Ordering::Relaxed);
+            turn.router.deny_all();
+        }
+        true
+    }
+
     // ── session management, mirroring /api/sessions ──
 
     /// How many turns are running, across every session.
@@ -1014,8 +1184,17 @@ impl AgentHost {
         self.inner.turns.borrow().len()
     }
 
-    pub fn sessions(&self) -> Result<String, JsValue> {
-        let mut rows = self.inner.store.list().map_err(err)?;
+    /// `scope` is the `GET /api/sessions?scope=` value: `active` (default,
+    /// also for `None`/blank) | `archived` | `all`; anything else is an
+    /// error the shim turns into a 400.
+    pub fn sessions(&self, scope: Option<String>) -> Result<String, JsValue> {
+        let scope = match scope.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => SessionScope::Active,
+            Some(raw) => SessionScope::parse(raw).ok_or_else(|| {
+                JsValue::from_str("invalid_scope: scope must be one of: active, archived, all")
+            })?,
+        };
+        let mut rows = self.inner.store.list_scoped(scope).map_err(err)?;
         // The store cannot know which turns are live; the host can.
         let turns = self.inner.turns.borrow();
         for row in &mut rows {
@@ -1029,6 +1208,10 @@ impl AgentHost {
         let Some((title, created_at, updated_at, active_skill, messages)) = detail else {
             return Ok("null".to_string());
         };
+        // Organisation flags off the listing row, so a resumed session shows
+        // its category / pin / archive state in the chat header without a
+        // second round-trip through the sessions list.
+        let flags = self.inner.store.flags(id).map_err(err)?.unwrap_or_default();
         // Split into `meta` and `messages` because that is the shape the UI
         // destructures: it reads `detail.meta.title` and friends, and a flat
         // object leaves it loading a transcript under a session whose title,
@@ -1042,13 +1225,21 @@ impl AgentHost {
                 "active_skill": active_skill,
                 "auto_confirm": self.inner.auto_state(id),
                 "running": self.inner.turns.borrow().contains_key(id),
+                "pinned": flags.pinned,
+                "archived_at": flags.archived_at,
+                "category": flags.category,
             },
             "messages": messages,
         }))
         .map_err(err)
     }
 
-    pub fn search(&self, query: &str, limit: usize, exclude: Option<String>) -> Result<String, JsValue> {
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        exclude: Option<String>,
+    ) -> Result<String, JsValue> {
         let hits = self
             .inner
             .store
@@ -1099,17 +1290,46 @@ impl AgentHost {
             .is_some_and(|t| t.router.cancel_task(task_id))
     }
 
+    /// `PATCH /api/sessions/{id}`: every field optional, absent = unchanged.
+    /// `archived: true` hides the session from default listings (and clears
+    /// its pin); `false` restores it. `category` is a tri-state squeezed
+    /// through the JS boundary: `None` = unchanged, `Some("")` = clear (the
+    /// shim maps JSON `null` to it), otherwise a label of at most
+    /// [`MAX_CATEGORY_CHARS`] characters — longer is rejected before anything
+    /// is written, so a bad request is a no-op.
     #[wasm_bindgen(js_name = updateSession)]
     pub fn update_session(
         &self,
         id: &str,
         title: Option<String>,
         pinned: Option<bool>,
+        archived: Option<bool>,
+        category: Option<String>,
     ) -> Result<(), JsValue> {
-        self.inner
-            .store
-            .update(id, title.as_deref(), pinned)
-            .map_err(err)
+        let category = category.map(|c| c.trim().to_string());
+        if let Some(c) = &category {
+            if c.chars().count() > MAX_CATEGORY_CHARS {
+                return Err(JsValue::from_str(&format!(
+                    "invalid_category: category must be at most {MAX_CATEGORY_CHARS} characters"
+                )));
+            }
+        }
+        if title.is_some() || pinned.is_some() {
+            self.inner
+                .store
+                .update(id, title.as_deref(), pinned)
+                .map_err(err)?;
+        }
+        if let Some(archived) = archived {
+            self.inner.store.set_archived(id, archived).map_err(err)?;
+        }
+        if let Some(c) = category {
+            self.inner
+                .store
+                .set_category(id, Some(c.as_str()).filter(|c| !c.is_empty()))
+                .map_err(err)?;
+        }
+        Ok(())
     }
 
     /// Write a session's transcript directly, without running a turn.
@@ -1129,6 +1349,7 @@ impl AgentHost {
             ));
         }
         let messages: Vec<ChatMessage> = serde_json::from_str(messages_json).map_err(err)?;
+        self.inner.reset_context_state(id);
         self.inner
             .store
             .save(id, &messages, "web", None)
@@ -1143,12 +1364,21 @@ impl AgentHost {
         // Whatever was allowed applied to this conversation. A new session that
         // reused the id must start by asking again.
         self.inner.auto.borrow_mut().remove(id);
+        self.inner.context.borrow_mut().remove(id);
         self.inner.store.delete(id).map_err(err)
     }
 }
 
 impl AgentHost {
     fn over(sink: Sink, store: SessionStore) -> AgentHost {
+        Self::over_shared(sink, Arc::new(store))
+    }
+
+    /// Build a host over a store that outlives it. Not a JS entry point: it
+    /// is how a test stages a reload — one host writes, a second one over the
+    /// same store must find what the first one left — without a real database
+    /// file to reopen.
+    pub fn over_shared(sink: Sink, store: Arc<SessionStore>) -> AgentHost {
         let registry = Arc::new(ToolRegistry::new());
         let safe_paths = Arc::new(SafePathAllowList::new(Some(std::path::PathBuf::from(
             crate::files::SAFE_PATHS,
@@ -1162,8 +1392,7 @@ impl AgentHost {
         let skills = crate::skills::install(&registry);
         crate::themes::install(&registry);
         // Session retrieval needs the store the sessions live in, so the Arc
-        // is built here and shared with Inner.
-        let store = Arc::new(store);
+        // is shared with Inner.
         crate::session_tools::install(&registry, store.clone());
 
         AgentHost {
@@ -1185,6 +1414,7 @@ impl AgentHost {
                 next_queue_id: std::cell::Cell::new(0),
                 attached: RefCell::new(HashMap::new()),
                 auto: RefCell::new(HashMap::new()),
+                context: RefCell::new(HashMap::new()),
             }),
         }
     }
@@ -1222,7 +1452,9 @@ fn turn_client(inner: &Inner, model: Option<&str>) -> Option<LlmClient> {
 #[wasm_bindgen(js_name = openHost)]
 pub async fn open(sink: Sink, namespace: Option<String>) -> Result<AgentHost, JsValue> {
     report_to_console();
-    let store = crate::storage::open(namespace.as_deref()).await.map_err(err)?;
+    let store = crate::storage::open(namespace.as_deref())
+        .await
+        .map_err(err)?;
 
     // Not fatal, and deliberately so: the workspace holds skills and uploads,
     // and a tab that can still hold a conversation is worth more than one that
@@ -1338,7 +1570,10 @@ fn snapshot(inner: &Inner, stream_id: &str, session_id: &str) {
             stream_id,
             &sse::frame(
                 "status",
-                serde_json::json!({ "text": "earlier output trimmed / 早期输出已截略" }),
+                serde_json::json!({
+                    "code": "tail_trimmed",
+                    "text": "earlier output trimmed / 早期输出已截略"
+                }),
             ),
         );
     }
@@ -1522,7 +1757,10 @@ fn start_turn(inner: &Rc<Inner>, session_id: &str, start: TurnStart) -> serde_js
     // override on top. `with_reasoning_effort` is only called when there is
     // something to say — called with `None` it would CLEAR the profile default.
     let configured_effort = inner.reasoning_effort.borrow().clone();
-    let llm = if reasoning_effort.as_deref().is_some_and(|e| !e.trim().is_empty()) {
+    let llm = if reasoning_effort
+        .as_deref()
+        .is_some_and(|e| !e.trim().is_empty())
+    {
         llm.with_reasoning_effort(reasoning_effort.clone())
     } else if !configured_effort.is_empty() {
         llm.with_reasoning_effort(Some(configured_effort))
@@ -1532,8 +1770,12 @@ fn start_turn(inner: &Rc<Inner>, session_id: &str, start: TurnStart) -> serde_js
 
     // Make the session real before the turn produces anything, so it shows up in
     // the sidebar as soon as the user hits send rather than when the answer
-    // finishes arriving.
-    let _ = inner.store.touch(session_id, &origin);
+    // finishes arriving. Carries the full-auto flag along so a toggle flipped
+    // before this first turn lands in the row it creates.
+    let auto = inner.auto_flag(session_id);
+    let _ = inner
+        .store
+        .touch(session_id, &origin, auto.load(Ordering::Relaxed));
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
@@ -1541,7 +1783,6 @@ fn start_turn(inner: &Rc<Inner>, session_id: &str, start: TurnStart) -> serde_js
     let (steer_tx, steer_rx) = mpsc::unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let router = ConfirmRouter::new();
-    let auto = inner.auto_flag(session_id);
 
     inner.turns.borrow_mut().insert(
         session_id.to_string(),
@@ -1566,7 +1807,13 @@ fn start_turn(inner: &Rc<Inner>, session_id: &str, start: TurnStart) -> serde_js
         snapshot(inner, &stream, session_id);
     }
 
-    let mut params = TurnParams::new(llm.clone(), inner.registry.clone(), staged.snapshot, event_tx, confirm_rx);
+    let mut params = TurnParams::new(
+        llm.clone(),
+        inner.registry.clone(),
+        staged.snapshot,
+        event_tx,
+        confirm_rx,
+    );
     params.ask_user_rx = Some(ask_rx);
     params.steer_rx = Some(steer_rx);
     params.cancel_flag = cancel;
@@ -1575,6 +1822,7 @@ fn start_turn(inner: &Rc<Inner>, session_id: &str, start: TurnStart) -> serde_js
     params.active_skill = staged.skill_seed.clone();
     params.session_id = Some(session_id.to_string());
     params.store = Some(inner.store.clone());
+    params.context_state = Some(inner.context_state(session_id));
     // Sub-agents get the same tools, the same skills and the same approval
     // mode as the turn that delegated to them. What they do not get is a
     // runner of their own, which is the depth cap: `task` is only advertised

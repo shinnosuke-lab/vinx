@@ -12,11 +12,12 @@ import {
 } from "lucide-react"
 import { Button } from "@agentchat/components/ui/button"
 import { Separator } from "@agentchat/components/ui/separator"
-import { EffortBadge, ModelBadge } from "@agentchat/components/chat/model-icon"
+import { ModelBadge, TuningBadge } from "@agentchat/components/chat/model-icon"
 import { SkillIcon } from "@agentchat/components/shared/skill-icon"
 import { cn } from "@agentchat/lib/utils"
 import { t } from "@agentchat/lib/i18n"
 import type { SkillInfo } from "@agentchat/types"
+import type { CatalogParameterDefinition } from "@agentchat/client"
 
 interface ChatInputProps {
   value: string
@@ -42,6 +43,18 @@ interface ChatInputProps {
   defaultEffort?: string | null
   /** Switch the reasoning effort for this session ("" = back to default). */
   onSelectEffort?: (effort: string) => void
+  /** Model-parameter definitions of the CURRENT model (structured catalog).
+   *  Non-empty replaces the effort badge with one chip per definition. */
+  parameterDefinitions?: CatalogParameterDefinition[]
+  /** Selected parameter values by definition id ("" / absent = default). */
+  selectedParameters?: Record<string, string>
+  /** Change one parameter value for this session ("" = back to default). */
+  onSelectParameter?: (id: string, value: string) => void
+  /** The current model supports a max mode: show the Max toggle chip. */
+  supportsMaxMode?: boolean
+  /** Max mode is on for this session. */
+  maxMode?: boolean
+  onToggleMaxMode?: (on: boolean) => void
   /** Skills for the `/` command palette (manual-invocable only are shown). */
   skills?: SkillInfo[]
   /** Icon URL resolver for palette rows and the pending-skill chip. */
@@ -60,10 +73,19 @@ interface ChatInputProps {
   /** Session full-auto is ON: show the red badge next to the action button
    *  and render the stop button in the destructive color. */
   autoConfirm?: boolean
-  /** Badge click: turn session full-auto off. */
-  onAutoConfirmOff?: () => void
+  /** Toggle click: switch session full-auto on or off. When provided, the
+   *  badge is a two-state toggle — a muted hollow pill while off (so a fresh
+   *  chat can opt in before the first confirmation prompt) and the red badge
+   *  while on. Without it the badge is display-only. */
+  onAutoConfirmChange?: (enabled: boolean) => void
+  /** Hide the "off" state of the toggle (only the red badge shows when on).
+   *  For surfaces that cannot apply an opt-in yet, e.g. before a session
+   *  exists. Default `true`. */
+  canEnableAutoConfirm?: boolean
   /** Attachments staged for the next message (chips above the textarea). An
-   *  entry without `id` is still uploading and blocks send. */
+   *  entry without `id` is still uploading and blocks send. `previewUrl` is
+   *  an object URL for a file picked in this page, or the server copy for a
+   *  chip restored from a saved draft. */
   attachments?: {
     key: number
     name: string
@@ -74,6 +96,9 @@ interface ChatInputProps {
   }[]
   onAddFiles?: (files: File[]) => void
   onRemoveUpload?: (key: number) => void
+  /** An image chip's preview failed to load — for a chip restored from a
+   *  saved draft that means the upload is gone from the server. */
+  onPreviewError?: (key: number) => void
   /** Open the image lightbox (image chips zoom on click). */
   onPreview?: (src: string, alt?: string) => void
   /** Enable typing while a turn streams: Enter/send parks the message in the
@@ -182,6 +207,12 @@ export function ChatInput({
   selectedEffort,
   defaultEffort,
   onSelectEffort,
+  parameterDefinitions,
+  selectedParameters,
+  onSelectParameter,
+  supportsMaxMode,
+  maxMode,
+  onToggleMaxMode,
   skills,
   skillIconUrl,
   pendingSkill,
@@ -191,10 +222,12 @@ export function ChatInput({
   onPendingSkillChange,
   onResetSkill,
   autoConfirm,
-  onAutoConfirmOff,
+  onAutoConfirmChange,
+  canEnableAutoConfirm = true,
   attachments,
   onAddFiles,
   onRemoveUpload,
+  onPreviewError,
   onPreview,
   queueEnabled,
   onSendNow,
@@ -420,7 +453,8 @@ export function ChatInput({
 
   const palette = paletteOpen ? (
     <div
-      className="absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-md border border-border bg-card shadow-md animate-in fade-in-0 zoom-in-95 duration-100 sm:w-[34rem] sm:max-w-[calc(100vw-2rem)]"
+      data-side="top"
+      className="acc-pop absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-md border border-border bg-card shadow-md sm:w-[34rem] sm:max-w-[calc(100vw-2rem)]"
       // Keep textarea focus when clicking an item.
       onMouseDown={(e) => e.preventDefault()}
     >
@@ -531,10 +565,12 @@ export function ChatInput({
               src={up.previewUrl}
               alt={up.name}
               onClick={() => onPreview?.(up.previewUrl as string, up.name)}
+              onError={() => onPreviewError?.(up.key)}
               className="h-full w-full cursor-zoom-in object-cover"
             />
           ) : (
-            // objectURL tab = browser-native preview (txt/pdf render in place).
+            // Object URL tab = browser-native preview (txt/pdf render in
+            // place); a restored chip's server URL downloads instead.
             <button
               type="button"
               onClick={() => up.previewUrl && window.open(up.previewUrl, "_blank")}
@@ -651,18 +687,34 @@ export function ChatInput({
     </Button>
   )
 
-  // Session full-auto badge, docked left of the action button so it reads as
-  // one "auto mode" cluster with the (now red) stop control. Click = off.
+  // Session full-auto toggle, docked left of the action button so it reads as
+  // one "auto mode" cluster with the (red, when on) stop control. On = red
+  // live badge, click turns it off; off = muted hollow pill, click opts in —
+  // so a fresh chat can start in full-auto without waiting for the first
+  // confirmation prompt.
   const autoBadge = autoConfirm ? (
     <button
       type="button"
-      onClick={onAutoConfirmOff}
-      title={t("fullAutoBadgeHint")}
-      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-sm border border-destructive/50 bg-destructive/10 px-1.5 text-[10px] font-medium leading-none text-destructive transition-colors hover:bg-destructive/20"
+      onClick={onAutoConfirmChange ? () => onAutoConfirmChange(false) : undefined}
+      disabled={!onAutoConfirmChange}
+      aria-pressed={true}
+      title={onAutoConfirmChange ? t("fullAutoBadgeHint") : t("fullAutoBadge")}
+      className="animate-pop-in inline-flex h-6 shrink-0 items-center gap-1 rounded-sm border border-destructive/50 bg-destructive/10 px-1.5 text-[10px] font-medium leading-none text-destructive transition-colors hover:bg-destructive/20 disabled:cursor-default disabled:hover:bg-destructive/10"
     >
-      <span className="h-1.5 w-1.5 rounded-full bg-destructive" />
+      <span className="acc-live-dot h-1.5 w-1.5 rounded-full bg-destructive" />
       {t("fullAutoBadge")}
-      <X className="h-2.5 w-2.5" />
+      {onAutoConfirmChange && <X className="h-2.5 w-2.5" />}
+    </button>
+  ) : onAutoConfirmChange && canEnableAutoConfirm ? (
+    <button
+      type="button"
+      onClick={() => onAutoConfirmChange(true)}
+      aria-pressed={false}
+      title={t("fullAutoEnableHint")}
+      className="inline-flex h-6 shrink-0 items-center gap-1 rounded-sm border border-dashed border-border px-1.5 text-[10px] font-medium leading-none text-muted-foreground/60 transition-colors hover:border-destructive/40 hover:bg-destructive/5 hover:text-destructive"
+    >
+      <span className="h-1.5 w-1.5 rounded-full border border-current" />
+      {t("fullAutoBadge")}
     </button>
   ) : null
 
@@ -715,11 +767,17 @@ export function ChatInput({
                 onSelect={onSelectModel}
                 disabled={streaming}
               />
-              <EffortBadge
-                levels={effortLevels ?? []}
-                selected={selectedEffort ?? ""}
+              <TuningBadge
+                parameterDefinitions={parameterDefinitions}
+                selectedParameters={selectedParameters}
+                onSelectParameter={onSelectParameter}
+                supportsMaxMode={supportsMaxMode}
+                maxMode={maxMode}
+                onToggleMaxMode={onToggleMaxMode}
+                effortLevels={effortLevels}
+                selectedEffort={selectedEffort}
                 defaultEffort={defaultEffort}
-                onSelect={onSelectEffort}
+                onSelectEffort={onSelectEffort}
                 disabled={streaming}
               />
             </div>

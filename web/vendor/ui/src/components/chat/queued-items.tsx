@@ -1,16 +1,21 @@
 import { useEffect, useRef, useState } from "react"
-import { Check, ChevronDown, ChevronUp, Clock, Paperclip, Pencil, X } from "lucide-react"
+import { Check, ChevronDown, ChevronUp, Clock, FileText, Pencil, X, Zap } from "lucide-react"
 import { Button } from "@agentchat/components/ui/button"
+import { fileTypeTag, isImageUploadId } from "@agentchat/lib/attachments"
 import { t, tf } from "@agentchat/lib/i18n"
+import { formatBytes } from "@agentchat/lib/releases"
+import type { AttachmentView } from "@agentchat/types"
 
 /** One message parked in the server-side session queue (a `queue` frame item). */
 export interface QueuedItem {
-  /** Server-issued id addressing this item for remove/edit. */
+  /** Server-issued id addressing this item for remove/edit/send-now. */
   id: number
   /** Full message text (display truncation is CSS's job). */
   message: string
-  /** Number of attachments riding the parked message. */
-  attachments: number
+  /** Attachments riding the parked message, as upload references (the
+   *  bytes stay behind `uploadUrl(id)`) — enough for thumbnails and the
+   *  preview modal without another round-trip. */
+  attachments: AttachmentView[]
 }
 
 interface QueuedItemsProps {
@@ -19,21 +24,110 @@ interface QueuedItemsProps {
   onRemove: (id: number) => void
   /** Replace one parked message's text (attachments ride along unchanged). */
   onEdit: (id: number, message: string) => void
+  /** "Send now": stop the running turn and start this parked message next
+   *  (it jumps to the queue front; attachments ride along). */
+  onSendNow: (id: number) => void
   /** Drop every parked message (the header's "clear all"). */
   onClear: () => void
+  /** `GET /api/chat/upload/{id}` URL builder (thumbnail sources). */
+  uploadUrl: (id: string, name?: string) => string
+  /** A row's attachment chip was clicked: open it (lightbox for images, the
+   *  file preview for everything else — the host decides). */
+  onPreviewAttachment: (attachment: AttachmentView) => void
 }
 
 /** Long queues collapse to this many rows plus an expander. */
 const COLLAPSED_ROWS = 3
 
+/** A row shows at most this many attachment chips; the rest fold into a
+ *  "+N" tail whose tooltip lists their names — rows stay one line tall. */
+const MAX_CHIPS = 4
+
+/** The per-row attachment strip: image thumbnails and type-tagged file chips
+ *  (`PDF`, `CSV`), each a button opening the preview. Icons rather than names
+ *  on purpose — the message text owns the row's width; the full name and
+ *  size live in the tooltip and in the preview itself. */
+function AttachmentChips({
+  attachments,
+  uploadUrl,
+  onPreview,
+}: {
+  attachments: AttachmentView[]
+  uploadUrl: (id: string, name?: string) => string
+  onPreview: (attachment: AttachmentView) => void
+}) {
+  const shown = attachments.slice(0, MAX_CHIPS)
+  const rest = attachments.slice(MAX_CHIPS)
+  return (
+    <span className="flex shrink-0 items-center gap-1" data-acc="queued-attachments">
+      {shown.map((a) => {
+        const label = a.name || a.id
+        const size = formatBytes(a.size)
+        const title = size ? `${label} · ${size}` : label
+        if (isImageUploadId(a.id)) {
+          return (
+            <button
+              key={a.id}
+              type="button"
+              onClick={() => onPreview(a)}
+              title={title}
+              aria-label={title}
+              className="h-5 w-5 shrink-0 cursor-zoom-in overflow-hidden rounded-[3px] border border-border bg-muted/40 transition-opacity hover:opacity-80"
+            >
+              <img
+                src={uploadUrl(a.id)}
+                alt={label}
+                loading="lazy"
+                draggable={false}
+                className="h-full w-full object-cover"
+              />
+            </button>
+          )
+        }
+        const tag = fileTypeTag(a)
+        return (
+          <button
+            key={a.id}
+            type="button"
+            onClick={() => onPreview(a)}
+            title={title}
+            aria-label={title}
+            className="inline-flex h-5 shrink-0 items-center gap-0.5 rounded-[3px] border border-border bg-muted/40 px-1 text-[9px] font-medium tracking-wide text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          >
+            <FileText className="h-2.5 w-2.5 shrink-0" />
+            {tag && <span>{tag}</span>}
+          </button>
+        )
+      })}
+      {rest.length > 0 && (
+        <span
+          className="text-[10px] tabular-nums text-muted-foreground/70"
+          title={rest.map((a) => a.name || a.id).join("\n")}
+        >
+          +{rest.length}
+        </span>
+      )}
+    </span>
+  )
+}
+
 /** The queue panel docked above the composer: a bordered card with a header
- *  (count + clear-all) and one numbered row per parked message, with actions
- *  to remove it or edit its text in place (revealed on hover on fine
- *  pointers, always visible on touch). Queues longer than `COLLAPSED_ROWS`
- *  collapse behind a "+N more" expander. Rows never mutate optimistically —
- *  the server's next `queue` snapshot is the single source of truth, so
- *  every viewer converges the same way. */
-export function QueuedItems({ items, onRemove, onEdit, onClear }: QueuedItemsProps) {
+ *  (count + clear-all) and one numbered row per parked message, with
+ *  always-visible actions to send it now, edit its text in place or remove
+ *  it (the same affordance rule as the sub-task strip: no hover-only
+ *  controls). Queues longer than `COLLAPSED_ROWS` collapse behind a "+N more"
+ *  expander. Rows never mutate optimistically — the server's next `queue`
+ *  snapshot is the single source of truth, so every viewer converges the same
+ *  way. */
+export function QueuedItems({
+  items,
+  onRemove,
+  onEdit,
+  onSendNow,
+  onClear,
+  uploadUrl,
+  onPreviewAttachment,
+}: QueuedItemsProps) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [draft, setDraft] = useState("")
   const [expanded, setExpanded] = useState(false)
@@ -65,7 +159,7 @@ export function QueuedItems({ items, onRemove, onEdit, onClear }: QueuedItemsPro
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4 pb-1.5 print:hidden">
-      <div className="animate-fade-in overflow-hidden rounded-lg border border-border bg-muted/20">
+      <div className="animate-rise-in overflow-hidden rounded-lg border border-border bg-muted/20">
         <div className="flex items-center gap-1.5 border-b border-border/60 px-2.5 py-1.5 text-[11px] text-muted-foreground">
           <Clock className="h-3 w-3 shrink-0 text-muted-foreground/70" />
           <span className="min-w-0 flex-1 truncate font-medium">
@@ -130,7 +224,7 @@ export function QueuedItems({ items, onRemove, onEdit, onClear }: QueuedItemsPro
               <div
                 key={q.id}
                 title={q.message}
-                className="group flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted/50"
+                className="flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted/50"
               >
                 <span className="w-3.5 shrink-0 text-right tabular-nums text-muted-foreground/50">
                   {idx + 1}
@@ -138,13 +232,24 @@ export function QueuedItems({ items, onRemove, onEdit, onClear }: QueuedItemsPro
                 <span className="min-w-0 flex-1 truncate text-foreground/75">
                   {q.message}
                 </span>
-                {q.attachments > 0 && (
-                  <span className="flex shrink-0 items-center gap-0.5 text-[10px]">
-                    <Paperclip className="h-2.5 w-2.5" />
-                    {q.attachments}
-                  </span>
+                {q.attachments.length > 0 && (
+                  <AttachmentChips
+                    attachments={q.attachments}
+                    uploadUrl={uploadUrl}
+                    onPreview={onPreviewAttachment}
+                  />
                 )}
-                <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100">
+                <div className="flex shrink-0 items-center gap-0.5">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => onSendNow(q.id)}
+                    className="h-6 w-6 rounded-sm text-muted-foreground hover:text-primary [&_svg]:size-3"
+                    title={t("queuedSendNow")}
+                    aria-label={t("queuedSendNow")}
+                  >
+                    <Zap />
+                  </Button>
                   <Button
                     variant="ghost"
                     size="icon"
@@ -154,6 +259,7 @@ export function QueuedItems({ items, onRemove, onEdit, onClear }: QueuedItemsPro
                     }}
                     className="h-6 w-6 rounded-sm text-muted-foreground hover:text-foreground [&_svg]:size-3"
                     title={t("edit")}
+                    aria-label={t("edit")}
                   >
                     <Pencil />
                   </Button>
@@ -163,6 +269,7 @@ export function QueuedItems({ items, onRemove, onEdit, onClear }: QueuedItemsPro
                     onClick={() => onRemove(q.id)}
                     className="h-6 w-6 rounded-sm text-muted-foreground hover:text-destructive [&_svg]:size-3"
                     title={t("delete")}
+                    aria-label={t("delete")}
                   >
                     <X />
                   </Button>

@@ -55,6 +55,10 @@ const buildTime = new Date()
 // version.sh.
 const skillsRepo = declared('SKILLS_REPO');
 
+// Where installable apps (.vapp packages) are published — the apps-hub.
+// Empty hides the Apps page's repository tab the same way.
+const appsRepo = declared('APPS_REPO');
+
 // The endpoint the page starts with. The settings panel remains the authority
 // once anyone has used it. Anything set here lands in the bundle in clear,
 // which is why version.sh insists DEFAULT_API_KEY stays empty in anything
@@ -119,7 +123,13 @@ export default defineConfig(() => ({
 		__APP_VERSION__: JSON.stringify(version),
 		__BUILD_TIME__: JSON.stringify(buildTime),
 		__SKILLS_REPO__: JSON.stringify(skillsRepo),
+		__APPS_REPO__: JSON.stringify(appsRepo),
 		__DEFAULTS__: JSON.stringify(defaults),
+		// Where the app shell lives (§10.3). Empty — the default — means the
+		// copy shipped beside the page (app/public/app-frame.html, resolved
+		// at runtime by app/app-frame-url.ts). Set to put it on a different
+		// site instead; see the shell's own header for what that buys.
+		__APP_FRAME_URL__: JSON.stringify(process.env.VINX_APP_FRAME_URL ?? ''),
 	},
 	build: {
 		outDir: resolve(repo, 'dist'),

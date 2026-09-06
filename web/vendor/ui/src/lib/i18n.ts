@@ -41,6 +41,17 @@ const EN: Labels = {
   thinkingLabel: 'Thinking…',
   reasoning: 'Reasoning',
 
+  // step group (folded run of reasoning + tool rows)
+  stepGroupLive: 'Working · step {0} · {1}',
+  stepGroupSteps: '{0} steps',
+  stepGroupBreakdown: 'thinking {0} · tools {1}',
+  stepGroupFailed: '{0} failed',
+
+  // message outline (right-hand rail of user-message ticks)
+  outlineAria: 'Conversation outline',
+  outlineJumpTo: 'Jump to message #{0}',
+  outlineAttachmentOnly: '(attachments only)',
+
   // confirm
   confirm: 'Confirm',
   cancel: 'Cancel',
@@ -52,6 +63,7 @@ const EN: Labels = {
   fullAutoHint: 'Approve this call AND skip all later confirmations in this session. Questions (ask_user) still prompt. Can be turned off anytime.',
   fullAutoBadge: 'FULL-AUTO',
   fullAutoBadgeHint: 'Full auto is ON for this session: tool confirmations are skipped. Click to turn off.',
+  fullAutoEnableHint: 'Full auto is OFF. Click to skip tool confirmations for this session (questions still prompt). Remembered with the session.',
 
   // scheduled-task authorization (confirm bar variant)
   scheduleAuthorizeTitle: 'Authorize scheduled task',
@@ -71,9 +83,14 @@ const EN: Labels = {
   askUserCustomRequired: 'Please type your custom answer.',
   askUserCancel: 'Cancel',
   askUserSubmit: 'Submit',
+  askUserWaiting: 'Waiting for your answer…',
+  askUserNoAnswer: 'no answer',
+  askUserCancelled: 'Cancelled',
+  askUserAutoPicked: 'Auto-picked (full-auto)',
 
   // task sub-agents
   subagentTag: 'sub-task',
+  subagentHeader: 'Sub-tasks · {0}',
   subagentRunning: 'running {name}',
   subagentDone: 'finished',
   subagentError: 'error',
@@ -84,17 +101,22 @@ const EN: Labels = {
   taskStatusFailed: 'failed',
   taskStatusTimeout: 'timed out',
   taskStatusCancelled: 'cancelled',
-  taskTimeoutBadge: 'limit {0}s',
+  taskTimeoutBadge: 'limit {0}',
+  taskTimeLeft: '{0} left of the time budget',
   taskViewTranscript: 'View sub-session',
   taskPromptChars: '{0} chars',
   taskPromptLabel: 'Prompt',
   taskResultLabel: 'Result',
+  taskSessionReadonly: 'Sub-agent transcript — read-only',
+  taskOverBudget: 'past its time budget — wrapping up',
+  streamTrimmed: 'earlier output trimmed',
 
   // message queue + steer
   queuedHeader: 'Queued · {0}',
   queuedClear: 'Clear all',
   queuedMore: '{n} more queued…',
   queuedCollapse: 'Collapse',
+  queuedSendNow: 'Send now (stops the current task and starts this queued message)',
   queuePlaceholder: 'Type the next message — it sends when the current reply finishes (Enter to queue)',
   queueSendTitle: 'Queue (sends after the current reply)',
   sendNowTitle: 'Send now (stops the current task and handles this message)',
@@ -110,6 +132,12 @@ const EN: Labels = {
   export: 'Export',
   exportMarkdown: 'Markdown',
   exportPdf: 'PDF',
+  transcriptMenu: 'View & export',
+  transcriptView: 'Steps',
+  expandAllSteps: 'Expand all',
+  collapseAllSteps: 'Collapse all',
+  alerts: 'Alerts',
+  alertChime: 'Chime when a background tab needs you',
 
   // markdown / code
   code: 'code',
@@ -138,8 +166,8 @@ const EN: Labels = {
   // shell
   shell: 'Shell',
   ssh: 'SSH',
-  vinx: 'Run',
-  timeoutLabel: 'timeout {0}s',
+  run: 'Run',
+  timeoutLabel: 'timeout {0}',
   execTimeoutTip: 'Command timed out',
   execNonzeroTip: 'Command exited with a non-zero status',
 
@@ -190,6 +218,17 @@ const EN: Labels = {
   summaryShow: 'Show the summary the model continues from',
   summaryHide: 'Hide summary',
 
+  // recall_result (the agent re-reading an elided tool result)
+  recallTitle: 'Brought back the result of {0}',
+  recallHint: 'This output had been trimmed from the model\u2019s working context to save space; the agent pulled it back from the session record. The card below shows it the way the original call did.',
+  recallFromArchive: 'from the pre-compaction archive',
+  recallSize: '{0} chars · {1} lines',
+  recallShowOriginal: 'Show original call',
+  recallOriginalGone: 'The original call is no longer in this transcript',
+  recallAlreadyVisible: 'Already in the model\u2019s context — nothing to bring back',
+  recallNotFound: 'Nothing to bring back',
+  recallContentLabel: 'Recalled output',
+
   // sessions panel
   history: 'History',
   noSessions: 'No conversations yet',
@@ -209,15 +248,31 @@ const EN: Labels = {
   // apps (extensions) page
   apps: 'Apps',
   appsTitle: 'Apps',
-  appsSshTitle: 'Web Terminal',
-  appsSshDesc: 'Open an interactive shell in your browser',
-  appsBuiltinSection: 'Built-in tools',
   releasesNav: 'Releases',
   releasesTitle: 'Releases',
   themesNav: 'Themes',
   themesTitle: 'Themes',
   appsInstalledSection: 'Installed apps',
   appsInstalledEmpty: 'No apps installed — ask the agent to package and run a service.',
+  // Vinx: the one thing this page says about the machine, and only when a
+  // machine app is asked to run on a machine left powered off (the shim's
+  // MACHINE_OFF). Power itself lives on the capsule at the bottom right.
+  appsVmOff: 'The machine is powered off — power it on with the key at the bottom right, then try again.',
+  // Vinx: a window app's verb is opening its window, not starting a service.
+  appOpenWindow: 'Open window',
+  appsOpenWindowHint: 'Open the app\u2019s window on this page (a pure web app needs no machine)',
+  appCloseWindow: 'Close window',
+  appsCloseWindowHint: 'Close the app\u2019s window',
+  appRunOnce: 'Run once',
+  appsRunOnceHint: 'Run the command to completion; its exit code lands in the log',
+  appsEnableRunOnBoot: 'Run once on every boot',
+  appsEnableRunOnBootHint: 'Add to the autostart list; the supervisor runs it once per boot',
+  appsTitleLabel: 'Title',
+  appsKindLabel: 'Kind',
+  appsIdLabel: 'App id',
+  appsKind_window: 'window',
+  appsKind_service: 'service',
+  appsKind_command: 'command',
   appStart: 'Start',
   appStop: 'Stop',
   appRemove: 'Uninstall',
@@ -266,6 +321,17 @@ const EN: Labels = {
   appsNo: 'No',
   appsStartHint: 'Start the systemd service',
   appsStopHint: 'Stop the running service',
+  // Vinx: the autostart switch on the Apps detail panel.
+  appsEnableAutostart: 'Start on boot',
+  appsEnableAutostartHint: 'Add to the autostart list; the supervisor picks it up on every boot',
+  appsDisableAutostart: 'Don\u2019t start on boot',
+  appsDisableAutostartHint: 'Boot policy only \u2014 a running instance keeps running',
+  // Vinx: a pure web app's autostart — the page loading is its boot.
+  appsOpenOnLoadLabel: 'Open on load',
+  appsEnableOpenOnLoad: 'Open when the page loads',
+  appsEnableOpenOnLoadHint: 'Add to the autostart list; this page opens the window whenever it loads, with or without the machine',
+  appsDisableOpenOnLoad: 'Don\u2019t open when the page loads',
+  appsDisableOpenOnLoadHint: 'Load policy only \u2014 an open window stays open',
   appsOpenPageHint: 'Open the app\u2019s web page in a new tab',
   appsOpenSessionAction: 'Open source conversation',
   appsOpenSessionHint: 'Jump to the conversation that installed this app',
@@ -330,9 +396,13 @@ const EN: Labels = {
   timeMinAgo: '{0}m ago',
   timeHourAgo: '{0}h ago',
   timeDayAgo: '{0}d ago',
+  // duration budgets (lib/duration formatBudget): "25 min", "1 h 30 min"
+  durationHours: '{0} h',
+  durationMinutes: '{0} min',
+  durationSeconds: '{0} s',
 
-  // sessions page / sidebar (upstream-TUI parity)
-  vinxAgent: 'Vinx Agent',
+  // sessions page / sidebar
+  defaultBrand: 'Vinx Agent',
   about: 'About',
   version: 'Version',
   kernelVersion: 'Kernel',
@@ -363,18 +433,59 @@ const EN: Labels = {
   attachFile: 'Attach image or file',
   attachLimit: 'Up to {0} attachments per message.',
   uploadFailed: 'Upload failed',
+  draftAttachmentGone: '"{0}" is no longer on the server — removed from the draft.',
   fileTooLarge: '{0} exceeds the {1}MB limit.',
   downloadFile: 'Download',
+  close: 'Close',
+  filePreviewUnavailable: 'No in-app preview for this file type — download it to open.',
+  filePreviewTruncated: 'Showing the first {0} — download for the full file.',
+  filePreviewFailed: 'Could not load the file.',
   dropFilesHint: 'Drop files to attach them',
   groupActive: 'Active',
   filterAll: 'All',
   filterActive: 'Active',
   filterPinned: 'Pinned',
   runningBadge: 'Running',
+  // sessions page — grouping / archive / category
+  sessionSortCreated: 'Created',
+  sessionSortTitle: 'Title',
+  groupLabel: 'Group',
+  groupByTime: 'Time',
+  groupByCategory: 'Category',
+  groupByOrigin: 'Source',
+  groupByNone: 'None',
+  groupUncategorized: 'Uncategorised',
+  groupOriginWeb: 'Web',
+  groupOriginTui: 'Terminal (TUI)',
+  groupOriginTerminal: 'Web Terminal',
+  timeToday: 'Today',
+  timeYesterday: 'Yesterday',
+  timeLast7Days: 'Previous 7 days',
+  timeLast30Days: 'Previous 30 days',
+  timeOlder: 'Older',
+  collapseGroup: 'Collapse group',
+  expandGroup: 'Expand group',
+  archive: 'Archive',
+  unarchive: 'Restore',
+  archivedSection: 'Archived',
+  archivedAt: 'Archived {0}',
+  archivedHint: 'Archived conversations stay out of the list and the sidebar. Sending a new message in one restores it.',
+  archiveRunningHint: 'A running conversation can\'t be archived',
+  batchArchive: 'Archive selected',
+  batchUnarchive: 'Restore selected',
+  category: 'Category',
+  setCategory: 'Set category',
+  batchSetCategory: 'Set category for selected',
+  newCategory: 'New category…',
+  categoryPlaceholder: 'Category name',
+  clearCategory: 'Remove category',
+  batchActions: 'Batch actions',
+  noLiveSessions: 'No active conversations match — the archive below still does.',
 
   // settings page — sections
   secAppearance: 'Appearance',
-  secAi: 'AI',
+  secAi: 'Model provider',
+  secAgentBehavior: 'Agent behavior',
   secRuntime: 'Runtime',
   secRuntimeCache: 'Runtime Cache',
   secSecurity: 'Security',
@@ -429,6 +540,12 @@ const EN: Labels = {
   modelDefaultTag: 'Default',
   effortDefault: 'default',
   effortBadgeHint: 'Reasoning effort',
+  tuningBadgeHint: 'Model parameters',
+  tuningMaxMode: 'Max mode',
+  tuningOn: 'On',
+  tuningOff: 'Off',
+
+
   skillsSortByName: 'Name',
   skillsSortByTools: 'Tools',
   skillsSortByState: 'Status',
@@ -520,12 +637,16 @@ const EN: Labels = {
   fldAppsRepo: 'Apps repository',
   fldEnabled: 'Enabled',
   fldPort: 'Port',
+  fldProvider: 'Provider',
+  providerOpenAi: 'OpenAI compatible',
   fldBaseUrl: 'Endpoint',
   fldModel: 'Model',
   fldApiKey: 'API key',
   fldTemperature: 'Temperature',
   fldReasoningEffort: 'Reasoning effort',
   fldSubagentReasoningEffort: 'Sub-agent reasoning effort',
+  fldDefaultFullAuto: 'Full auto by default',
+  copyUserId: 'Copy user id',
 
   // settings page — helpers
   hlpAppName: 'Shown in the navigation rail, About panel, and browser tab.',
@@ -544,6 +665,16 @@ const EN: Labels = {
     'Default reasoning depth for the main agent: low / high / max (blank = the provider default). Values a model does not support are clamped to its default automatically.',
   hlpSubagentReasoningEffort:
     'Reasoning depth for task sub-agents (blank = inherit the main agent). Delegated work is often mechanical — "low" is dramatically faster at no quality cost.',
+  hlpDefaultFullAuto:
+    'New chat sessions start in FULL-AUTO: tool confirmations are skipped (questions still prompt). Each session can be switched off anytime via its FULL-AUTO badge. Use with care — the agent runs dangerous operations without asking.',
+  // settings page — secret fields (the stored value never reaches the browser)
+  secretStored: 'Stored · leave blank to keep',
+  secretNotStored: 'Not set · paste to set',
+  secretNew: 'New value — save to apply',
+  secretShow: 'Show',
+  secretHide: 'Hide',
+  secretCopy: 'Copy',
+  secretCopyStoredHint: 'Only a value entered in this form can be copied; stored secrets are never sent to the browser.',
 
   // settings page — command allow-list
   addToWhitelist: 'Add to allow-list',
@@ -620,6 +751,17 @@ const ZH: Labels = {
   thinkingLabel: '思考中…',
   reasoning: '推理过程',
 
+  // step group (folded run of reasoning + tool rows)
+  stepGroupLive: '执行中 · 第 {0} 步 · {1}',
+  stepGroupSteps: '{0} 个步骤',
+  stepGroupBreakdown: '思考 {0} · 工具 {1}',
+  stepGroupFailed: '{0} 失败',
+
+  // message outline (right-hand rail of user-message ticks)
+  outlineAria: '会话导航',
+  outlineJumpTo: '跳转到第 {0} 条消息',
+  outlineAttachmentOnly: '（仅附件）',
+
   // confirm
   confirm: '确认',
   cancel: '取消',
@@ -628,6 +770,7 @@ const ZH: Labels = {
   fullAutoHint: '批准本次操作,并跳过本会话后续所有确认。提问(ask_user)仍会询问。可随时关闭。',
   fullAutoBadge: '全自动',
   fullAutoBadgeHint: '本会话已开启全自动:工具确认将被跳过。点击关闭。',
+  fullAutoEnableHint: '全自动未开启。点击开启:本会话跳过工具确认(提问仍会询问),设置会随会话保存。',
 
   // scheduled-task authorization (confirm bar variant)
   scheduleAuthorizeTitle: '授权定时任务',
@@ -650,9 +793,14 @@ const ZH: Labels = {
   askUserCustomRequired: '请输入自定义回答。',
   askUserCancel: '取消',
   askUserSubmit: '提交',
+  askUserWaiting: '等待你的回答…',
+  askUserNoAnswer: '未作答',
+  askUserCancelled: '已取消',
+  askUserAutoPicked: '自动选择（全自动）',
 
   // task sub-agents
   subagentTag: '子任务',
+  subagentHeader: '子任务 · {0} 个运行中',
   subagentRunning: '执行 {name}',
   subagentDone: '已完成',
   subagentError: '出错',
@@ -663,17 +811,22 @@ const ZH: Labels = {
   taskStatusFailed: '失败',
   taskStatusTimeout: '超时',
   taskStatusCancelled: '已取消',
-  taskTimeoutBadge: '限时 {0}s',
+  taskTimeoutBadge: '限时 {0}',
+  taskTimeLeft: '距限时还剩 {0}',
   taskViewTranscript: '查看子会话',
   taskPromptChars: '{0} 字符',
   taskPromptLabel: '任务指令',
   taskResultLabel: '结果',
+  taskSessionReadonly: '子任务会话(只读)',
+  taskOverBudget: '已超限时,收尾中',
+  streamTrimmed: '早期输出已截略',
 
   // message queue + steer
   queuedHeader: '已排队 · {0} 条',
   queuedClear: '清空',
   queuedMore: '还有 {n} 条…',
   queuedCollapse: '收起',
+  queuedSendNow: '立即发送(终止当前任务,马上处理这条排队消息)',
   queuePlaceholder: '输入下一条消息——当前回复结束后自动发送(Enter 排队)',
   queueSendTitle: '排队(当前回复结束后发送)',
   sendNowTitle: '立即发送(终止当前任务并立即处理)',
@@ -689,6 +842,12 @@ const ZH: Labels = {
   export: '导出',
   exportMarkdown: 'Markdown',
   exportPdf: 'PDF',
+  transcriptMenu: '视图与导出',
+  transcriptView: '步骤',
+  expandAllSteps: '全部展开',
+  collapseAllSteps: '全部折叠',
+  alerts: '提醒',
+  alertChime: '后台标签页完成或需确认时响一声',
 
   // markdown / code
   code: '代码',
@@ -717,8 +876,8 @@ const ZH: Labels = {
   // shell
   shell: 'Shell',
   ssh: 'SSH',
-  vinx: '运行',
-  timeoutLabel: '超时 {0}s',
+  run: '运行',
+  timeoutLabel: '限时 {0}',
   execTimeoutTip: '命令超时',
   execNonzeroTip: '命令以非零状态退出',
 
@@ -769,6 +928,17 @@ const ZH: Labels = {
   summaryShow: '查看模型据以继续对话的摘要',
   summaryHide: '收起摘要',
 
+  // recall_result (the agent re-reading an elided tool result)
+  recallTitle: '找回了 {0} 的结果',
+  recallHint: '这段输出之前为节省空间已从模型的工作上下文中裁掉，代理从会话记录中把它找了回来。下方按原调用的样式展示。',
+  recallFromArchive: '来自压缩前的归档',
+  recallSize: '{0} 字符 · {1} 行',
+  recallShowOriginal: '查看原调用',
+  recallOriginalGone: '原调用已不在当前对话中',
+  recallAlreadyVisible: '结果仍在模型上下文中，无需找回',
+  recallNotFound: '没有可找回的结果',
+  recallContentLabel: '找回的输出',
+
   // sessions panel
   history: '历史',
   noSessions: '还没有会话',
@@ -788,15 +958,29 @@ const ZH: Labels = {
   // apps (extensions) page
   apps: '扩展',
   appsTitle: '扩展',
-  appsSshTitle: 'Web 终端',
-  appsSshDesc: '在浏览器中打开交互式 shell',
-  appsBuiltinSection: '内置工具',
   releasesNav: '发布内容',
   releasesTitle: '发布内容',
   themesNav: '主题',
   themesTitle: '主题',
   appsInstalledSection: '已安装应用',
   appsInstalledEmpty: '还没有安装应用——让 agent 打包并运行一个服务试试。',
+  // Vinx: 这一页关于机器只说这一句，且只在机器应用被要求在关着的机器上运行时
+  // （shim 的 MACHINE_OFF）。电源本身在右下角的胶囊上。
+  appsVmOff: '机器已关机——请用右下角的电源键开机，再试一次。',
+  appOpenWindow: '打开窗口',
+  appsOpenWindowHint: '在本页打开应用窗口（纯 Web 应用不需要开机）',
+  appCloseWindow: '关闭窗口',
+  appsCloseWindowHint: '关闭应用窗口',
+  appRunOnce: '运行一次',
+  appsRunOnceHint: '运行命令直到结束，退出码记录在日志里',
+  appsEnableRunOnBoot: '每次开机运行一次',
+  appsEnableRunOnBootHint: '加入自启列表，每次开机由守护进程运行一次',
+  appsTitleLabel: '标题',
+  appsKindLabel: '类型',
+  appsIdLabel: '应用 ID',
+  appsKind_window: '窗口',
+  appsKind_service: '服务',
+  appsKind_command: '命令',
   appStart: '启动',
   appStop: '停止',
   appRemove: '卸载',
@@ -845,6 +1029,16 @@ const ZH: Labels = {
   appsNo: '否',
   appsStartHint: '启动 systemd 服务',
   appsStopHint: '停止运行中的服务',
+  // Vinx: Apps 详情面板的开机自启开关。
+  appsEnableAutostart: '开机自启',
+  appsEnableAutostartHint: '加入自启列表,每次开机由守护进程拉起',
+  appsDisableAutostart: '取消开机自启',
+  appsDisableAutostartHint: '仅影响开机策略 — 正在运行的实例继续运行',
+  appsOpenOnLoadLabel: '装载时打开',
+  appsEnableOpenOnLoad: '页面装载时打开',
+  appsEnableOpenOnLoadHint: '加入自启列表：本页每次装载都会打开这个窗口，机器开着或关着都一样',
+  appsDisableOpenOnLoad: '取消装载时打开',
+  appsDisableOpenOnLoadHint: '仅影响装载策略 — 已打开的窗口不受影响',
   appsOpenPageHint: '在新标签页打开应用页面',
   appsOpenSessionAction: '打开来源会话',
   appsOpenSessionHint: '跳转到安装此应用的会话',
@@ -909,9 +1103,13 @@ const ZH: Labels = {
   timeMinAgo: '{0} 分钟前',
   timeHourAgo: '{0} 小时前',
   timeDayAgo: '{0} 天前',
+  // duration budgets (lib/duration formatBudget): "25 分钟", "1 小时 30 分钟"
+  durationHours: '{0} 小时',
+  durationMinutes: '{0} 分钟',
+  durationSeconds: '{0} 秒',
 
-  // sessions page / sidebar (upstream-TUI parity)
-  vinxAgent: 'Vinx Agent',
+  // sessions page / sidebar
+  defaultBrand: 'Vinx Agent',
   about: '关于',
   version: '版本',
   kernelVersion: '内核版本',
@@ -942,18 +1140,59 @@ const ZH: Labels = {
   attachFile: '添加图片或文件',
   attachLimit: '每条消息最多 {0} 个附件。',
   uploadFailed: '上传失败',
+  draftAttachmentGone: '"{0}" 在服务端已不存在，已从草稿中移除。',
   fileTooLarge: '{0} 超过 {1}MB 上限。',
   downloadFile: '下载',
+  close: '关闭',
+  filePreviewUnavailable: '此类文件不支持页内预览，请下载后查看。',
+  filePreviewTruncated: '仅显示前 {0}，完整内容请下载查看。',
+  filePreviewFailed: '文件加载失败。',
   dropFilesHint: '松开鼠标，把文件添加为附件',
   groupActive: '活动中',
   filterAll: '全部',
   filterActive: '活动中',
   filterPinned: '置顶',
   runningBadge: '执行中',
+  // sessions page — grouping / archive / category
+  sessionSortCreated: '创建时间',
+  sessionSortTitle: '标题',
+  groupLabel: '分组',
+  groupByTime: '时间',
+  groupByCategory: '分类',
+  groupByOrigin: '来源',
+  groupByNone: '不分组',
+  groupUncategorized: '未分类',
+  groupOriginWeb: 'Web',
+  groupOriginTui: '终端 (TUI)',
+  groupOriginTerminal: 'Web 终端',
+  timeToday: '今天',
+  timeYesterday: '昨天',
+  timeLast7Days: '过去 7 天',
+  timeLast30Days: '过去 30 天',
+  timeOlder: '更早',
+  collapseGroup: '收起分组',
+  expandGroup: '展开分组',
+  archive: '归档',
+  unarchive: '取消归档',
+  archivedSection: '已归档',
+  archivedAt: '归档于 {0}',
+  archivedHint: '归档的会话不再出现在列表和侧栏中；在其中再发一条消息会自动恢复。',
+  archiveRunningHint: '执行中的会话不能归档',
+  batchArchive: '归档所选',
+  batchUnarchive: '取消归档所选',
+  category: '分类',
+  setCategory: '设置分类',
+  batchSetCategory: '为所选设置分类',
+  newCategory: '新建分类…',
+  categoryPlaceholder: '分类名称',
+  clearCategory: '移除分类',
+  batchActions: '批量操作',
+  noLiveSessions: '没有匹配的活跃会话，下方归档区仍有结果。',
 
   // settings page — sections
   secAppearance: '外观',
-  secAi: 'AI 模型',
+  secAi: '模型服务',
+  secAgentBehavior: 'Agent 行为',
   secRuntime: '运行',
   secRuntimeCache: '运行时缓存',
   secSecurity: '安全',
@@ -1008,6 +1247,12 @@ const ZH: Labels = {
   modelDefaultTag: '默认',
   effortDefault: '默认',
   effortBadgeHint: '思考深度',
+  tuningBadgeHint: '模型参数',
+  tuningMaxMode: 'Max 模式',
+  tuningOn: '开',
+  tuningOff: '关',
+
+
   skillsSortByName: '名称',
   skillsSortByTools: '工具数',
   skillsSortByState: '状态',
@@ -1098,12 +1343,16 @@ const ZH: Labels = {
   fldAppsRepo: 'Apps 仓库地址',
   fldEnabled: '启用',
   fldPort: '端口',
+  fldProvider: '模型服务',
+  providerOpenAi: 'OpenAI 兼容接口',
   fldBaseUrl: '接口地址',
   fldModel: '模型',
   fldApiKey: 'API 密钥',
   fldTemperature: '采样温度',
   fldReasoningEffort: '思考深度',
   fldSubagentReasoningEffort: '子 Agent 思考深度',
+  fldDefaultFullAuto: '新会话默认全自动',
+  copyUserId: '复制用户 ID',
 
   // settings page — helpers
   hlpAppName: '显示在导航栏、关于面板和浏览器标签页中。',
@@ -1122,6 +1371,16 @@ const ZH: Labels = {
     '主 Agent 的默认思考深度：low / high / max（留空 = 服务商默认）。模型不支持的取值会自动钳制到其默认档。',
   hlpSubagentReasoningEffort:
     'task 子 Agent 的思考深度（留空 = 继承主 Agent）。委派的任务多为机械性工作，low 档速度大幅提升且几乎不损质量。',
+  hlpDefaultFullAuto:
+    '新建会话默认进入全自动：跳过工具确认（提问仍会询问）。每个会话可随时通过"全自动"徽标关闭。请谨慎开启——Agent 将不经确认执行危险操作。',
+  // settings page — secret fields (the stored value never reaches the browser)
+  secretStored: '已存储 · 留空保持不变',
+  secretNotStored: '未设置 · 粘贴以设置',
+  secretNew: '新值 · 保存后生效',
+  secretShow: '显示',
+  secretHide: '隐藏',
+  secretCopy: '复制',
+  secretCopyStoredHint: '只能复制本次在表单中填入的值；已存储的密钥不会下发到浏览器。',
 
   // settings page — command allow-list
   addToWhitelist: '加入白名单',
@@ -1185,6 +1444,29 @@ let base: Labels = detectBase()
 let overridesMem: Labels | undefined
 let current: Labels = { ...base }
 
+/**
+ * Mirror the active locale onto `<html lang>`. The static shell ships
+ * `lang="en"`; browsers key several text decisions on the attribute — which
+ * CJK font serves a Han character shared across zh/ja (`ui-sans-serif` picks
+ * PingFang for `zh`, Hiragino for `ja`), `text-autospace` behaviour, hyphenation
+ * and the on-screen-keyboard / spell-check locale — so a Chinese UI should
+ * declare itself as such. Done here (not in a component) so every host that
+ * switches the dictionary switches the document too. Skipped when the host
+ * page already declared a more specific tag (`zh-Hant`, `en-GB`) for the
+ * same language.
+ */
+function syncDocumentLang(): void {
+  try {
+    if (typeof document === 'undefined') return
+    const want = base === ZH ? 'zh' : 'en'
+    const el = document.documentElement
+    if (!el.lang.toLowerCase().startsWith(want)) el.lang = want === 'zh' ? 'zh-CN' : 'en'
+  } catch {
+    /* ignore: non-browser env */
+  }
+}
+syncDocumentLang()
+
 export function setLabels(overrides?: Labels): void {
   overridesMem = overrides
   current = overrides ? { ...base, ...overrides } : { ...base }
@@ -1201,6 +1483,7 @@ export function setLanguage(lang?: string): void {
   else if (l.startsWith('en')) base = EN
   else base = detectBase()
   current = { ...base, ...(overridesMem ?? {}) }
+  syncDocumentLang()
 }
 
 export function t(key: string): string {

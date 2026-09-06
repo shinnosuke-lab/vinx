@@ -69,6 +69,146 @@ taken, what is reimplemented for the browser, and why. The short version:
    vendored — the host layer here is a rewrite, and the tools simply were not
    carried when it was written.
 
+5. **UI synced with the `xcore` sibling fork** (2026-09-06). `xcore` is
+   another fork of the same `agent-core` (a local-shell agent with a Sand
+   provider), whose `ui/src` had moved far past `10fdab3`. Its UI was
+   three-way merged in per file — base = upstream `10fdab3:ui/src` (the
+   real common ancestor; the first attempt used this repo's `d46da50` as
+   base and silently reverted every Vinx change that predates it, which is
+   why the base matters), ours = the tree here, theirs = `xcore/ui/src`. 20
+   files conflicted, all resolved by rule: branding/comments → ours,
+   functional → combine. Taken: the status-note pipeline
+   (`lib/status-notes.ts`, notes place/replace/drop instead of stacking),
+   transcript step groups (`step-group.tsx`, consecutive tool calls fold
+   into one row), the message outline rail (`message-outline.tsx`), the
+   collapsible primitive, tool cards for `ask_user` / `recall_result` /
+   `web_fetch`, attachment previews (`file-preview.tsx`), the sessions page
+   redesign (scope tabs, group/sort axes, batch actions, an **archive**
+   section and **categories** via `session-category.tsx`), the composer's
+   auto-confirm toggle with a `full_auto` flag on the first send, queue
+   "send now" (`POST /api/chat/queue/promote`), the light/dark motion
+   tokens, and a lot of small polish (popover side measurement, pop-in
+   verdicts, i18n rewording). Stripped as inapplicable: everything Sand
+   (provider panel, login, identity, usage ledger/`UsageBadge`), the
+   per-session working directory (`WorkDirBadge`, `/api/fs/dirs`, the
+   sessions page's "project" axis), xcore's own logo/wordmark, and its
+   `settings-page.tsx` rework (kept ours wholesale; its SecretInput /
+   behaviour section are a later hand-pick). Kept dormant, not stripped:
+   the structured model catalog plumbing (`CatalogModel`, parameter chips,
+   max mode) — it only renders when `/api/models` ships a `catalog`, which
+   this host does not. Vinx-specific keys renamed onto upstream's names:
+   `vinxAgent` → `defaultBrand`, `vinx` (the `vinx_run` card label) →
+   `run` (xcore's `*_run` generalisation covers it). Host side, to honour
+   the new contract: `SessionStore` grew `archived_at`/`category` columns
+   (`list_scoped(SessionScope)`, `set_archived`, `set_category`; a new
+   turn un-archives), `AgentHost::sessions(scope)`, `update_session(…,
+   archived, category)`, `queue_promote`; the shim serves
+   `GET /api/sessions?scope=`, `PATCH` with `archived`/`category`,
+   `POST /api/chat/queue/promote`, and applies `full_auto` on a session
+   the call creates. Review follow-up, same day: full-auto is **persisted**
+   (`sessions.full_auto`; `setAuto`/approve-all write through, the turn's
+   opening `touch` carries the flag into the row it creates, and a host
+   reads the store for a session it has no flag for), so the badge survives
+   a reload as the UI promises — `xcore` keeps the same column; the turn's
+   opening `touch` un-archives like `save` does, so an archived session is
+   back in the live list when its turn starts rather than when it ends; and
+   `queue_promote` answers a plain bool (found / not found) instead of a
+   `-1/0/1` tri-state nobody consumed. Engine-side xcore work (context
+   management, pending status events) is a separate batch.
+6. **Engine context management synced with `xcore`** (2026-09-07). The
+   working-context section of `context.rs` (everything after
+   `compress_tool_result`) was replaced by xcore's and the matching pieces of
+   `agent_loop.rs`, `client.rs`, `event.rs`, `sse.rs` and `types.rs` spliced
+   in, in the order the pieces depend on each other: token usage first
+   (`StreamOutcome.usage` → `AgentEvent::Usage` → the `usage` SSE frame, and
+   `SessionContextState::observe` calibrating chars-per-token from the real
+   `prompt_tokens`), then the budget model (`working_budget_tokens` capped at
+   160k, `compaction_threshold` 60% / `pruning_threshold` 40% of it,
+   `stub_oldest_tool_call_args`), then Level‑1 pruning with an absolute cut
+   (`PruneState`, held per session in `SharedContextState`; the host owns one
+   slot per session, hands it to the loop through `TurnParams.context_state`,
+   and resets it on rewind / import / delete while the loop resets it on
+   compaction — the point is a stable request prefix for provider prompt
+   caches), then Level‑2 compaction quality (`compaction_tail_start` keeps a
+   verbatim tail, `recall_index` names the largest archived results,
+   `neutralize_task_state_markers`, `LlmClient::for_compaction` with minimal
+   reasoning) with `StatusUpdate { text, pending }` so the UI's status notes
+   can spin while the summary is written, and last the `update_task_state`
+   verdict bands (≤2000 accepted, 2000–4000 accepted with a nudge in the ack,
+   >4000 refused). The lossy-stream status frame now carries
+   `code: "tail_trimmed"` so the UI localizes it. Adaptations are marked
+   `vinx:` in the sources: the pre-compaction archive runs inline (the store
+   is `!Send`; xcore uses `spawn_blocking`), clocks go through `wasmtimer`,
+   reasoning counts toward the estimate on tool-call turns only (no
+   `reasoning_meta` signatures here), `compaction_model` exists but nothing
+   sets it yet. Skipped: the Sand-only fields, xcore's overflow-forced
+   compaction (its `force` parameter stays with one `false` caller, so a
+   later port is a one-liner), and the task-UX / `edit_file` / Environment /
+   cancel-aware items. xcore's inline `#[test]`s were carried as
+   `tests/context_budget.rs` (22 tests under `wasm_bindgen_test`); the mock
+   endpoint now streams a usage record so `tests/turn.rs` proves the frame.
+7. **Engine UX / tool-IO items synced with `xcore`** (2026-09-07, the
+   items item 6 deferred). `task` UX: `run_batch` emits each child's
+   `ToolCallResult` the moment it lands (and a synthetic one for a child
+   that died without reporting) instead of waiting for the whole batch, so
+   the UI's task cards resolve one by one; `AgentEvent::Subagent` grew
+   `session_id` and `label`, the child's transcript is titled with
+   `task_label(args)` (description, else the prompt's first line, ≤80 chars)
+   the moment its first `SessionSync` reaches the store (`set_title_async`
+   added to `SessionStore` and the no-store shim; the store is `!Send`, so
+   it is a synchronous write behind the name the engine expects), and the
+   mirror forwards `ToolCallResult` rather than `continue`-ing past it. The
+   `subagent` SSE frame carries the two new fields; the UI (item 5) already
+   read them. `edit_file`: the identical-`old_str`/`new_str` check moved
+   after the match search, so a no-op edit whose anchor is unique is
+   refused with the anchor's line number and the INSERT / DELETE recipe,
+   and one whose anchor is missing or ambiguous gets that error instead;
+   the tool description says the same. Settings: `AgentWebConfig` grew
+   `default_full_auto` (surfaced to the UI as `config.default_full_auto`
+   on `GET /api/chat/meta`, which `AgentChat.tsx` already consulted to
+   seed the composer's auto-confirm toggle) and `GET /api/config` annotates
+   `api_key_set` (stripped again on save); the settings page gained a
+   **Behavior** card (the toggle plus the sub-agent effort and repo fields
+   moved in from the AI card; xcore's `default_work_dir` has no equivalent
+   here) and a `SecretInput` for the API key (show / hide / copy, placeholder
+   from `api_key_set`; xcore uses it for its Sand tokens, which this fork
+   has none of). Overflow: `error_is_context_overflow` classifies the
+   provider's HTTP 400/413 by the phrasings OpenAI-compatible endpoints use
+   (xcore reads a typed code off Sand; there is none across vendors), and the
+   loop answers it with one forced compaction (`maybe_compact_context_inner(…,
+   true)` — the `force` parameter item 6 left with a single `false` caller)
+   and a single replay; `vinx:` the replay recomputes `request_view` and
+   `sent_chars`, which xcore leaves stale, goes out only over a request that
+   actually differs from the refused one, and — the one behavioural departure
+   — a forced compaction never summarizes the user's live message: upstream's
+   tail rule drops the newest message whenever it is larger than the tail
+   budget (a pasted document), which under a forced round would replace the
+   very question with a 500-char summary and have the model answer something
+   it never saw. Here the tail starts at that message at the latest, and when
+   nothing older is left to shed the provider's verdict is surfaced as before
+   (status "skipped: the message alone exceeds the model's context window").
+   The classifier also refuses anything naming a rate limit — Groq's
+   tokens-per-minute overrun is a 413 "Request too large for model", which
+   wants a wait, not a lossy compaction. Cancel: `send_chat_request` takes
+   the turn's cancel flag and wraps connect, header wait and both backoff
+   sleeps in `await_unless_cancelled` (`tokio::select!` over a 50 ms
+   `wasmtimer` tick), so Stop during a silent upstream aborts the request at
+   once instead of after the first byte. `recall_result` (xcore's #10) needed
+   nothing: the vinx tool already advertises and answers as xcore does.
+   Skipped: xcore's `backfill_task_titles` store migration (no shipped rows
+   to back-fill). Tests: `tests/turn.rs` 29 (`a_delegated_task…` asserts
+   label / session_id / one parent `tool_result` / titled child,
+   `a_task_is_labelled_by_description_then_prompt`,
+   `a_context_overflow_verdict_compacts_and_replays_once` (two turns: the
+   older exchange is summarized, the live message survives verbatim),
+   `an_overflowing_message_is_refused_rather_than_summarized_away`,
+   `only_a_4xx_naming_the_context_limit_reads_as_overflow`,
+   `a_stop_during_the_wait_for_headers_ends_the_turn_at_once`),
+   `tests/file_tools.rs` 24, `shim.test.ts` 108, browser 102; the mock grew
+   `mock-overflow-once` (stateless: a live message saying "overflow" gets
+   the 400 unless the history already opens with a summary; the summarizer's
+   request and everything else stream) and `mock-slow-headers` (3 s to headers).
+
 If a later upstream change is worth taking, three-way merge it per file
 (`git merge-file`, base = the recorded fork commit, theirs = upstream `main`,
 ours = the file here), then re-apply judgment where the wasm adaptations and
@@ -81,8 +221,9 @@ The one architectural departure worth knowing: upstream's device is a gateway
 Here the device is a Linux VM emulated in the page (v86):
 
 - `run_shell` calls leave the engine as an HTTP POST that the worker's own
-  `fetch` intercepts and bounces to the main thread, where they run on the VM's
-  `ttyS1` serial line (`runtime/src/worker.ts`, `runtime/src/device-vm.ts`).
+  `fetch` intercepts and bounces to the main thread, where they run as
+  `proc.run` over the VM's ttyS3 control link (`runtime/src/worker.ts`,
+  `runtime/src/device-vm.ts`, `app/vm.ts`).
 - The `/terminal` console is xterm.js wired straight to the VM's `ttyS0`
   (`app/terminal.tsx`, `app/vm.ts`), not a PTY over a socket.
 
@@ -92,3 +233,188 @@ the file tools and skill loading, single-threaded compaction archiving, the
 terminal chat panel and its quality pass, tool-card summaries, the clipboard
 helper export, and hiding the gateway enabled/port section of the settings
 page.
+
+**One tab = one computer** (2026-08-28): every document runs its own VM (see
+`app/pane-id.ts`), so entries that pointed at `/terminal/` as if it were "the"
+terminal of the current machine were lies of navigation — that page is a
+*different* computer.
+
+- `vendor/ui/src/components/apps/apps-page.tsx`: the built-in "Web Terminal"
+  card (and its `BuiltinApp`/`AppCard` scaffolding) removed; the installed
+  list now shows an `appsInstalledEmpty` empty state instead of leaning on
+  the built-ins section. `vendor/ui/src/lib/i18n.ts`: `appsSshTitle`,
+  `appsSshDesc`, `appsBuiltinSection` dropped (both languages).
+- `apps-page.tsx` again (2026-09-02): the list is the in-page machine's, so
+  the page follows the machine's state — **only to ask the list again when
+  it changes**. It reads `<html data-vm-state>` (written by `app/vm.ts`)
+  through a `MutationObserver` — no import of app code. The list itself is
+  real in every state: `app/vm-apps.ts` answers from the machine's mirror
+  while it is off or booting (`state: off`, kinds from the `.kind`
+  sidecars) and from rund while it runs. The page shows nothing about
+  power — no machine notice, no power key, no boot progress: the machine
+  capsule (`app/net-panel.tsx`) floats over every route and is the one
+  owner of the machine's power. (An earlier cut had an `apps-vm-notice`
+  banner with its own power key firing `vinx:vm-power-on`; removed
+  2026-09-04 with the "the machine stays as left" power model,
+  `app/machine-power.ts`, along with the `appsVmDownloading/Starting/
+  PowerOn/Failed/Retry/Stale` keys.) i18n: `appsVmOff` only (both
+  languages). All marked `Vinx:`.
+- `apps-page.tsx` / `client.ts` (2026-09-03): a window app's verb. The shim
+  adds `app_kind` to `kind=app` releases and a `POST
+  /api/releases/app/:id/run` route; `client.runApp()` calls it, and the card
+  and detail panel show "Open window" (`appOpenWindow`) instead of "Start"
+  for `app_kind === "window"`. A pure web app opens from the page even with
+  the machine off (`app/vapp.ts` reads the mirrored package). Errors from
+  the app routes are `AppsError` with the shim's `code`; `MACHINE_OFF` is
+  worded by the page (`appsVmOff`).
+- `apps-page.tsx` (2026-09-03, cards by kind): a machine app (`app_kind`
+  set) is drawn by its kind — a window opens/closes (`appOpenWindow` /
+  `appCloseWindow`), a command runs once
+  (`appRunOnce`, autostart reads "run once on every boot"), a service
+  starts/stops as before. (2026-09-06: the autostart switch shows for
+  every kind; a pure web app — `ReleaseRecord.web`, a Vinx field from the
+  guest's `.web` sidecar — words it as the page's load, not the machine's
+  boot: `appsEnableOpenOnLoad`/`appsDisableOpenOnLoad` + hints,
+  `appsOpenOnLoadLabel` on the overview row. The page's
+  `app/app-autostart.ts` opens the enabled pure web windows on load,
+  machine on or off; the switch reaches the mirror while off. Uninstall
+  reaches the mirror while off too — `app/vm-apps.ts` does the guest's
+  `app remove` there: drop from the enabled list, delete the package and
+  its sidecars — so an app installed without the machine is removed
+  without it; no page change, the shim's DELETE route is unchanged.) The card shows the manifest's `title` (id as
+  tooltip) and one line of `description`, and a kind chip in place of the
+  runtime chip; the detail panel hides version/runtime/owning-session (no
+  source for a vinx app) and shows title/kind/id instead. Batch start/stop
+  count window apps as skipped alongside oneshots. `ReleaseRecord.title` is
+  a Vinx field; `runtime` is no longer sent for vinx apps.
+- `apps-page.tsx` (2026-09-03): re-fetches the list on `vinx:data-restored`
+  (window event from `app/share-store.ts`): `ready` precedes the mirror's
+  replay into /data, so the first `app.list` of a boot is empty.
+- `open_terminal` on the chat page is re-rendered by the host
+  (`app/open-terminal-tool.tsx` via `toolRenderers`) to open the machine
+  console panel (`app/vm-console.tsx`) in place; the vendored renderer is
+  untouched. The engine tool's description (`vendor/engine/os/
+  open_terminal.rs`) was reworded 2026-09-04 — "offer the person a console
+  on the machine", no more "in a new browser tab" — since the vendored
+  engine is the fork and needs no patch.
+- `vendor/engine/os/fs.rs`, `os/mod.rs` (2026-09-04, bare names): a bare
+  filename (no `/`) handed to `write_file` has always landed in the drafts
+  bucket; `read_file` and `edit_file` now resolve the same bare name
+  against the drafts too (`resolve_existing_in_drafts` in `os/mod.rs`:
+  drafts when the file exists there, otherwise as given), so the
+  write → edit → read round trip a model naturally takes works. Both tools
+  grew `with_drafts_dir`, wired by `register_audited` and by the host's
+  `crates/agent-web-core/src/files.rs`. Motivation: a 2026-09-04 session
+  where `edit_file("2048.html")` answered "file not found" for the very
+  file `write_file("2048.html")` had just created. Extended the same day
+  to `list_files` (`os/fs.rs`) and `search_files` (`os/search.rs`) after
+  the next session tried `search_files("md-notes.html")` and was told
+  "cannot resolve path": one rule for every file tool. `resolve_in_drafts`
+  now leaves `.` and `..` alone — they are the default `path` of
+  `list_files`/`search_files` and mean the root, not the drafts bucket
+  that happens to contain a `.` as well.
+- `vendor/engine/os/mod.rs` `check_read` (2026-09-04): a path that does not
+  resolve reports "no such file or directory: …" instead of "cannot resolve
+  path: …", which a model reads as a permission wall. The upstream wording
+  is the same for both cases; this is a wording change only.
+- `vendor/engine/os/search.rs` (2026-09-04): when the search root is a
+  single file, the hit's path printed as `notes.html/:736:` — the empty
+  remainder after `strip_prefix` was joined with `/`. Now the path as
+  written. Upstream has the same bug (it shows in the gateway agent's own
+  `search_files` output); worth sending back.
+- `vendor/engine/agent_loop.rs`, `event.rs` (2026-09-04, `ask_user`
+  timeouts): an unattended session auto-picks each question's default after
+  the timeout, and the payload said so with a bare `auto_picked: true` the
+  tool description never explained. A real session read
+  `selected_labels: ["Images"]` as the person's answer and built a feature
+  nobody asked for. The description now spells out the flag; the payload
+  carries a `note` next to it, only when it is true, saying the defaults are
+  a guess to be named and kept small. Unit test in `event.rs`. Upstream
+  candidate.
+- `crates/agent-web-core/src/files.rs` (2026-09-04): a workspace
+  `download_file` (Safe, ≤16 MB) that reads the VFS and hands the bytes to
+  the page (`setDownloader` on `AgentHost`, wired by `runtime/src/worker.ts`
+  to a `{download, filename, bytes}` message; `client.ts` `onDownload`;
+  `index.ts` `mount` passes the host's `download` option). With the machine
+  off it is the one way a *copy* leaves the workspace — vinx has no
+  `publish`. `host.rs` retires it with the other workspace file tools when
+  the device brings its own (`install_tools`).
+- `crates/agent-web-core/src/files.rs` `open_file` (2026-09-04, the other
+  door): the person's next question was "can't the page just load it?".
+  `open_file` (Safe) vets a workspace path and answers "Offered …"; the
+  chat card (`app/open-file-tool.tsx`, registered on both pages, reading
+  through `app/workspace-files.ts`) carries an Open button whose click
+  reads the bytes back (`AgentHost::readWorkspaceFile` → worker op →
+  `client.readWorkspaceFile`) and hands them to the browser as a new tab
+  (`app/opener.ts`, the guest's open(1) path — same blob:-URL trust
+  posture). Read at click time, not shipped in the result: an old session's
+  card still opens, and shows the file as it is now; a file that is gone
+  says so. `vendor/ui/src/components/chat/tool-call-block.tsx`: `open_file`
+  added to `STICKY_TOOLS` (its result IS the button), marked Vinx.
+  Retired with the other workspace file tools when the device owns files.
+- `crates/agent-web-core/src/files.rs` `install_app` (2026-09-05, the third
+  door): a pure web app — `kind: window`, `ui.type: web`, no `exec` — needs
+  no machine to run, so it should need none to install. The engine tool
+  (Safe) takes `id` + workspace paths `html` (the window's body fragment,
+  required), `css`, `js` and `title`/`description`, does only the workspace
+  half (locate, read, ≤160 KB a part), and hands `{id, title, description,
+  html, css, js}` to the page (`AgentHost::setAppInstaller`, the
+  `setDownloader` idiom; `worker.ts` `installApp`/`installAppResult`
+  round trip through `vmPending`; `client.ts` `onInstallApp`; `index.ts`
+  `MountOptions.installApp`). A rejection comes back as the tool's
+  refusal (`Error: …`). Page side: `app/app-check.ts` mirrors the guest
+  `app check` codes and wording (`ID_INVALID`/`ID_RESERVED`/
+  `TITLE_INVALID`/`DESCRIPTION_INVALID`/`PART_TOO_BIG`, warnings
+  `HTML_EXTERNAL_REF`/`JS_SANDBOX_API`); `app/app-install.ts` writes what
+  `app install` writes — `packVapp` of `app.json` + the parts as
+  `apps/<id>.vapp` plus the `.kind`/`.title`/`.description` sidecars —
+  mirror first (owner tab), live tree when the machine is up
+  (`MachineOffError` is "the next boot's replay carries it", not a
+  failure), refuses an id held by a non-web app, then dispatches
+  `vinx:apps-changed`. `vendor/ui/src/components/apps/apps-page.tsx`
+  listens to it beside `vinx:data-restored`; `vm-apps.ts`'s
+  `relayAppExits` (main.tsx, once) fires the same event on the guest's
+  `app.exited`, so a backend that ends on its own (the ROM picker's q, a
+  game over, a crashed service) is a play button again without a refresh.
+  `tool-call-block.tsx`:
+  `install_app` in `STICKY_TOOLS`. Card `app/install-app-tool.tsx` (both
+  pages): the install line, an Open button (`vmAppsBridge.run`, the
+  mirror's window) and, on the chat page, the Apps page link. Prompts:
+  `device-vm.ts` ON prompt defines "app" as an Apps page entry (a saved
+  HTML file is not one); the NO_MACHINE prompt names `install_app` as the
+  door that does not need the power key. Optional `autostart: true`
+  (2026-09-06) is the guest's `app enable`: the page appends the id to the
+  mirrored `/data/apps/enabled` (`app/enabled-list.ts`), and the window
+  opens whenever the page loads — offered only when the person asked for
+  it. Installing is not enabling: a fresh install (no package under the id
+  yet) that finds the id already on the list — a leftover of a remove
+  whose disable never reached the mirror — drops that line, as the guest's
+  `app install` does, so the new package does not autostart unasked; an
+  update leaves the list alone. Retired when the device owns files — the
+  guest's `app pack`/`app install` is the door then.
+- **Bundled apps** (2026-09-06, `apps/` at the repo root, `web/build-apps.mjs`,
+  `app/bundled-apps.ts`): the page ships apps the way it ships skills.
+  `apps/<id>/` holds a package's sources as `app pack` would take them
+  (`app.json` + the files it needs; `lasertyper` is a tty C game the guest
+  builds with tcc on first run; `nes` is the console's window — a ROM
+  picker on a tty that lists the `.nes` files under `/data` and hands the
+  pick to the image's `/usr/bin/nes`, the picture on the screen window;
+  the machine stays in the image, the package is the doorway); `npm run build:apps` packs each into
+  `app/gen/apps/<id>.vapp` — a deterministic plain-ustar tar.gz, the same
+  shape `app pack` writes, so a source packs to the same bytes on any
+  machine — and lists them in `app/gen/bundled-apps.json` (id, kind, web,
+  title, description, size, sha256). `seedBundledApps()` runs on every
+  page load (`main.tsx`, owner tab only): for each bundled id not yet on
+  the mirrored `apps/bundled` record (one id per line, the enabled list's
+  shape) it lands the package and sidecars exactly as `install_app` does
+  (`installSidecars`/`landInApps`, factored out of `app/app-install.ts`:
+  mirror first, live tree when the machine is up, `MachineOffError`
+  tolerated), then appends the id to the record in the same landing. One
+  gift per machine: the record is written whether or not the person keeps
+  the app, so an uninstall is final (`app remove` in the guest drops the
+  package; the page never re-seeds it), and an `apps/<id>.vapp` already
+  there under a bundled id — the person's own package — is recorded
+  without being touched. `app/gen/` is a build output (`build:apps` runs
+  ahead of `dev`/`build`); the source of truth is `apps/`. Browser test
+  "the page ships an app…" covers the three cases plus a guest leg that
+  runs the game in its tty window.

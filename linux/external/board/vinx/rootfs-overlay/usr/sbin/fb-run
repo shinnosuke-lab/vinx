@@ -1,0 +1,51 @@
+#!/bin/sh
+# fb-run PROG [ARG...] -- run one framebuffer program at a time (§10.5).
+#
+# Every FB entrance (lvdemo, fbdemo, nes, an app template's run) execs
+# through here. Two jobs, both settled by construction:
+#
+#   - mutual exclusion: an flock on fd 9. The kernel drops the lock with
+#     the fd when the process group dies -- kill -9 included -- so a
+#     crashed FB program never wedges the screen, and the second starter
+#     gets an explicit "busy" instead of two programs fighting over fb0
+#     and the evdev queues. Exclusive evdev access IS this lock: at most
+#     one FB program runs, so at most one reader drains the mouse.
+#
+#   - terminal restore: `stty -g` before, restored on the way out --
+#     normal exit, INT, TERM and HUP alike. FB programs put the console
+#     into raw/-echo for their input and historically only some of them
+#     gave it back (nes restored only on clean exit); now the wrapper
+#     owes the console, not the program.
+#
+# The program runs as a child (not an exec): the traps must outlive it
+# to restore the tty. It inherits fd 9, so the lock holds for the whole
+# process group and dies with it.
+
+[ $# -ge 1 ] || {
+	echo 'usage: fb-run PROG [ARG...]' >&2
+	exit 2
+}
+
+mkdir -p /run/vinx
+exec 9>/run/vinx/fb.lock
+if ! flock -n 9; then
+	holder=$(cat /run/vinx/fb.holder 2>/dev/null)
+	echo "fb-run: the framebuffer is busy${holder:+ (held by $holder)}; one FB program at a time" >&2
+	exit 75
+fi
+echo "$$ $1" > /run/vinx/fb.holder
+
+# Save the console's termios when stdin is a tty; restore is idempotent
+# (a signal path may run it right before the EXIT path would).
+SAVED=
+[ -t 0 ] && SAVED=$(stty -g 2>/dev/null) || SAVED=
+restore() {
+	[ -n "$SAVED" ] && stty "$SAVED" 2>/dev/null
+	rm -f /run/vinx/fb.holder
+}
+trap restore EXIT
+trap 'restore; trap - INT; kill -INT $$' INT
+trap 'restore; trap - TERM; kill -TERM $$' TERM
+trap 'restore; trap - HUP; kill -HUP $$' HUP
+
+"$@"

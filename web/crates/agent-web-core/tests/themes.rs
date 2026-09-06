@@ -31,8 +31,7 @@ fn context(session: Option<&str>) -> ToolContext {
     // Leaked: dropping the receiver closes the channel, and the tool reports
     // the applied style through it.
     std::mem::forget(rx);
-    ToolContext::new(tx, Arc::new(AtomicBool::new(false)))
-        .with_session(session.map(str::to_string))
+    ToolContext::new(tx, Arc::new(AtomicBool::new(false))).with_session(session.map(str::to_string))
 }
 
 async fn style(registry: &ToolRegistry, args: serde_json::Value, session: Option<&str>) -> String {

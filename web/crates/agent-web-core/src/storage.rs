@@ -47,7 +47,13 @@ fn named(plain: &str, stem: &str, namespace: Option<&str>) -> String {
     // characters that cannot be read as a path or need escaping anywhere.
     let safe: String = ns
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     format!("{}-{}.db", stem, safe.trim_matches('-'))
 }

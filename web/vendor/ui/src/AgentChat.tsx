@@ -9,22 +9,38 @@ import {
   forwardRef,
   memo,
 } from "react"
-import { Archive, ChevronDown, ChevronLeft, Copy, Check, FileText, Pencil, RotateCcw, X, XCircle, PanelLeftOpen, Plus, Upload } from "lucide-react"
+import { Archive, ChevronDown, ChevronLeft, Copy, Check, ExternalLink, FileText, Pencil, RotateCcw, X, XCircle, PanelLeftOpen, Plus, Upload } from "lucide-react"
 import { ChatBusyError, createChatClient } from "./client"
-import type { ModelCaps } from "./client"
+import type { CatalogModel, ModelCaps } from "./client"
 import { VINX_LOGO } from "./assets/vinx-logo"
 import { defaultToolRenderers } from "./components/chat/tools"
 import { setLabels, t, tf } from "./lib/i18n"
+import { printElementToPdf, printSoloElementToPdf } from "./lib/export"
 import { applyLlmStyle, runLlmScript, currentLlmCss, currentLlmJs } from "./lib/llm-style"
 import { ChatRuntimeContext } from "./lib/chat-runtime"
+import { FoldAllContext, type FoldCommand } from "./lib/fold-all"
+import { clearAttention, installAlerts, signalAttention } from "./lib/alerts"
+import { RevealContext, type RevealCommand } from "./lib/reveal"
+import { dropPendingNotes, placeStatusNote } from "./lib/status-notes"
 import { themeToCssVars } from "./lib/theme"
-import { copyToClipboard, useMediaQuery, MOBILE_QUERY } from "./lib/utils"
+import {
+  NEW_CHAT_DRAFT_ID,
+  clearDraft,
+  readDraft,
+  sweepDrafts,
+  writeDraft,
+  type ComposerDraft,
+} from "./lib/composer-draft"
+import { cn, copyToClipboard, useMediaQuery, MOBILE_QUERY } from "./lib/utils"
 import { Markdown } from "./components/chat/markdown"
 import { ReasoningBlock } from "./components/chat/reasoning-block"
 import { ToolCallBlock } from "./components/chat/tool-call-block"
+import { StepGroup, buildTranscriptBlocks } from "./components/chat/step-group"
+import { MessageOutline, type OutlineEntry } from "./components/chat/message-outline"
 import { ConfirmBar } from "./components/chat/confirm-bar"
 import { AskUserBar } from "./components/chat/ask-user-bar"
 import { Lightbox } from "./components/chat/lightbox"
+import { FilePreview } from "./components/chat/file-preview"
 import { MessageActions } from "./components/chat/message-actions"
 import { ChatInput } from "./components/chat/chat-input"
 import { ChatWelcome } from "./components/chat/chat-welcome"
@@ -32,15 +48,18 @@ import { QueuedItems, type QueuedItem } from "./components/chat/queued-items"
 import { SessionsPanel } from "./components/chat/sessions-panel"
 import { ExportMenu } from "./components/chat/export-menu"
 import { SessionReleases } from "./components/chat/session-releases"
+import { SessionCategoryButton } from "./components/chat/session-category"
 import { Spinner } from "./components/shared/spinner"
 import { Button } from "./components/ui/button"
 import { toast } from "./components/ui/toast"
+import { isImageUploadId } from "./lib/attachments"
 import type {
   AgentChatHandle,
   AgentChatProps,
   ArchiveGeneration,
   AskAnswer,
   AskQuestion,
+  AttachmentView,
   ChatEvent,
   MessageView,
   SessionSummary,
@@ -54,6 +73,50 @@ let nextMsgId = 0
 /** Max cadence for applying buffered stream deltas to React state (see
  *  pendingDeltasRef): ~20 renders/s regardless of provider chunk rate. */
 const DELTA_FLUSH_MS = 50
+
+/** Smallest text release per smoothing tick (~120 chars/s at DELTA_FLUSH_MS).
+ *  Providers that emit small frequent chunks drain their buffer immediately,
+ *  so smoothing is invisible for them. */
+const SMOOTH_MIN_CHARS = 6
+
+// ── Interval-aware typewriter pacing ──
+// Some providers (measured: kimi k3, direct AND via proxies) emit output as
+// large bursts seconds apart: ~1s of flowing chunks, 2-3s of silence, then a
+// multi-KB block in one network flush. A fixed drain rate either pops the
+// block at once or lags behind, so the release rate adapts to the measured
+// burst interval: the backlog is spread evenly until the NEXT burst is
+// expected, making block-pause-block render as one continuous scroll.
+//
+// The interval estimate is an EMA over gaps between delta arrivals, counting
+// only gaps ≥ SMOOTH_GAP_MIN_MS: frames inside one burst arrive ~0ms apart
+// and must not drag the estimate down. The EMA is clamped to
+// SMOOTH_GAP_MAX_MS so a long thinking pause (measured 21-37s to first
+// token) cannot push display lag beyond ~4s; the full flush on `done`
+// bounds it at stream end regardless.
+
+/** Gaps shorter than this are frames within one burst, not a burst boundary. */
+const SMOOTH_GAP_MIN_MS = 250
+
+/** Upper clamp for the burst-interval estimate (= worst-case display lag). */
+const SMOOTH_GAP_MAX_MS = 4000
+
+/** EMA weight of the newest observed burst gap. */
+const SMOOTH_EMA_ALPHA = 0.3
+
+/** Starting interval estimate before any burst gap has been observed. */
+const SMOOTH_EMA_INITIAL_MS = 800
+
+/** Split a delta buffer into the portion to render this tick and the rest:
+ *  `want` chars with the SMOOTH_MIN_CHARS floor, never cutting a surrogate
+ *  pair in half (emoji etc. stay intact). */
+function takeSmoothPrefix(buf: string, want: number): [string, string] {
+  if (!buf) return ["", ""]
+  let take = Math.max(SMOOTH_MIN_CHARS, want)
+  if (take >= buf.length) return [buf, ""]
+  const last = buf.charCodeAt(take - 1)
+  if (last >= 0xd800 && last <= 0xdbff) take++
+  return [buf.slice(0, take), buf.slice(take)]
+}
 
 /** Backoff before redialling a dropped follow stream. Short because the
  *  reconnect is cheap and self-repairing (it replays a full snapshot). */
@@ -85,110 +148,6 @@ function formatElapsed(ms: number): string {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
 }
 
-/**
- * Save a DOM region to PDF via the browser print dialog. Shared by the header
- * "export PDF" (whole transcript) and the per-message export button.
- *
- * Sizes a single tall `@page` to the content: measures `el` at the printed
- * width (190mm) so wrapping matches the PDF, injects a one-shot `@page`, and
- * reproduces the active chat skin's page background. Cleaned up on `afterprint`.
- *
- * `neutralizeInnerColumn` handles the transcript container, whose inner column
- * (`mx-auto max-w-3xl px-4`) and print-only title (`[data-print-title]`) must
- * be measured the way the print stylesheet renders them. For a single message
- * body element there is no such column, so leave it off.
- */
-function printElementToPdf(
-  el: HTMLElement,
-  opts: { title?: string; neutralizeInnerColumn?: boolean } = {},
-) {
-  const prevTitle = document.title
-  const cleanup = () => {
-    document.getElementById("print-single-page")?.remove()
-    document.title = prevTitle
-  }
-
-  const run = () => {
-    // Measure with the SAME box the print stylesheet renders: theme.css's
-    // `@media print` widens the transcript by dropping the inner column's
-    // `px-4` / `max-w-3xl`. Measuring with the on-screen padding narrows the
-    // text, wraps more lines, and over-counts the height — which then sizes
-    // the single page too tall and leaves a long blank tail.
-    const inner = opts.neutralizeInnerColumn
-      ? el.querySelector<HTMLElement>(":scope > div:not([data-print-title])")
-      : null
-    // Save whole inline styles: the overrides below use `!important`
-    // priority, which a property-by-property restore can't clear.
-    const elCss = el.style.cssText
-    const innerCss = inner?.style.cssText ?? ""
-    // The print-only title is `display: none` on screen, so it would be
-    // missing from the measured scrollHeight and the printed page would come
-    // up short. Show it for the (synchronous, paint-free) measurement, then
-    // restore.
-    const titleEl = opts.neutralizeInnerColumn
-      ? el.querySelector<HTMLElement>("[data-print-title]")
-      : null
-    const titleCss = titleEl?.style.cssText ?? ""
-    titleEl?.style.setProperty("display", "block", "important")
-    // Force the SAME geometry the print stylesheet forces (full width, no
-    // column max-width/margins) — and with `!important`, so an active
-    // `set_chat_style` skin's own `!important` width/padding can't narrow
-    // the MEASURED content below the PRINTED width. A narrower measurement
-    // wraps more lines and over-counts the height, sizing the single page
-    // far too tall and leaving a long blank tail (the reported bug).
-    el.style.setProperty("overflow", "visible", "important")
-    el.style.setProperty("height", "auto", "important")
-    el.style.setProperty("width", "190mm", "important")
-    el.style.setProperty("max-width", "190mm", "important")
-    if (inner) {
-      inner.style.setProperty("max-width", "none", "important")
-      inner.style.setProperty("margin-left", "0", "important")
-      inner.style.setProperty("margin-right", "0", "important")
-      inner.style.setProperty("padding-left", "0", "important")
-      inner.style.setProperty("padding-right", "0", "important")
-    }
-    const contentHeightMm = Math.ceil((el.scrollHeight * 25.4) / 96)
-    el.style.cssText = elCss
-    if (inner) inner.style.cssText = innerCss
-    if (titleEl) titleEl.style.cssText = titleCss
-    // The page must clear the content plus the `@page` top+bottom margins;
-    // a small safety margin guards against sub-pixel rounding clipping the
-    // last line. Nothing more, so the tail stays tight (no long blank).
-    // Keep in sync with the `[data-chat-messages]` print `padding` in
-    // theme.css: the @page margin is dropped to 0 so a custom-skin page
-    // background can bleed to the paper edge, and this inset moves into
-    // that padding instead — so the single page is still sized around it.
-    const PAGE_MARGIN_MM = 10
-    const SAFETY_MM = 4
-    const pageHeightMm = contentHeightMm + PAGE_MARGIN_MM * 2 + SAFETY_MM
-    // Reproduce the active chat skin's page background (the resolved
-    // `--color-background`, read off `.acc-root`) so a themed transcript
-    // exports on themed "paper" instead of white — which also keeps a dark
-    // skin's light text readable. Decorative background images / JS effects
-    // are deliberately NOT reproduced (they only add noise to a document).
-    const accRoot = el.closest(".acc-root") ?? document.body
-    const pageBg = getComputedStyle(accRoot).backgroundColor
-    const style = document.createElement("style")
-    style.id = "print-single-page"
-    style.textContent = `@media print { @page { size: 210mm ${pageHeightMm}mm !important; margin: 0 !important; } html { background: ${pageBg} !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; } }`
-    document.head.appendChild(style)
-    // The browser derives the default "Save as PDF" filename from
-    // document.title — swap in the session title for the dialog's lifetime.
-    if (opts.title) document.title = opts.title
-    window.addEventListener("afterprint", cleanup, { once: true })
-    requestAnimationFrame(() => window.print())
-  }
-
-  // Late-loading webfonts change line metrics (hence wrapping and height);
-  // wait for them so the measurement matches what actually prints.
-  const fonts = document.fonts
-  if (fonts?.ready) {
-    fonts.ready.then(run, run)
-  } else {
-    run()
-  }
-}
-
 interface Message {
   id: number
   role: "user" | "assistant" | "tool" | "status" | "error"
@@ -207,6 +166,9 @@ interface Message {
    *  archive), not as a regular user bubble. Keeps role "user" so the rewind
    *  ordinal stays aligned with the server's user-message indices. */
   summaryMarker?: boolean
+  /** `status` rows: work in flight ("Compacting context..."), shown with a
+   *  spinner and replaced by the next status note (see lib/status-notes). */
+  pending?: boolean
 }
 
 /** An attachment staged in the composer: uploaded eagerly on paste/pick, sent
@@ -217,7 +179,8 @@ interface PendingUpload {
   /** `image` renders a thumbnail chip; `file` a name+size chip. */
   kind: "image" | "file"
   size: number
-  /** Object URL for the local preview (images only). */
+  /** Preview URL: a `blob:` object URL for a file picked in this page, or the
+   *  server's `GET /api/chat/upload/{id}` for a chip restored from a draft. */
   previewUrl?: string
   /** Upload id once the eager upload finished; chips without it block send. */
   id?: string
@@ -225,10 +188,50 @@ interface PendingUpload {
   lines?: number | null
 }
 
+/** Release a chip's preview. Only object URLs hold memory; a restored chip's
+ *  server URL is a plain string. */
+function revokePreview(url: string | undefined) {
+  if (url && url.startsWith("blob:")) URL.revokeObjectURL(url)
+}
+
 let nextUploadKey = 0
 
+/** Debounce for persisting the composer text to the draft store. Attachment
+ *  and skill-chip changes flush immediately (they are rarer and matter more). */
+const DRAFT_SAVE_MS = 300
+
+/** Identity of a draft's non-text parts (which draft, which uploads, which
+ *  skill). A change here is "structural" and persists at once; a change in
+ *  the text alone is debounced. */
+function draftSignature(
+  id: string,
+  uploads: PendingUpload[],
+  skill: string | null | undefined,
+): string {
+  return `${id}\n${uploads.map((p) => p.id ?? "").join(",")}\n${skill ?? ""}`
+}
+
+/** Rebuild composer chips from a stored draft: every entry already has its
+ *  upload id, so the chips are sendable at once; previews point at the
+ *  server copy (the original `File` did not survive the page). */
+function uploadsFromDraft(
+  draft: ComposerDraft | null,
+  uploadUrl: (id: string, name?: string) => string,
+): PendingUpload[] {
+  if (!draft) return []
+  return draft.attachments.slice(0, MAX_ATTACHMENTS_PER_MESSAGE).map((a) => ({
+    key: nextUploadKey++,
+    name: a.name,
+    kind: a.kind,
+    size: a.size,
+    previewUrl: a.kind === "image" ? uploadUrl(a.id) : uploadUrl(a.id, a.name),
+    id: a.id,
+    lines: a.lines,
+  }))
+}
+
 /** Max attachments per message, images + files combined. */
-const MAX_ATTACHMENTS_PER_MESSAGE = 3
+const MAX_ATTACHMENTS_PER_MESSAGE = 5
 
 const IMAGE_MAX_BYTES = 10 * 1024 * 1024
 const FILE_MAX_BYTES = 20 * 1024 * 1024
@@ -237,29 +240,33 @@ const FILE_MAX_BYTES = 20 * 1024 * 1024
  *  — including other `image/*` like SVG — uploads as a plain file. */
 const IMAGE_UPLOAD_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"]
 
-/** `<uuid>.<ext>` upload id → is it an image (thumbnail vs file chip)? */
-function isImageUploadId(id: string): boolean {
-  const ext = id.split(".").pop() ?? ""
-  return ["png", "jpg", "jpeg", "webp", "gif"].includes(ext)
+/** Attachment references off a `queue` frame item. The server sends the
+ *  full `Attachment` records; anything malformed (or a bare count from an
+ *  older server) reads as "no previewable attachments" rather than a crash. */
+function queuedAttachments(raw: unknown): AttachmentView[] {
+  if (!Array.isArray(raw)) return []
+  const out: AttachmentView[] = []
+  for (const a of raw) {
+    if (!a || typeof a !== "object") continue
+    const r = a as Record<string, unknown>
+    if (typeof r.id !== "string" || !r.id) continue
+    out.push({
+      id: r.id,
+      name: typeof r.name === "string" && r.name ? r.name : null,
+      mime: typeof r.mime === "string" && r.mime ? r.mime : null,
+      size: typeof r.size === "number" ? r.size : null,
+      lines: typeof r.lines === "number" ? r.lines : null,
+    })
+  }
+  return out
 }
 
-/** localStorage namespace for the per-session model override. The
- *  `ontrak.model.` prefix is a leftover from the ontrakagent codebase this
- *  UI was ported from; reads fall back to the legacy key once and migrate
- *  its value forward so existing picks survive the rename. */
+/** localStorage namespace for the per-session model override. */
 const MODEL_KEY_PREFIX = "agent.model."
-const LEGACY_MODEL_KEY_PREFIX = "ontrak.model."
 
 function readModelOverride(sid: string): string {
   try {
-    const current = localStorage.getItem(`${MODEL_KEY_PREFIX}${sid}`)
-    if (current !== null) return current
-    const legacy = localStorage.getItem(`${LEGACY_MODEL_KEY_PREFIX}${sid}`)
-    if (legacy !== null) {
-      localStorage.setItem(`${MODEL_KEY_PREFIX}${sid}`, legacy)
-      localStorage.removeItem(`${LEGACY_MODEL_KEY_PREFIX}${sid}`)
-      return legacy
-    }
+    return localStorage.getItem(`${MODEL_KEY_PREFIX}${sid}`) ?? ""
   } catch {
     /* private mode / quota: the override simply stays unread */
   }
@@ -270,8 +277,6 @@ function writeModelOverride(sid: string, model: string) {
   try {
     if (model) localStorage.setItem(`${MODEL_KEY_PREFIX}${sid}`, model)
     else localStorage.removeItem(`${MODEL_KEY_PREFIX}${sid}`)
-    // Drop any legacy twin so the two namespaces can never diverge.
-    localStorage.removeItem(`${LEGACY_MODEL_KEY_PREFIX}${sid}`)
   } catch {
     /* private mode / quota: selection stays in memory */
   }
@@ -292,6 +297,47 @@ function writeEffortOverride(sid: string, effort: string) {
   try {
     if (effort) localStorage.setItem(`${EFFORT_KEY_PREFIX}${sid}`, effort)
     else localStorage.removeItem(`${EFFORT_KEY_PREFIX}${sid}`)
+  } catch {
+    /* private mode / quota: selection stays in memory */
+  }
+}
+
+/** Per-session model tuning: catalog parameter values (`thinking`,
+ *  `context`, `effort`…) plus the max-mode flag, one JSON record per session
+ *  so a re-opened session keeps the picks made in it. */
+const TUNING_KEY_PREFIX = "agent.tuning."
+
+interface TuningOverride {
+  parameters: Record<string, string>
+  maxMode: boolean
+}
+
+function readTuningOverride(sid: string): TuningOverride {
+  try {
+    const raw = localStorage.getItem(`${TUNING_KEY_PREFIX}${sid}`)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<TuningOverride>
+      const parameters: Record<string, string> = {}
+      if (parsed.parameters && typeof parsed.parameters === "object") {
+        for (const [k, v] of Object.entries(parsed.parameters)) {
+          if (typeof v === "string" && v) parameters[k] = v
+        }
+      }
+      return { parameters, maxMode: parsed.maxMode === true }
+    }
+  } catch {
+    /* private mode / corrupt record: fall through to defaults */
+  }
+  return { parameters: {}, maxMode: false }
+}
+
+function writeTuningOverride(sid: string, tuning: TuningOverride) {
+  const parameters: Record<string, string> = {}
+  for (const [k, v] of Object.entries(tuning.parameters)) if (v.trim()) parameters[k] = v
+  const empty = Object.keys(parameters).length === 0 && !tuning.maxMode
+  try {
+    if (empty) localStorage.removeItem(`${TUNING_KEY_PREFIX}${sid}`)
+    else localStorage.setItem(`${TUNING_KEY_PREFIX}${sid}`, JSON.stringify({ parameters, maxMode: tuning.maxMode }))
   } catch {
     /* private mode / quota: selection stays in memory */
   }
@@ -401,6 +447,7 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     enableExport = true,
     modelName: modelNameProp,
     onSessionChange,
+    onTitleChange,
     onBack,
     hideSidebar = false,
     sessionHref,
@@ -414,10 +461,29 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
   useMemo(() => setLabels(labels), [labels])
 
   const [messages, setMessages] = useState<Message[]>([])
-  const [input, setInput] = useState("")
+  // Read-during-render mirror for stable runtime callbacks (findToolCall):
+  // a callback closing over `messages` would churn the runtime context value
+  // — and every card consuming it — on each streamed token.
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
+  // Composer draft (lib/composer-draft): text, staged attachments and the
+  // pending `/skill` chip survive a reload. The fresh chat's draft seeds the
+  // initial state; a session's draft is swapped in by `switchDraft` when it
+  // is opened. `draftIdRef` names the draft the composer currently holds.
+  const [initialDraft] = useState(() => readDraft(NEW_CHAT_DRAFT_ID))
+  const draftIdRef = useRef(NEW_CHAT_DRAFT_ID)
+  const [input, setInput] = useState(initialDraft?.text ?? "")
+  const inputRef = useRef(input)
+  inputRef.current = input
   // Composer skill state: pending is the next-turn intent; activating bridges
   // send → authoritative SSE; active is the server-owned session context.
   const [pendingSkill, setPendingSkill] = useState<SkillInfo | null>(null)
+  const pendingSkillRef = useRef<SkillInfo | null>(null)
+  pendingSkillRef.current = pendingSkill
+  /** Skill name from a restored draft that could not be resolved yet (the
+   *  skill list had not loaded); resolved when it arrives, and kept in the
+   *  persisted draft meanwhile so a second reload does not lose it. */
+  const pendingSkillRestoreRef = useRef<string | null>(initialDraft?.skill ?? null)
   const [activatingSkill, setActivatingSkill] = useState<SkillInfo | null>(null)
   const [resettingSkill, setResettingSkill] = useState(false)
   const [streaming, setStreaming] = useState(false)
@@ -426,6 +492,10 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
    *  session's stale transcript. */
   const [sessionLoading, setSessionLoading] = useState(false)
   const [sessionId, setSessionId] = useState<string | null>(null)
+  /** The session's `origin` label from the SSE `session` frame. `"task"`
+   *  marks a sub-agent transcript, which is served read-only (the backend
+   *  rejects posts into it too). */
+  const [sessionOrigin, setSessionOrigin] = useState<string | null>(null)
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null)
   const [pendingAskUser, setPendingAskUser] = useState<PendingAskUser | null>(null)
   /** Live progress per `task` sub-agent (keyed by the parent task tool_call
@@ -434,7 +504,10 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
    *  readouts. Rendered as a strip above the composer and shared with the
    *  `task` tool card via the chat runtime context. */
   const [subagentNotes, setSubagentNotes] = useState<
-    Record<string, { note: string; startedAt: number }>
+    Record<
+      string,
+      { note: string; startedAt: number; sessionId?: string; label?: string }
+    >
   >({})
   /** Tasks whose per-task cancel was requested; the row shows "cancelling…"
    *  until the task's tool_result lands and clears it. */
@@ -443,9 +516,21 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
    *  they auto-start when the running turn ends. Ids address one item for
    *  remove/edit; `attachments` is the count riding the parked message. */
   const [queuedItems, setQueuedItems] = useState<QueuedItem[]>([])
-  // Session-scoped full-auto (backend-owned; synced from SSE `session` frames
-  // and session detail so a reload / second tab converges with the backend).
+  const queuedItemsRef = useRef<QueuedItem[]>([])
+  queuedItemsRef.current = queuedItems
+  // Session-scoped full-auto (backend-owned and persisted with the session;
+  // synced from SSE `session` frames and session detail so a reload / second
+  // tab / restart converges with the backend).
   const [autoConfirm, setAutoConfirm] = useState(false)
+  /** Config default for NEW sessions (`config.default_full_auto` from meta):
+   *  seeds the badge on a fresh chat before the server session exists; once a
+   *  session is live, its own frames own the state. */
+  const defaultFullAutoRef = useRef(false)
+  /** The toggle was flipped on a fresh chat (no server session yet): the
+   *  choice rides along on the first send (`full_auto`) so the session is
+   *  created in that mode — even its first tool call honours it. `null` =
+   *  untouched, follow the configured default. */
+  const preSessionAutoRef = useRef<boolean | null>(null)
   const [modelName, setModelName] = useState(modelNameProp ?? "")
   // Upstream-advertised models (empty = switcher stays a read-only badge) and
   // the per-session override the user picked. `selectedModel` empty = follow
@@ -462,15 +547,96 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
   const [selectedEffort, setSelectedEffort] = useState("")
   const selectedEffortRef = useRef("")
   selectedEffortRef.current = selectedEffort
-  const [pendingUploads, setPendingUploads] = useState<PendingUpload[]>([])
+  // Structured model catalog from /api/models (`catalog`, optional; absent on vinx today):
+  // base models + parameter definitions + variants. Empty = flat models.
+  const [modelCatalog, setModelCatalog] = useState<CatalogModel[]>([])
+  // Per-session catalog parameter values by definition id ("" / absent = the
+  // model's default) and the max-mode flag. Reset on model switch — each
+  // model has its own parameter space.
+  const [selectedParameters, setSelectedParameters] = useState<Record<string, string>>({})
+  const selectedParametersRef = useRef<Record<string, string>>({})
+  selectedParametersRef.current = selectedParameters
+  const [maxMode, setMaxMode] = useState(false)
+  const maxModeRef = useRef(false)
+  maxModeRef.current = maxMode
+  /** Persist the in-memory (pre-session) tuning picks under a fresh session
+   *  id, so the sessionId effect re-reads them instead of resetting. */
+  const carryTuningTo = (sid: string) => {
+    const parameters = selectedParametersRef.current
+    const max = maxModeRef.current
+    if (Object.values(parameters).some((v) => v.trim()) || max) {
+      writeTuningOverride(sid, { parameters, maxMode: max })
+    }
+  }
+  // Transcript-wide expand/collapse of process blocks (header menu). A
+  // command object is issued per click; every mounted block applies it once.
+  // Cleared on session switch so a stale command cannot reach the next
+  // transcript's blocks.
+  const [foldCommand, setFoldCommand] = useState<FoldCommand | null>(null)
+  const foldSeqRef = useRef(0)
+  const foldAll = useCallback((mode: FoldCommand["mode"]) => {
+    setFoldCommand({ mode, seq: ++foldSeqRef.current })
+  }, [])
+  // Targeted reveal of one earlier tool call (lib/reveal): issued by the
+  // recall_result card's "show original". Retracted after the fold
+  // transitions have had time to run, so a card that remounts later does
+  // not replay it (a reveal IS applied on mount — the target usually mounts
+  // because its group just unfolded for it).
+  const [revealCommand, setRevealCommand] = useState<RevealCommand | null>(null)
+  const revealSeqRef = useRef(0)
+  const revealTimerRef = useRef<number | undefined>(undefined)
+  const revealToolCall = useCallback((callId: string) => {
+    setRevealCommand({ callId, seq: ++revealSeqRef.current })
+    window.clearTimeout(revealTimerRef.current)
+    revealTimerRef.current = window.setTimeout(() => setRevealCommand(null), 1500)
+  }, [])
+  useEffect(() => () => window.clearTimeout(revealTimerRef.current), [])
+  /** The transcript's own record of an earlier tool call, for cards that
+   *  refer to one (recall_result). Reads the render-time mirror: the row is
+   *  older than the card asking, so it is settled by then. */
+  const findToolCall = useCallback((callId: string) => {
+    const row = messagesRef.current.find((m) => m.role === "tool" && m.toolCallId === callId)
+    return row ? { name: row.toolName ?? "", args: row.toolArgs } : undefined
+  }, [])
+  const [pendingUploads, setPendingUploads] = useState<PendingUpload[]>(() =>
+    uploadsFromDraft(initialDraft, client.uploadUrl),
+  )
   const pendingUploadsRef = useRef<PendingUpload[]>([])
   pendingUploadsRef.current = pendingUploads
   /** Full-screen image preview (composer chips + transcript thumbnails). */
   const [lightbox, setLightbox] = useState<{ src: string; alt?: string } | null>(null)
+  /** Non-image attachment opened from the queue strip (text head / download). */
+  const [filePreview, setFilePreview] = useState<AttachmentView | null>(null)
+  /** A queue-row chip was clicked: images go to the lightbox, files to the
+   *  file preview modal. */
+  const handlePreviewAttachment = useCallback(
+    (a: AttachmentView) => {
+      if (isImageUploadId(a.id)) setLightbox({ src: client.uploadUrl(a.id), alt: a.name || a.id })
+      else setFilePreview(a)
+    },
+    [client],
+  )
   const [chatTitle, setChatTitle] = useState("")
+  // Mirror every header-title change (load / auto-title / rename / new chat)
+  // to the host in one place, so no `setChatTitle` call site can forget it.
+  // Ref-routed: a new callback identity must not re-fire the current title.
+  const onTitleChangeRef = useRef(onTitleChange)
+  onTitleChangeRef.current = onTitleChange
+  useEffect(() => {
+    onTitleChangeRef.current?.(chatTitle)
+  }, [chatTitle])
   const [titleEditing, setTitleEditing] = useState(false)
   const [titleDraft, setTitleDraft] = useState("")
   const [sessions, setSessions] = useState<SessionSummary[]>([])
+  // The open session's category (header tag pill). Seeded from the session
+  // detail on resume, kept in step with the sidebar list (which the sessions
+  // page also mutates), and updated optimistically by the header picker.
+  const [sessionCategory, setSessionCategory] = useState<string | null>(null)
+  const knownCategories = useMemo(() => {
+    const seen = new Set<string>()
+    for (const s of sessions) if (s.category) seen.add(s.category)
+    return [...seen].sort((a, b) => a.localeCompare(b))
+  }, [sessions])
   const [skills, setSkills] = useState<SkillInfo[]>([])
   // Name of the skill steering the conversation (driven by live `skill` events;
   // null = none). Powers the composer pill + one-click /reset.
@@ -533,6 +699,156 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
   const sessionIdRef = useRef<string | null>(null)
   sessionIdRef.current = sessionId
 
+  // ── Composer draft persistence ──
+  // Everything the composer holds is written under `draftIdRef.current`:
+  // text changes debounced, attachment / skill-chip changes at once (a chip
+  // still uploading has no id and is skipped — it cannot be restored). The
+  // three send paths clear text + chips, which the same effect turns into a
+  // removal, so a sent message never leaves a draft behind and a failed send
+  // that hands the text back re-creates it. Hiding the tab flushes the
+  // pending write: `beforeunload` is unreliable on mobile, `pagehide` /
+  // `visibilitychange` fire before the page is frozen or killed.
+  const draftTimerRef = useRef<number | null>(null)
+  const draftSigRef = useRef<string | null>(null)
+  const persistDraftNow = useCallback(() => {
+    if (draftTimerRef.current !== null) {
+      window.clearTimeout(draftTimerRef.current)
+      draftTimerRef.current = null
+    }
+    const attachments = pendingUploadsRef.current
+      .filter((p): p is PendingUpload & { id: string } => !!p.id)
+      .map((p) => ({ id: p.id, name: p.name, kind: p.kind, size: p.size, lines: p.lines }))
+    writeDraft(draftIdRef.current, {
+      text: inputRef.current,
+      attachments,
+      skill: pendingSkillRef.current?.name ?? pendingSkillRestoreRef.current ?? undefined,
+      updatedAt: Date.now(),
+    })
+  }, [])
+  useEffect(() => {
+    const sig = draftSignature(draftIdRef.current, pendingUploads, pendingSkill?.name)
+    const structural = sig !== draftSigRef.current
+    draftSigRef.current = sig
+    if (structural) {
+      persistDraftNow()
+      return
+    }
+    if (draftTimerRef.current !== null) window.clearTimeout(draftTimerRef.current)
+    draftTimerRef.current = window.setTimeout(() => {
+      draftTimerRef.current = null
+      persistDraftNow()
+    }, DRAFT_SAVE_MS)
+  }, [input, pendingUploads, pendingSkill, persistDraftNow])
+  // Background-tab attention signals (title badge + chime): document-level
+  // listeners live for the component's lifetime.
+  useEffect(() => installAlerts(), [])
+
+  useEffect(() => {
+    const flush = () => {
+      if (draftTimerRef.current !== null) persistDraftNow()
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flush()
+    }
+    window.addEventListener("pagehide", flush)
+    document.addEventListener("visibilitychange", onVisibility)
+    return () => {
+      window.removeEventListener("pagehide", flush)
+      document.removeEventListener("visibilitychange", onVisibility)
+      // Unmount: persist whatever is still pending (host navigated away).
+      flush()
+    }
+  }, [persistDraftNow])
+  // One sweep per page load: forget drafts nobody came back to in a week.
+  useEffect(() => {
+    sweepDrafts()
+  }, [])
+
+  const skillsRef = useRef<SkillInfo[]>([])
+  skillsRef.current = skills
+  /** The skill list has answered once (even empty / 404): restored skill
+   *  names can be resolved or dropped from here on. */
+  const skillsLoadedRef = useRef(false)
+
+  /** Turn a restored draft's skill NAME into the chip, once the skill list is
+   *  known. Until then the name stays in `pendingSkillRestoreRef` (and so in
+   *  the persisted draft, so a second reload keeps it); an unknown or
+   *  disabled skill is dropped quietly and the draft rewritten without it. */
+  const resolveRestoredSkill = useCallback(() => {
+    const name = pendingSkillRestoreRef.current
+    if (!name || !skillsLoadedRef.current) return
+    pendingSkillRestoreRef.current = null
+    const skill = skillsRef.current.find(
+      (s) => s.name === name && s.user_invocable && s.enabled !== false,
+    )
+    if (skill) {
+      // Ref first: a flush before the re-render must still see the skill.
+      pendingSkillRef.current = skill
+      setPendingSkill(skill)
+    } else {
+      persistDraftNow()
+    }
+  }, [persistDraftNow])
+
+  /** Point the composer at another draft: flush the current one under its
+   *  own id, then load `id`'s stored text / chips / skill chip. Chips from
+   *  files picked in THIS page hold object URLs and are released. Called by
+   *  new-chat and session-open, never by the send paths — a session minted
+   *  by a send inherits the fresh chat's composer, see `adoptDraftId`. */
+  const switchDraft = useCallback(
+    (id: string) => {
+      if (draftIdRef.current === id) return
+      if (draftTimerRef.current !== null) persistDraftNow()
+      pendingUploadsRef.current.forEach((p) => revokePreview(p.previewUrl))
+      const draft = readDraft(id)
+      const text = draft?.text ?? ""
+      const uploads = uploadsFromDraft(draft, client.uploadUrl)
+      draftIdRef.current = id
+      // Mirror into the refs now: a flush racing the re-render must never
+      // write the previous composer under the new id.
+      inputRef.current = text
+      pendingUploadsRef.current = uploads
+      pendingSkillRef.current = null
+      pendingSkillRestoreRef.current = draft?.skill ?? null
+      setInput(text)
+      setPendingUploads(uploads)
+      setPendingSkill(null)
+      resolveRestoredSkill()
+      // The persistence effect then sees a new signature (the id changed)
+      // and rewrites what was just read — a harmless touch.
+    },
+    [client, persistDraftNow, resolveRestoredSkill],
+  )
+
+  /** A send on the fresh chat named a session: the composer (emptied by the
+   *  send) now belongs to that session. The `new` record is dropped rather
+   *  than flushed — a debounced write still pending would otherwise land
+   *  under the wrong id — and anything typed since the send moves along. */
+  const adoptDraftId = useCallback(
+    (sid: string) => {
+      if (draftIdRef.current !== NEW_CHAT_DRAFT_ID) return
+      if (draftTimerRef.current !== null) {
+        window.clearTimeout(draftTimerRef.current)
+        draftTimerRef.current = null
+      }
+      clearDraft(NEW_CHAT_DRAFT_ID)
+      draftIdRef.current = sid
+      persistDraftNow()
+    },
+    [persistDraftNow],
+  )
+
+  /** A restored image chip whose upload is gone (runtime cache cleared, other
+   *  agent): drop the chip and say so, rather than send a dangling reference
+   *  the server would silently strip. Only server-backed previews count — a
+   *  `blob:` preview that fails to decode says nothing about the upload. */
+  const handleUploadPreviewError = useCallback((key: number) => {
+    const gone = pendingUploadsRef.current.find((p) => p.key === key)
+    if (!gone?.id || !gone.previewUrl || gone.previewUrl.startsWith("blob:")) return
+    toast.warning(tf("draftAttachmentGone", gone.name))
+    setPendingUploads((prev) => prev.filter((p) => p.key !== key))
+  }, [])
+
   // Archive expander lifecycle. Reset on session switch; (re)fetch the
   // generation list whenever the session goes idle — a compaction that just
   // happened during the finished turn becomes visible right away.
@@ -587,19 +903,26 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
    *  has since navigated to (rapid session switching on slow loads). */
   const loadGenRef = useRef(0)
 
-  // ── Streaming delta throttle ──
+  // ── Streaming delta throttle + typewriter smoothing ──
   // Applying every SSE frame directly means one full markdown re-parse of the
   // growing message per provider chunk (cost grows with message length). Text
-  // deltas are buffered here and flushed as a single setMessages at most every
-  // DELTA_FLUSH_MS; structural events flush synchronously first so ordering is
-  // preserved. `toolArgs` holds the ids of tool calls whose accumulated args
-  // (in toolArgsRef) need syncing into state.
+  // deltas are buffered here and drained by a DELTA_FLUSH_MS tick that
+  // releases at most a slice of the backlog per step (takeSmoothPrefix), so
+  // providers that batch tokens into large infrequent chunks render as a
+  // steady typewriter instead of block-pause-block. Structural events flush
+  // the whole buffer synchronously first so ordering is preserved. `toolArgs`
+  // holds the ids of tool calls whose accumulated args (in toolArgsRef) need
+  // syncing into state.
   const pendingDeltasRef = useRef<{ content: string; reasoning: string; toolArgs: Set<string> }>({
     content: "",
     reasoning: "",
     toolArgs: new Set(),
   })
   const flushTimerRef = useRef<number | null>(null)
+  /** Burst-interval estimate for typewriter pacing (see SMOOTH_GAP_MIN_MS).
+   *  `lastArrivalMs = 0` means "no arrival yet this turn"; the learned EMA
+   *  survives across turns since it characterizes the provider. */
+  const smoothPaceRef = useRef({ lastArrivalMs: 0, emaMs: SMOOTH_EMA_INITIAL_MS })
   const titleInputRef = useRef<HTMLInputElement>(null)
 
   // Empty = new chat: composer is centered in the content area instead of
@@ -624,6 +947,14 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
             ? (m.suggestions as unknown[]).filter((s): s is string => typeof s === "string").slice(0, 4)
             : undefined,
         })
+        // New sessions start at the configured full-auto default. Seed the
+        // badge for the fresh-chat view only — a live session's state
+        // arrives on its own `session` frames.
+        const defaultFullAuto = m.config?.default_full_auto === true
+        defaultFullAutoRef.current = defaultFullAuto
+        if (defaultFullAuto && !sessionIdRef.current && preSessionAutoRef.current === null) {
+          setAutoConfirm(true)
+        }
       })
       .catch(() => {
         if (alive) toast.error(t("loadFailed"))
@@ -643,6 +974,7 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
         if (!alive) return
         setAvailableModels(m.models)
         setModelCaps(m.caps)
+        setModelCatalog(m.catalog)
       })
       .catch(() => {
         /* switcher simply stays read-only */
@@ -659,10 +991,15 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     if (!sessionId) {
       setSelectedModel("")
       setSelectedEffort("")
+      setSelectedParameters({})
+      setMaxMode(false)
       return
     }
     setSelectedModel(readModelOverride(sessionId))
     setSelectedEffort(readEffortOverride(sessionId))
+    const tuning = readTuningOverride(sessionId)
+    setSelectedParameters(tuning.parameters)
+    setMaxMode(tuning.maxMode)
   }, [sessionId])
 
   const handleSelectModel = useCallback(
@@ -675,10 +1012,15 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       // level set and default, so a carried-over pick would be misleading
       // (and possibly invalid).
       setSelectedEffort("")
+      // Same for catalog parameter values and max mode — they are defined per
+      // base model (a `context: 1m` pick is meaningless on a 200k model).
+      setSelectedParameters({})
+      setMaxMode(false)
       const sid = sessionIdRef.current
       if (!sid) return
       writeModelOverride(sid, next)
       writeEffortOverride(sid, "")
+      writeTuningOverride(sid, { parameters: {}, maxMode: false })
     },
     [modelName],
   )
@@ -689,9 +1031,59 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     if (sid) writeEffortOverride(sid, effort)
   }, [])
 
+  // Parameter / max-mode picks persist per session (like model and effort).
+  // Before the first message they live in memory and are carried onto the
+  // new session id by the `session` frame / send-ack handlers.
+  const handleSelectParameter = useCallback((id: string, value: string) => {
+    const next = { ...selectedParametersRef.current, [id]: value }
+    setSelectedParameters(next)
+    const sid = sessionIdRef.current
+    if (sid) writeTuningOverride(sid, { parameters: next, maxMode: maxModeRef.current })
+  }, [])
+
+  const handleToggleMaxMode = useCallback((on: boolean) => {
+    setMaxMode(on)
+    const sid = sessionIdRef.current
+    if (sid) writeTuningOverride(sid, { parameters: selectedParametersRef.current, maxMode: on })
+  }, [])
+
   // Capability record of the model the next turn will use (override or the
   // configured default) — drives the effort badge next to the model switcher.
   const currentCaps: ModelCaps | undefined = modelCaps[selectedModel || modelName]
+
+  // Catalog record of that same model (structured catalog only): resolves the flat
+  // name against base names, legacy slugs and aliases, because the configured
+  // `modelName` may still be a legacy variant slug like `gpt-6.1-high`.
+  const currentCatalogModel: CatalogModel | undefined = useMemo(() => {
+    const name = (selectedModel || modelName).trim()
+    if (!name || !modelCatalog.length) return undefined
+    return (
+      modelCatalog.find((m) => m.name === name) ??
+      modelCatalog.find((m) => m.serverModelName === name) ??
+      modelCatalog.find((m) => m.legacySlugs.includes(name)) ??
+      modelCatalog.find((m) => m.variants.some((v) => v.legacySlug === name)) ??
+      modelCatalog.find((m) => m.idAliases.includes(name))
+    )
+  }, [modelCatalog, selectedModel, modelName])
+
+  // The parameter values / max-mode flag that actually ride a send: only when
+  // the CURRENT model defines them (mirrors the effort guard below). Refs so
+  // send callbacks never see stale closure values.
+  const parametersForSend: [string, string][] = useMemo(() => {
+    const defs = currentCatalogModel?.parameters ?? []
+    if (!defs.length) return []
+    const out: [string, string][] = []
+    for (const def of defs) {
+      const v = selectedParameters[def.id]?.trim()
+      if (v) out.push([def.id, v])
+    }
+    return out
+  }, [currentCatalogModel, selectedParameters])
+  const parametersForSendRef = useRef<[string, string][]>([])
+  parametersForSendRef.current = parametersForSend
+  const maxModeForSend = currentCatalogModel?.supportsMaxMode ? maxMode : false
+  const maxModeForSendRef = useRef(false)
+  maxModeForSendRef.current = maxModeForSend
 
   // The effort that actually rides a send: only when the CURRENT model
   // advertises levels. A stale per-session override (picked on a previous
@@ -724,9 +1116,19 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       client
         .listSkills()
         .then((r) => {
-          if (alive) setSkills(r.skills)
+          if (!alive) return
+          // Ref before state: the `finally` below resolves against the ref.
+          skillsRef.current = r.skills
+          setSkills(r.skills)
         })
         .catch(() => {})
+        .finally(() => {
+          // Either way the registry has spoken (a 404 = no skills at all):
+          // a restored draft's skill chip can now be resolved or dropped.
+          if (!alive || skillsLoadedRef.current) return
+          skillsLoadedRef.current = true
+          resolveRestoredSkill()
+        })
     }
     const onVisible = () => {
       if (document.visibilityState === "visible") refresh()
@@ -739,22 +1141,131 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       window.removeEventListener("focus", refresh)
       document.removeEventListener("visibilitychange", onVisible)
     }
-  }, [client])
+  }, [client, resolveRestoredSkill])
 
-  // Sticky autoscroll. `showJumpToBottom` surfaces a floating button when the
-  // user scrolls away during streaming, so new output is never silently missed.
+  // ── Sticky autoscroll ──
+  // One intent bit, `followRef`, says whether the reader is following the
+  // tail. It is the ONLY input to autoscroll; geometry (scrollTop vs
+  // scrollHeight) never decides on its own. The bit is set by the reader's
+  // actions (send, jump-to-bottom, scrolling to the bottom) and cleared by
+  // exactly one thing: the reader scrolling up. Every content change that
+  // lands while it is set re-pins the container — the optimistic bubbles, the
+  // `history` rebuild of the whole transcript, each token flush, AND the
+  // silent height changes that go through no React state at all (a step
+  // group auto-folding after the turn, a mermaid block swapping its code view
+  // for the SVG, images decoding).
+  //
+  // Why not derive "at bottom" from the previous scrollHeight (the earlier
+  // design): those silent height changes left that number stale, so the send
+  // after a folded turn read as "reader scrolled up", and a `history` rebuild
+  // landing mid-glide (localhost: ~20ms) stranded the smooth scroll on a
+  // target computed for the OLD layout — the new bubble ended up below the
+  // fold with the button suppressed. `showJumpToBottom` surfaces the floating
+  // button when the reader has scrolled away, so new output is never silently
+  // missed.
   const STICK_THRESHOLD = 80
   const [showJumpToBottom, setShowJumpToBottom] = useState(false)
-  // Button visibility follows the live scroll position. It must NOT gate
-  // autoscroll: the scroll event is async, so a high-frequency streaming flush
-  // could autoscroll before the event lands, clobbering the user's scroll-up.
-  // Stable identity so the callback ref below can add/remove it cleanly.
+  const followRef = useRef(true)
+  // Set for the span of a smooth scroll WE started: the scroll events it
+  // fires along the way must not read as the reader scrolling up (mid-glide
+  // the container IS >80px from the bottom for a few frames). Cleared on
+  // arrival, on `scrollend`, by a timeout past any plausible glide duration
+  // (a glide the browser skips — reduced motion, hidden tab — never fires
+  // either event), by content landing (see `pinToBottom`), or the moment the
+  // reader touches the wheel / screen.
+  const glidingRef = useRef(false)
+  const glideTimerRef = useRef<number | null>(null)
+  const endGlide = useCallback(() => {
+    glidingRef.current = false
+    if (glideTimerRef.current !== null) {
+      window.clearTimeout(glideTimerRef.current)
+      glideTimerRef.current = null
+    }
+  }, [])
+  const isAtBottom = (c: HTMLElement) =>
+    c.scrollTop + c.clientHeight >= c.scrollHeight - STICK_THRESHOLD
+  // A programmatic pin fires a scroll event too (async, next frame). It moves
+  // toward the bottom, so it cannot mean "the reader left" — but it can land
+  // between two pins of a fast stream while a taller layout has already made
+  // the container "not at bottom" again. This flag spans pin → its event.
+  // Counted, not boolean: several pins can land in one frame (layout effect
+  // + resize observer) and each schedules its own release.
+  const pinningRef = useRef(0)
+  const pinToBottom = useCallback((c: HTMLElement) => {
+    if (c.scrollTop + c.clientHeight >= c.scrollHeight - 1) return
+    // Content landing mid-glide cuts the glide: re-issuing a smooth scroll
+    // per token would restart its easing every time and never arrive.
+    if (glidingRef.current) endGlide()
+    pinningRef.current++
+    c.scrollTop = c.scrollHeight
+    // The event (if any — none when the content grew below the fold without
+    // moving the thumb) lands before the next frame; release after it.
+    requestAnimationFrame(() => {
+      pinningRef.current = Math.max(0, pinningRef.current - 1)
+    })
+  }, [endGlide])
+  // Scroll events tell us two things: where the reader is (button) and, when
+  // the scroll is theirs, whether they left the tail (intent). Ours (an
+  // autoscroll pin or a glide in flight) only ever move toward the bottom,
+  // so they may confirm the intent, never revoke it. A reader scroll that
+  // leaves the tail is recognised by direction: scrollTop went DOWN in value
+  // (content moved away from the bottom); a pin or content growth never does.
+  const lastScrollTopRef = useRef(0)
   const handleContainerScroll = useCallback(() => {
     const c = messagesContainerRef.current
     if (!c) return
-    setShowJumpToBottom(c.scrollTop + c.clientHeight < c.scrollHeight - STICK_THRESHOLD)
-  }, [])
-  // Callback ref: attach the scroll listener the moment the messages container
+    const atBottom = isAtBottom(c)
+    const movedUp = c.scrollTop < lastScrollTopRef.current
+    lastScrollTopRef.current = c.scrollTop
+    if (glidingRef.current) {
+      if (atBottom) endGlide()
+      return
+    }
+    if (atBottom) followRef.current = true
+    else if (movedUp && pinningRef.current === 0) followRef.current = false
+    setShowJumpToBottom(!atBottom)
+  }, [endGlide])
+  // Input that can only come from the reader. It ends any glide right away
+  // (the reader wins), and an upward wheel drops the follow bit BEFORE the
+  // scroll it causes — so a token flush landing in between cannot pin the
+  // reader back down. If the wheel was too small to leave the tail, the
+  // scroll event that follows raises the bit again. A wheel-up that cannot
+  // scroll anything (already at the top, or no overflow yet) is ignored: it
+  // fires no scroll event to correct the bit, and a transcript that has yet
+  // to overflow must still follow once it does. Passive: the browser's own
+  // scrolling must not wait on us.
+  const handleWheel = useCallback(
+    (e: WheelEvent) => {
+      if (glidingRef.current) endGlide()
+      const c = messagesContainerRef.current
+      if (e.deltaY < 0 && c && c.scrollTop > 0) followRef.current = false
+    },
+    [endGlide],
+  )
+  const handleTouchStart = useCallback(() => {
+    if (glidingRef.current) endGlide()
+  }, [endGlide])
+  // The one smooth scroll in the transcript, for the reader's own actions
+  // (jump button, send). Sets the intent first: content that lands during
+  // the glide goes through `pinToBottom`, which ends the glide with an
+  // instant pin to the new bottom instead of stranding it on the old one.
+  const glideToBottom = useCallback(() => {
+    followRef.current = true
+    setShowJumpToBottom(false)
+    const c = messagesContainerRef.current
+    if (!c) return
+    if (c.scrollTop + c.clientHeight >= c.scrollHeight - 1) return
+    glidingRef.current = true
+    if (glideTimerRef.current !== null) window.clearTimeout(glideTimerRef.current)
+    glideTimerRef.current = window.setTimeout(endGlide, 1200)
+    c.scrollTo({ top: c.scrollHeight, behavior: "smooth" })
+  }, [endGlide])
+  // The transcript's content column, observed for height changes that do not
+  // go through `messages` (folds, mermaid, images). Only the column is
+  // observed: the scroll container itself grows/shrinks with the window,
+  // which is not content.
+  const contentResizeObserverRef = useRef<ResizeObserver | null>(null)
+  // Callback ref: attach the listeners the moment the messages container
   // mounts, detach when it unmounts. Driven by the node's lifecycle, NOT by a
   // guessed render condition — the container is absent during the session-load
   // spinner and the empty-state welcome, so a useEffect([isEmpty]) misses the
@@ -763,43 +1274,79 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
   const setMessagesContainer = useCallback(
     (node: HTMLDivElement | null) => {
       const prev = messagesContainerRef.current
-      if (prev) prev.removeEventListener("scroll", handleContainerScroll)
+      if (prev) {
+        prev.removeEventListener("scroll", handleContainerScroll)
+        prev.removeEventListener("scrollend", endGlide)
+        prev.removeEventListener("wheel", handleWheel)
+        prev.removeEventListener("touchstart", handleTouchStart)
+      }
+      contentResizeObserverRef.current?.disconnect()
+      contentResizeObserverRef.current = null
       messagesContainerRef.current = node
-      if (node) node.addEventListener("scroll", handleContainerScroll, { passive: true })
+      if (!node) return
+      node.addEventListener("scroll", handleContainerScroll, { passive: true })
+      node.addEventListener("scrollend", endGlide, { passive: true })
+      node.addEventListener("wheel", handleWheel, { passive: true })
+      node.addEventListener("touchstart", handleTouchStart, { passive: true })
+      // A fresh container (new session / loading → loaded) starts at the tail.
+      followRef.current = true
+      lastScrollTopRef.current = 0
+      if (typeof ResizeObserver !== "undefined") {
+        const ro = new ResizeObserver(() => {
+          if (followRef.current) pinToBottom(node)
+        })
+        // Observe every direct child (the transcript column, the archive
+        // expander, the print title): each is a block whose height is content.
+        for (const child of Array.from(node.children)) ro.observe(child)
+        contentResizeObserverRef.current = ro
+      }
     },
-    [handleContainerScroll],
+    [handleContainerScroll, endGlide, handleWheel, handleTouchStart, pinToBottom],
   )
-  // Deterministic stick-to-bottom: decide from the PREVIOUS scrollHeight vs the
-  // live scrollTop (which the browser keeps unchanged when content is appended
-  // below the viewport). This reads the user's latest scroll synchronously, so
-  // there is no race with the async scroll event and no dependence on a stale
-  // flag. Runs before paint to avoid a visible jump.
-  const prevScrollHeight = useRef(0)
+  // Keep the observer's child set current: the archive expander and the
+  // print title mount/unmount after the container does.
+  useEffect(() => {
+    const ro = contentResizeObserverRef.current
+    const c = messagesContainerRef.current
+    if (!ro || !c) return
+    ro.disconnect()
+    for (const child of Array.from(c.children)) ro.observe(child)
+  }, [archiveOpen, chatTitle, messages.length === 0])
+  // Every transcript update pins while following. Instant on purpose: a
+  // smooth scroll here would race the next token's flush and stutter.
+  // Smoothness is reserved for the reader's own actions (jumpToBottom,
+  // sending), where there is one target and no race. Before paint, so the
+  // `history` rebuild (every row unmounted and remounted with a different
+  // layout) never shows a frame at the wrong offset.
   useLayoutEffect(() => {
     const c = messagesContainerRef.current
     if (!c) return
-    const wasAtBottom =
-      prevScrollHeight.current - c.scrollTop - c.clientHeight <= STICK_THRESHOLD
-    if (wasAtBottom) c.scrollTop = c.scrollHeight
-    prevScrollHeight.current = c.scrollHeight
-  }, [messages])
-  const jumpToBottom = useCallback(() => {
-    const c = messagesContainerRef.current
-    if (c) c.scrollTop = c.scrollHeight
-    setShowJumpToBottom(false)
-  }, [])
+    if (followRef.current) pinToBottom(c)
+  }, [messages, pinToBottom])
+  const jumpToBottom = glideToBottom
 
-  // Apply all buffered deltas as one state update (and cancel the timer).
-  const flushDeltas = useCallback(() => {
-    if (flushTimerRef.current !== null) {
-      window.clearTimeout(flushTimerRef.current)
-      flushTimerRef.current = null
-    }
-    const pending = pendingDeltasRef.current
-    if (!pending.content && !pending.reasoning && pending.toolArgs.size === 0) return
-    const { content, reasoning } = pending
-    const argIds = [...pending.toolArgs]
-    pendingDeltasRef.current = { content: "", reasoning: "", toolArgs: new Set() }
+  // Outline rail entries: real user messages (not compaction markers), by
+  // id. Recomputed only when a user message is added/removed — streaming
+  // mutates the last assistant row, so the memo keeps its identity then and
+  // the rail's scroll listener is not re-attached per token.
+  const outlineSignature = useMemo(
+    () => messages.filter((m) => m.role === "user" && !m.summaryMarker).map((m) => m.id).join(","),
+    [messages],
+  )
+  const outlineEntries = useMemo<OutlineEntry[]>(
+    () =>
+      messages
+        .filter((m) => m.role === "user" && !m.summaryMarker)
+        .map((m) => ({ id: m.id, content: m.content, attachments: m.attachments?.length })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [outlineSignature],
+  )
+
+  // Append the given deltas to the last assistant message / dirty tool rows
+  // as one state update. Shared by the full flush (structural events) and the
+  // smoothing tick (partial release).
+  const applyDeltas = useCallback((content: string, reasoning: string, argIds: string[]) => {
+    if (!content && !reasoning && argIds.length === 0) return
     setMessages((prev) => {
       let updated = prev
       if (content || reasoning) {
@@ -828,14 +1375,74 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     })
   }, [])
 
+  // Apply ALL buffered deltas as one state update (and cancel the timer).
+  // Structural events (tool rows, done, error, …) call this first so they
+  // never render ahead of the text that precedes them.
+  const flushDeltas = useCallback(() => {
+    if (flushTimerRef.current !== null) {
+      window.clearTimeout(flushTimerRef.current)
+      flushTimerRef.current = null
+    }
+    const pending = pendingDeltasRef.current
+    if (!pending.content && !pending.reasoning && pending.toolArgs.size === 0) return
+    const { content, reasoning } = pending
+    const argIds = [...pending.toolArgs]
+    pendingDeltasRef.current = { content: "", reasoning: "", toolArgs: new Set() }
+    applyDeltas(content, reasoning, argIds)
+  }, [applyDeltas])
+
+  /** Self-reference so scheduleFlush and the tick it arms can refer to each
+   *  other without a circular useCallback dependency. */
+  const smoothTickRef = useRef<() => void>(() => {})
+
   const scheduleFlush = useCallback(() => {
     if (flushTimerRef.current === null) {
       flushTimerRef.current = window.setTimeout(() => {
         flushTimerRef.current = null
-        flushDeltas()
+        smoothTickRef.current()
       }, DELTA_FLUSH_MS)
     }
-  }, [flushDeltas])
+  }, [])
+
+  /** Feed the burst-interval EMA on every text-delta arrival. Sub-250ms gaps
+   *  are frames within one burst and are ignored (they would drag the
+   *  estimate to ~0 and defeat the pacing). */
+  const notePaceArrival = useCallback(() => {
+    const pace = smoothPaceRef.current
+    const now = performance.now()
+    if (pace.lastArrivalMs > 0) {
+      const gap = now - pace.lastArrivalMs
+      if (gap >= SMOOTH_GAP_MIN_MS) {
+        const clamped = Math.min(gap, SMOOTH_GAP_MAX_MS)
+        pace.emaMs = pace.emaMs * (1 - SMOOTH_EMA_ALPHA) + clamped * SMOOTH_EMA_ALPHA
+      }
+    }
+    pace.lastArrivalMs = now
+  }, [])
+
+  // One smoothing step: release a slice of the text backlog sized so the
+  // whole backlog drains evenly by the time the next provider burst is
+  // expected (interval-aware typewriter), and re-arm the timer while any
+  // remains — a burst keeps scrolling through the silence that follows it.
+  const smoothTick = useCallback(() => {
+    const pending = pendingDeltasRef.current
+    const estTicks = Math.max(1, smoothPaceRef.current.emaMs / DELTA_FLUSH_MS)
+    const [content, contentRest] = takeSmoothPrefix(
+      pending.content,
+      Math.ceil(pending.content.length / estTicks),
+    )
+    const [reasoning, reasoningRest] = takeSmoothPrefix(
+      pending.reasoning,
+      Math.ceil(pending.reasoning.length / estTicks),
+    )
+    const argIds = [...pending.toolArgs]
+    pending.content = contentRest
+    pending.reasoning = reasoningRest
+    pending.toolArgs = new Set()
+    applyDeltas(content, reasoning, argIds)
+    if (contentRest || reasoningRest) scheduleFlush()
+  }, [applyDeltas, scheduleFlush])
+  smoothTickRef.current = smoothTick
 
   useEffect(() => {
     return () => {
@@ -856,7 +1463,9 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       const failedAction = skillActionRef.current
       rollbackSkillAction()
       setMessages((prev) => {
-        const next = [...prev]
+        // A turn that died mid-compaction leaves its pending note behind;
+        // the error row below is the account of what happened.
+        const next = dropPendingNotes([...prev])
         const last = next[next.length - 1]
         if (
           last?.role === "assistant" &&
@@ -886,11 +1495,13 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       // complete before tool_result appends the next assistant message).
       switch (ev.event) {
         case "content": {
+          notePaceArrival()
           pendingDeltasRef.current.content += ev.data.text ?? ""
           scheduleFlush()
           return
         }
         case "reasoning": {
+          notePaceArrival()
           pendingDeltasRef.current.reasoning += ev.data.text ?? ""
           scheduleFlush()
           return
@@ -921,6 +1532,8 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           if (selectedEffortRef.current) {
             writeEffortOverride(sid, selectedEffortRef.current)
           }
+          carryTuningTo(sid)
+          adoptDraftId(sid)
           setSessionId(sid)
           sessionIdRef.current = sid
           streamRunningRef.current = ev.data.running === true
@@ -936,6 +1549,11 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           }
           if (Object.prototype.hasOwnProperty.call(ev.data, "auto_confirm")) {
             setAutoConfirm(ev.data.auto_confirm === true)
+          }
+          if (Object.prototype.hasOwnProperty.call(ev.data, "origin")) {
+            setSessionOrigin(
+              typeof ev.data.origin === "string" ? ev.data.origin : null,
+            )
           }
           onSessionChange?.(sid)
           break
@@ -1024,14 +1642,25 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           break
         }
         case "status": {
-          setMessages((prev) => [
-            ...prev,
-            { id: nextMsgId++, role: "status", content: ev.data.text ?? "" },
-          ])
+          // Known codes render localized; the wire `text` is the fallback
+          // for codes this build does not know.
+          const text =
+            ev.data.code === "tail_trimmed" ? t("streamTrimmed") : (ev.data.text ?? "")
+          // A pending note ("Compacting context...") is replaced by the next
+          // one — its outcome — and a note never stacks under the streaming
+          // placeholder (which must stay last): both rules in placeStatusNote.
+          const note: Message = {
+            id: nextMsgId++,
+            role: "status",
+            content: text,
+            pending: ev.data.pending === true,
+          }
+          setMessages((prev) => placeStatusNote(prev, note))
           break
         }
         case "confirm": {
           setPendingConfirm({ id: ev.data.id, name: ev.data.name, arguments: ev.data.arguments })
+          signalAttention("attention")
           break
         }
         case "ask_user": {
@@ -1040,16 +1669,17 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
             questions: ev.data.questions,
             timeoutSecs: ev.data.timeout_secs ?? null,
           })
+          signalAttention("attention")
           break
         }
         case "queue": {
           const items = Array.isArray(ev.data.items) ? ev.data.items : []
           setQueuedItems(
             items.map(
-              (i: { id?: number; message?: string; attachments?: number }) => ({
+              (i: { id?: number; message?: string; attachments?: unknown }) => ({
                 id: i.id ?? 0,
                 message: i.message ?? "",
-                attachments: i.attachments ?? 0,
+                attachments: queuedAttachments(i.attachments),
               }),
             ),
           )
@@ -1066,12 +1696,22 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           break
         }
         case "subagent": {
-          // Envelope from a `task` sub-agent: { task_id, event, data }. Only
-          // a few inner events matter for the progress strip; the rest are
-          // deliberately not spliced into the transcript (the parent `task`
-          // tool row is the transcript entry, its result carries the report).
+          // Envelope from a `task` sub-agent: { task_id, session_id, label,
+          // event, data }. Only a few inner events matter for the progress
+          // strip; the rest are deliberately not spliced into the transcript
+          // (the parent `task` tool row is the transcript entry, its result
+          // carries the report). `session_id` is kept so the task card can
+          // deep-link to the live sub-session view while it runs; `label`
+          // titles the row even when this tab never saw the parent
+          // tool_start (re-attach after a trimmed replay).
           const taskId = ev.data.task_id as string | undefined
           if (!taskId) break
+          const childSessionId =
+            typeof ev.data.session_id === "string" ? ev.data.session_id : undefined
+          const label =
+            typeof ev.data.label === "string" && ev.data.label
+              ? (ev.data.label as string)
+              : undefined
           const inner = ev.data.event as string | undefined
           let note: string | null = null
           if (inner === "tool_start") {
@@ -1085,12 +1725,20 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           // frames also refresh the activity line.
           setSubagentNotes((prev) => {
             const existing = prev[taskId]
-            if (existing && note === null) return prev
+            if (
+              existing &&
+              note === null &&
+              existing.sessionId === childSessionId &&
+              (existing.label !== undefined || label === undefined)
+            )
+              return prev
             return {
               ...prev,
               [taskId]: {
                 note: note ?? existing?.note ?? "",
                 startedAt: existing?.startedAt ?? Date.now(),
+                sessionId: childSessionId ?? existing?.sessionId,
+                label: existing?.label ?? label,
               },
             }
           })
@@ -1133,6 +1781,7 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           setSubagentNotes({})
           setCancellingTasks(new Set())
           reportSendError(ev.data.message ?? "error")
+          signalAttention("error")
           // A queued follow-up (the server drains the queue even after a
           // failed turn) arrives as the next snapshot on this same stream.
           break
@@ -1143,17 +1792,26 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           if (skillActionRef.current) rollbackSkillAction()
           // Drop a trailing empty placeholder (a turn whose last frame was a
           // tool_result, or an attach landing right before the end, leaves
-          // one behind) — mirrors the error path's cleanup.
+          // one behind) — mirrors the error path's cleanup. Same for a
+          // pending status note the turn never resolved (cancelled
+          // mid-compaction): the wait is over, nothing to report.
           setMessages((prev) => {
             const last = prev[prev.length - 1]
-            return last?.role === "assistant" && !last.content && !last.reasoning
-              ? prev.slice(0, -1)
-              : prev
+            const trimmed =
+              last?.role === "assistant" && !last.content && !last.reasoning
+                ? prev.slice(0, -1)
+                : prev
+            return dropPendingNotes(trimmed)
           })
           // The next queued message auto-starts server-side and arrives as a
           // fresh snapshot on this same stream, which flips `streaming` back
           // on — no timer, no guessing when to re-attach.
           setStreaming(false)
+          // Only a turn that actually hands control back is worth a chime: with
+          // messages still queued the server starts the next one by itself.
+          if (queuedItemsRef.current.length === 0) {
+            signalAttention("done")
+          }
           refreshSessions()
           break
         }
@@ -1161,7 +1819,7 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           break
       }
     },
-    [onSessionChange, refreshSessions, flushDeltas, scheduleFlush, reportSendError, rollbackSkillAction],
+    [onSessionChange, refreshSessions, flushDeltas, scheduleFlush, notePaceArrival, reportSendError, rollbackSkillAction, adoptDraftId],
   )
   handleEventRef.current = handleEvent
 
@@ -1233,7 +1891,7 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           },
         ])
         const dropChip = () => {
-          if (previewUrl) URL.revokeObjectURL(previewUrl)
+          revokePreview(previewUrl)
           setPendingUploads((prev) => prev.filter((p) => p.key !== key))
         }
         void (async () => {
@@ -1265,7 +1923,7 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
   const removeUpload = useCallback((key: number) => {
     setPendingUploads((prev) => {
       const gone = prev.find((p) => p.key === key)
-      if (gone?.previewUrl) URL.revokeObjectURL(gone.previewUrl)
+      revokePreview(gone?.previewUrl)
       return prev.filter((p) => p.key !== key)
     })
   }, [])
@@ -1328,6 +1986,9 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     toolArgsRef.current = {}
     hiddenToolIdsRef.current.clear()
     pendingDeltasRef.current = { content: "", reasoning: "", toolArgs: new Set() }
+    // Keep the learned burst-interval EMA (it characterizes the provider) but
+    // forget the last arrival so the idle gap between turns is not counted.
+    smoothPaceRef.current.lastArrivalMs = 0
     if (flushTimerRef.current !== null) {
       window.clearTimeout(flushTimerRef.current)
       flushTimerRef.current = null
@@ -1343,10 +2004,11 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
         .filter((p) => !!p.id)
         .map((p) => ({ id: p.id as string, name: p.name, lines: p.lines ?? undefined }))
       if ((!raw.trim() && !skillAction && attachments.length === 0) || streaming) return
+      clearAttention()
       const shown = displayContent ?? raw
       setInput("")
       if (attachments.length > 0) {
-        uploads.forEach((p) => p.previewUrl && URL.revokeObjectURL(p.previewUrl))
+        uploads.forEach((p) => revokePreview(p.previewUrl))
         setPendingUploads([])
       }
       if (skillAction?.op !== "reset") {
@@ -1362,10 +2024,13 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
         ])
       }
       setStreaming(true)
-      requestAnimationFrame(() => {
-        const container = messagesContainerRef.current
-        if (container) container.scrollTop = container.scrollHeight
-      })
+      // The reader's own action: follow the tail from here on. Set the intent
+      // NOW, synchronously — the optimistic rows above commit (and pin) in
+      // this same batch, and the `history` rebuild that follows the ack must
+      // find it set too. The glide itself waits a frame so the new bubble is
+      // laid out and the scroll has a real target.
+      followRef.current = true
+      requestAnimationFrame(glideToBottom)
       resetDeltaBuffers()
 
       // Pure trigger: the turn's frames arrive on the session's follow stream,
@@ -1378,14 +2043,25 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           attachments,
           selectedModelRef.current || undefined,
           effortForSendRef.current || undefined,
+          parametersForSendRef.current.length ? parametersForSendRef.current : undefined,
+          maxModeForSendRef.current || undefined,
+          // Fresh-chat extras (ignored for an existing session): an explicit
+          // full-auto toggle, applied server-side before the turn starts so
+          // even the first tool call honours it.
+          { fullAuto: preSessionAutoRef.current ?? undefined },
         )
         .then((ack) => {
           if (!ack.session_id) return
           if (!sessionIdRef.current) {
             // First message of a new chat: naming the session starts the
             // follow stream, which replays this turn from the feed tail.
+            // The pre-session full-auto choice went with the request; the
+            // session's own frames own the badge from here.
+            preSessionAutoRef.current = null
             if (selectedModelRef.current) writeModelOverride(ack.session_id, selectedModelRef.current)
             if (selectedEffortRef.current) writeEffortOverride(ack.session_id, selectedEffortRef.current)
+            carryTuningTo(ack.session_id)
+            adoptDraftId(ack.session_id)
             sessionIdRef.current = ack.session_id
             setSessionId(ack.session_id)
             onSessionChange?.(ack.session_id)
@@ -1425,6 +2101,8 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       reportSendError,
       rollbackSkillAction,
       onSessionChange,
+      glideToBottom,
+      adoptDraftId,
     ],
   )
 
@@ -1442,7 +2120,7 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       // The chips ride the queued message, so clear them now — leaving them
       // staged would attach the same files again to whatever is typed next.
       if (attachments.length > 0) {
-        uploads.forEach((p) => p.previewUrl && URL.revokeObjectURL(p.previewUrl))
+        uploads.forEach((p) => revokePreview(p.previewUrl))
         setPendingUploads([])
       }
       client
@@ -1452,6 +2130,8 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
           attachments,
           selectedModelRef.current || undefined,
           effortForSendRef.current || undefined,
+          parametersForSendRef.current.length ? parametersForSendRef.current : undefined,
+          maxModeForSendRef.current || undefined,
         )
         // A message that raced the turn's end started a fresh turn instead;
         // either way the follow stream reports it.
@@ -1522,7 +2202,7 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     // The chips ride the interrupting message, so clear them now — leaving
     // them staged would attach the same files again to the next message.
     if (attachments.length > 0) {
-      uploads.forEach((p) => p.previewUrl && URL.revokeObjectURL(p.previewUrl))
+      uploads.forEach((p) => revokePreview(p.previewUrl))
       setPendingUploads([])
     }
     client
@@ -1532,6 +2212,8 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
         attachments,
         selectedModelRef.current || undefined,
         effortForSendRef.current || undefined,
+        parametersForSendRef.current.length ? parametersForSendRef.current : undefined,
+        maxModeForSendRef.current || undefined,
       )
       .catch((e) => {
         toast.error(e instanceof Error ? e.message : String(e))
@@ -1555,6 +2237,20 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     (id: number, message: string) => {
       if (!sessionIdRef.current) return
       void client.editQueued(sessionIdRef.current, id, message)
+    },
+    [client],
+  )
+
+  /** "Send now" for one parked message: the backend moves it to the queue
+   *  front and winds the running turn down (queue kept), so the pump starts
+   *  it the moment the turn ends — the composer's ⚡ semantics, for a message
+   *  that is already queued (its attachments and model selection ride along).
+   *  No optimistic mutation: the `queue` snapshot converges the strip, and the
+   *  turn's normal wind-down drives the transcript. */
+  const handleSendNowQueued = useCallback(
+    (id: number) => {
+      if (!sessionIdRef.current) return
+      void client.sendQueuedNow(sessionIdRef.current, id)
     },
     [client],
   )
@@ -1637,13 +2333,26 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     }
   }
 
-  // Badge click: turn session full-auto off (shared flag — applies to the
-  // in-flight turn's next tool call too).
-  const handleAutoConfirmOff = useCallback(() => {
-    const sid = sessionIdRef.current
-    if (sid) void client.setAutoConfirm(sid, false)
-    setAutoConfirm(false)
-  }, [client])
+  // Composer toggle: switch session full-auto on or off (shared flag — applies
+  // to the in-flight turn's next tool call too; persisted with the session).
+  const handleAutoConfirmChange = useCallback(
+    (enabled: boolean) => {
+      const sid = sessionIdRef.current
+      if (sid) {
+        void client.setAutoConfirm(sid, enabled).catch(() => {
+          toast.error(t("operationFailed"))
+          setAutoConfirm(!enabled)
+        })
+      } else {
+        // Fresh chat (no server session yet): remember the choice so the
+        // first send creates the session in that mode — it would otherwise
+        // start at the configured default.
+        preSessionAutoRef.current = enabled
+      }
+      setAutoConfirm(enabled)
+    },
+    [client],
+  )
 
   const handleAskUserSubmit = (answers: AskAnswer[]) => {
     const sid = sessionIdRef.current
@@ -1687,21 +2396,30 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     // Clearing the session id tears down its follow stream (effect cleanup).
     setSessionId(null)
     sessionIdRef.current = null
+    setSessionOrigin(null)
     setPendingConfirm(null)
     setPendingAskUser(null)
     setQueuedItems([])
-    setAutoConfirm(false)
+    // A fresh chat starts at the configured full-auto default (a session
+    // created from it inherits the same server-side).
+    preSessionAutoRef.current = null
+    setAutoConfirm(defaultFullAutoRef.current)
     setStreaming(false)
     setSessionLoading(false)
     setChatTitle("")
+    setSessionCategory(null)
     setActiveSkill(null)
     setPendingSkill(null)
     setActivatingSkill(null)
     setResettingSkill(false)
     skillActionRef.current = null
+    setFoldCommand(null)
     resetDeltaBuffers()
+    // Last: flushes the left session's composer under its id and loads the
+    // fresh chat's draft (text, chips, skill chip) over the resets above.
+    switchDraft(NEW_CHAT_DRAFT_ID)
     onSessionChange?.(null)
-  }, [onSessionChange, resetDeltaBuffers])
+  }, [onSessionChange, resetDeltaBuffers, switchDraft])
 
   const resumeSession = useCallback(
     (id: string) => {
@@ -1712,6 +2430,9 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       if (sessionIdRef.current === id) return
       setStreaming(false)
       setQueuedItems([])
+      // Leaving the fresh chat: its pre-session full-auto choice no longer
+      // applies; the opened session's frames own the badge from here.
+      preSessionAutoRef.current = null
       setPendingConfirm(null)
       setPendingAskUser(null)
       setPendingSkill(null)
@@ -1733,26 +2454,66 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       // the stored copy here as well would only race that snapshot.
       setSessionId(id)
       sessionIdRef.current = id
+      setSessionOrigin(null)
+      // The composer follows the session: park the previous draft, load this
+      // session's (after the skill resets above, which it may re-populate).
+      switchDraft(id)
       onSessionChange?.(id)
       const gen = ++loadGenRef.current
+      setFoldCommand(null)
+      // Reset the header pill; the list-sync effect below seeds it from the
+      // sidebar row (usually present) and the detail is authoritative — it
+      // also covers sessions the active list does not carry (archived).
+      setSessionCategory(null)
       client
         .getSession(id)
         .then((detail) => {
           // A newer load/new-chat superseded this response: discard it.
           if (gen !== loadGenRef.current) return
           setChatTitle(detail.meta?.title || "")
+          setSessionCategory(detail.meta?.category ?? null)
         })
         .catch(() => {
           if (gen !== loadGenRef.current) return
           setChatTitle("")
         })
     },
-    [client, onSessionChange, resetDeltaBuffers],
+    [client, onSessionChange, resetDeltaBuffers, switchDraft],
+  )
+
+  // The sessions page (and the sidebar) may re-file the open session while
+  // this component stays mounted: follow the list whenever it carries the
+  // current id, so the header pill never lags a change made elsewhere.
+  useEffect(() => {
+    if (!sessionId) return
+    const row = sessions.find((s) => s.id === sessionId)
+    if (row) setSessionCategory(row.category ?? null)
+  }, [sessions, sessionId])
+
+  /** Header picker: optimistic update, PATCH, roll back + toast on failure. */
+  const handleSetCategory = useCallback(
+    (category: string | null) => {
+      const sid = sessionIdRef.current
+      if (!sid) return
+      const previous = sessionCategory
+      setSessionCategory(category)
+      void client
+        .updateSession(sid, { category })
+        .then(refreshSessions)
+        .catch(() => {
+          if (sessionIdRef.current === sid) setSessionCategory(previous)
+          toast.error(t("operationFailed"))
+        })
+    },
+    [client, refreshSessions, sessionCategory],
   )
 
   const handleRename = useCallback(
     (id: string, title: string) => {
-      void client.updateSession(id, { title }).then(refreshSessions)
+      void client
+        .updateSession(id, { title })
+        .then(refreshSessions)
+        .catch(() => toast.error(t("operationFailed")))
       if (id === sessionIdRef.current) setChatTitle(title)
     },
     [client, refreshSessions],
@@ -1762,7 +2523,11 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     (id: string) => {
       void client.deleteSession(id).then(() => {
         refreshSessions()
+        // The open session's composer moves to the fresh chat first (so its
+        // draft is not flushed back under the deleted id), then the record
+        // goes with the session.
         if (id === sessionIdRef.current) handleNewChat()
+        clearDraft(id)
       })
     },
     [client, refreshSessions, handleNewChat],
@@ -1770,8 +2535,8 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
 
   useImperativeHandle(
     ref,
-    () => ({ newChat: handleNewChat, openSession: resumeSession }),
-    [handleNewChat, resumeSession],
+    () => ({ newChat: handleNewChat, openSession: resumeSession, refreshSessions }),
+    [handleNewChat, resumeSession, refreshSessions],
   )
 
   const handleExport = useCallback(() => {
@@ -1804,21 +2569,11 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
     if (el) printElementToPdf(el, { title: chatTitle, neutralizeInnerColumn: true })
   }, [chatTitle])
 
-  // Per-message PDF: isolate a single assistant answer body. `print-solo` on
-  // the container + `data-print-solo` on the body element drive theme.css's
-  // solo print rules (hide every other message and the session title); the
-  // shared helper sizes the page to just this message. No title, no reasoning.
+  // Per-message PDF: isolate a single assistant answer body. The shared solo
+  // helper marks the transcript container + target for theme.css's solo print
+  // rules and sizes the page to just this message. No title, no reasoning.
   const handleMessagePdf = useCallback((bodyEl: HTMLElement | null, title: string) => {
-    const container = messagesContainerRef.current
-    if (!container || !bodyEl) return
-    container.classList.add("print-solo")
-    bodyEl.setAttribute("data-print-solo", "")
-    const cleanup = () => {
-      container.classList.remove("print-solo")
-      bodyEl.removeAttribute("data-print-solo")
-    }
-    window.addEventListener("afterprint", cleanup, { once: true })
-    printElementToPdf(bodyEl, { title })
+    if (bodyEl) printSoloElementToPdf(bodyEl, title)
   }, [])
 
   // Click-to-rename in the chat header (single click → inline input).
@@ -1849,17 +2604,34 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       cancelTitleEdit()
       return
     }
-    void client.updateSession(sid, { title: trimmed }).then(refreshSessions)
+    void client
+      .updateSession(sid, { title: trimmed })
+      .then(refreshSessions)
+      .catch(() => toast.error(t("operationFailed")))
     setChatTitle(trimmed)
     setTitleEditing(false)
     setTitleDraft("")
   }, [client, titleDraft, chatTitle, refreshSessions, cancelTitleEdit])
 
   const styleVars = themeToCssVars(theme)
+  // Sub-agent transcripts are read-only: no composer, no rewind. The id
+  // prefix answers before the stream's `session` frame lands (deep-link
+  // open); the frame's `origin` field is the authoritative signal after it.
+  const isTaskSession =
+    sessionOrigin === "task" || (sessionId?.startsWith("task-") ?? false)
   // Live sub-agent state joined with cancel flags for the `task` tool cards
   // (keyed by tool_call id, same key the cards receive as `callId`).
   const runtimeSubagents = useMemo(() => {
-    const out: Record<string, { note: string; startedAt: number; cancelling: boolean }> = {}
+    const out: Record<
+      string,
+      {
+        note: string
+        startedAt: number
+        cancelling: boolean
+        sessionId?: string
+        label?: string
+      }
+    > = {}
     for (const [taskId, live] of Object.entries(subagentNotes)) {
       out[taskId] = { ...live, cancelling: cancellingTasks.has(taskId) }
     }
@@ -1872,12 +2644,16 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
       subagents: runtimeSubagents,
       cancelTask: handleCancelTask,
       sessionHref,
+      findToolCall,
+      revealToolCall,
     }),
-    [client, sessionId, runtimeSubagents, handleCancelTask, sessionHref],
+    [client, sessionId, runtimeSubagents, handleCancelTask, sessionHref, findToolCall, revealToolCall],
   )
 
   return (
     <ChatRuntimeContext.Provider value={runtimeValue}>
+    <FoldAllContext.Provider value={foldCommand}>
+    <RevealContext.Provider value={revealCommand}>
     <div
       className={`acc-root relative flex h-full w-full overflow-hidden bg-background text-foreground${
         theme?.scheme === "dark" ? " dark" : ""
@@ -1982,6 +2758,12 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
                 selectedEffort={selectedEffort}
                 defaultEffort={currentCaps?.defaultEffort}
                 onSelectEffort={handleSelectEffort}
+                parameterDefinitions={currentCatalogModel?.parameters ?? []}
+                selectedParameters={selectedParameters}
+                onSelectParameter={handleSelectParameter}
+                supportsMaxMode={currentCatalogModel?.supportsMaxMode ?? false}
+                maxMode={maxModeForSend}
+                onToggleMaxMode={handleToggleMaxMode}
                 skills={skills}
                 skillIconUrl={client.skillIconUrl}
                 pendingSkill={pendingSkill}
@@ -1991,10 +2773,11 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
                 onPendingSkillChange={handlePendingSkillChange}
                 onResetSkill={handleResetSkill}
                 autoConfirm={autoConfirm}
-                onAutoConfirmOff={handleAutoConfirmOff}
+                onAutoConfirmChange={handleAutoConfirmChange}
                 attachments={pendingUploads}
                 onAddFiles={addFiles}
                 onRemoveUpload={removeUpload}
+                onPreviewError={handleUploadPreviewError}
                 onPreview={(src, alt) => setLightbox({ src, alt })}
               />
             </div>
@@ -2017,6 +2800,12 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
                 selectedEffort={selectedEffort}
                 defaultEffort={currentCaps?.defaultEffort}
                 onSelectEffort={handleSelectEffort}
+                parameterDefinitions={currentCatalogModel?.parameters ?? []}
+                selectedParameters={selectedParameters}
+                onSelectParameter={handleSelectParameter}
+                supportsMaxMode={currentCatalogModel?.supportsMaxMode ?? false}
+                maxMode={maxModeForSend}
+                onToggleMaxMode={handleToggleMaxMode}
                 skills={skills}
                 skillIconUrl={client.skillIconUrl}
                 pendingSkill={pendingSkill}
@@ -2026,10 +2815,11 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
                 onPendingSkillChange={handlePendingSkillChange}
                 onResetSkill={handleResetSkill}
                 autoConfirm={autoConfirm}
-                onAutoConfirmOff={handleAutoConfirmOff}
+                onAutoConfirmChange={handleAutoConfirmChange}
                 attachments={pendingUploads}
                 onAddFiles={addFiles}
                 onRemoveUpload={removeUpload}
+                onPreviewError={handleUploadPreviewError}
                 onPreview={(src, alt) => setLightbox({ src, alt })}
               />
             </div>
@@ -2099,14 +2889,33 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
                 >
                   <Plus className="h-4.5 w-4.5" strokeWidth={1.8} />
                 </button>
+                {/* File the conversation without leaving it: category pill +
+                    the same picker the sessions page uses. Needs a persisted
+                    session to PATCH — a fresh chat gets it after its first
+                    message. */}
+                {sessionId && historyAvailable && (
+                  <SessionCategoryButton
+                    category={sessionCategory}
+                    knownCategories={knownCategories}
+                    onChange={handleSetCategory}
+                  />
+                )}
                 <SessionReleases client={client} sessionId={sessionId} refreshKey={streaming} basePath={basePath} />
                 {enableExport && messages.length > 0 && (
-                  <ExportMenu onMarkdown={handleExport} onPdf={handlePdf} />
+                  <ExportMenu
+                    onMarkdown={handleExport}
+                    onPdf={handlePdf}
+                    onExpandAll={() => foldAll("expand")}
+                    onCollapseAll={() => foldAll("collapse")}
+                  />
                 )}
               </div>
             </div>
 
-            <div className="relative min-h-0 flex-1">
+            {/* `@container` so the outline rail can query THIS pane's width
+                (the sessions panel opening/closing changes it, the viewport
+                does not). */}
+            <div className="relative min-h-0 flex-1 @container">
               <div
                 className="h-full overflow-y-auto"
                 ref={setMessagesContainer}
@@ -2163,63 +2972,110 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
                   streaming={streaming}
                   renderers={renderers}
                   onEditMessage={setInput}
-                  onRewindMessage={handleRewindMessage}
+                  onRewindMessage={isTaskSession ? undefined : handleRewindMessage}
                   onMessagePdf={handleMessagePdf}
                   messagesEndRef={messagesEndRef}
                   uploadUrl={client.uploadUrl}
                   onPreview={(src, alt) => setLightbox({ src, alt })}
+                  followTail={!showJumpToBottom}
                 />
               </div>
-              {showJumpToBottom && (
-                <button
-                  type="button"
-                  onClick={jumpToBottom}
-                  aria-label={t("jumpToBottom")}
-                  title={t("jumpToBottom")}
-                  className="absolute bottom-3 left-1/2 z-10 -translate-x-1/2 inline-flex items-center justify-center rounded-full border border-border bg-card p-1.5 text-muted-foreground shadow-md transition-colors hover:text-foreground"
-                >
-                  <ChevronDown className="h-4 w-4" />
-                </button>
-              )}
+              {/* Right-hand rail: one tick per user message (hover = preview,
+                  click = scroll). Indexes the live transcript only — archived
+                  generations are collapsed by default and their rows move
+                  when that expander toggles. */}
+              <MessageOutline entries={outlineEntries} containerRef={messagesContainerRef} />
+              {/* Always mounted; `data-state` drives a fade+lift in AND out
+                  (theme.css .acc-jump). While a stream is running and the
+                  reader has scrolled up, a pulsing dot says "new output below". */}
+              <button
+                type="button"
+                onClick={jumpToBottom}
+                aria-label={t("jumpToBottom")}
+                title={t("jumpToBottom")}
+                aria-hidden={!showJumpToBottom}
+                tabIndex={showJumpToBottom ? 0 : -1}
+                data-state={showJumpToBottom ? "shown" : "hidden"}
+                className="acc-jump absolute bottom-3 left-1/2 z-10 inline-flex items-center justify-center gap-1 rounded-full border border-border bg-card py-1.5 pl-1.5 pr-1.5 text-muted-foreground shadow-md hover:text-foreground"
+              >
+                {streaming && (
+                  <span className="acc-live-dot ml-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
+                )}
+                <ChevronDown className="h-4 w-4" />
+              </button>
             </div>
 
             {streaming && Object.keys(subagentNotes).length > 0 && (
-              <div className="mx-auto w-full max-w-3xl space-y-px px-4 pb-1 print:hidden">
-                {Object.entries(subagentNotes).map(([taskId, live]) => {
-                  const label = taskLabel(toolArgsRef.current[taskId])
-                  const cancelling = cancellingTasks.has(taskId)
-                  return (
-                    <div
-                      key={taskId}
-                      className="group flex items-center gap-1.5 rounded-sm px-1 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted/40"
-                    >
-                      <Spinner className="h-3 w-3 shrink-0" />
-                      <span className="shrink-0 rounded-[3px] bg-muted px-1 py-px">
-                        {t("subagentTag")}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate" title={label ?? undefined}>
-                        {label ?? taskId.slice(0, 8)}
-                        <span className="text-muted-foreground/60">
-                          {" · "}
-                          {cancelling ? t("subagentCancelling") : live.note}
-                        </span>
-                      </span>
-                      <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground/60">
-                        {formatElapsed(Date.now() - live.startedAt)}
-                      </span>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        disabled={cancelling}
-                        onClick={() => handleCancelTask(taskId)}
-                        className="h-5 w-5 shrink-0 rounded-sm text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100 disabled:opacity-40 [@media(hover:none)]:opacity-100 [&_svg]:size-3"
-                        title={t("subagentCancel")}
-                      >
-                        <X />
-                      </Button>
-                    </div>
-                  )
-                })}
+              /* Same card chrome as QueuedItems below: bordered rounded panel
+                 with a header row — the two strips dock together above the
+                 composer and should read as one family. */
+              <div className="mx-auto w-full max-w-3xl px-4 pb-1.5 print:hidden">
+                <div className="animate-rise-in overflow-hidden rounded-lg border border-border bg-muted/20">
+                  <div className="flex items-center gap-1.5 border-b border-border/60 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+                    <Spinner className="h-3 w-3 shrink-0" />
+                    <span className="min-w-0 flex-1 truncate font-medium">
+                      {tf("subagentHeader", Object.keys(subagentNotes).length)}
+                    </span>
+                  </div>
+                  <div className="space-y-px p-1">
+                    {Object.entries(subagentNotes).map(([taskId, live]) => {
+                      // This tab's tool_start args first, the envelope's label as
+                      // fallback (covers re-attach after a trimmed replay), the
+                      // raw id as last resort.
+                      const label = taskLabel(toolArgsRef.current[taskId]) ?? live.label
+                      const cancelling = cancellingTasks.has(taskId)
+                      return (
+                        <div
+                          key={taskId}
+                          className="flex items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted/50"
+                        >
+                          <span
+                            className="min-w-0 flex-1 truncate text-foreground/75"
+                            title={label ?? undefined}
+                          >
+                            {label ?? taskId.slice(0, 8)}
+                            <span className="text-muted-foreground/60">
+                              {" · "}
+                              {cancelling ? t("subagentCancelling") : live.note}
+                            </span>
+                          </span>
+                          <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground/60">
+                            {formatElapsed(Date.now() - live.startedAt)}
+                          </span>
+                          {/* Always-visible actions (no hover reveal): this
+                              strip is the ONE place a running sub-agent can
+                              be opened or cancelled, so the affordance must
+                              be discoverable at a glance. */}
+                          <div className="flex shrink-0 items-center gap-0.5">
+                            {live.sessionId && sessionHref && (
+                              <a
+                                href={sessionHref(live.sessionId)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={t("taskViewTranscript")}
+                                aria-label={t("taskViewTranscript")}
+                                className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
+                              >
+                                <ExternalLink className="h-3 w-3" />
+                              </a>
+                            )}
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              disabled={cancelling}
+                              onClick={() => handleCancelTask(taskId)}
+                              className="h-6 w-6 rounded-sm text-muted-foreground hover:text-destructive disabled:opacity-40 [&_svg]:size-3"
+                              title={t("subagentCancel")}
+                              aria-label={t("subagentCancel")}
+                            >
+                              <X />
+                            </Button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
               </div>
             )}
 
@@ -2228,7 +3084,10 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
                 items={queuedItems}
                 onRemove={handleRemoveQueued}
                 onEdit={handleEditQueued}
+                onSendNow={handleSendNowQueued}
                 onClear={handleClearQueued}
+                uploadUrl={client.uploadUrl}
+                onPreviewAttachment={handlePreviewAttachment}
               />
             )}
 
@@ -2252,43 +3111,69 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
               />
             ) : null}
 
-            <ChatInput
-              value={input}
-              onChange={setInput}
-              onSend={handleSend}
-              onStop={handleStop}
-              streaming={streaming}
-              hasMessages={!isEmpty}
-              modelName={selectedModel || modelName}
-              models={availableModels}
-              defaultModel={modelName}
-              onSelectModel={handleSelectModel}
-              effortLevels={currentCaps?.effortLevels ?? []}
-              selectedEffort={selectedEffort}
-              defaultEffort={currentCaps?.defaultEffort}
-              onSelectEffort={handleSelectEffort}
-              skills={skills}
-              skillIconUrl={client.skillIconUrl}
-              pendingSkill={pendingSkill}
-              activatingSkill={activatingSkill}
-              activeSkillName={activeSkill}
-              resettingSkill={resettingSkill}
-              onPendingSkillChange={handlePendingSkillChange}
-              onResetSkill={handleResetSkill}
-              autoConfirm={autoConfirm}
-              onAutoConfirmOff={handleAutoConfirmOff}
-              attachments={pendingUploads}
-              onAddFiles={addFiles}
-              onRemoveUpload={removeUpload}
-              onPreview={(src, alt) => setLightbox({ src, alt })}
-              queueEnabled
-              onSendNow={handleSendNow}
-            />
+            {isTaskSession ? (
+              // Sub-agent transcript: a read-only note replaces the composer
+              // (the backend rejects posts into task sessions as well).
+              <div className="mx-auto w-full max-w-3xl px-4 pb-4 print:hidden">
+                <div className="flex items-center justify-center gap-1.5 rounded-md border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                  <FileText className="h-3.5 w-3.5 shrink-0" />
+                  {t("taskSessionReadonly")}
+                </div>
+              </div>
+            ) : (
+              <ChatInput
+                value={input}
+                onChange={setInput}
+                onSend={handleSend}
+                onStop={handleStop}
+                streaming={streaming}
+                hasMessages={!isEmpty}
+                modelName={selectedModel || modelName}
+                models={availableModels}
+                defaultModel={modelName}
+                onSelectModel={handleSelectModel}
+                effortLevels={currentCaps?.effortLevels ?? []}
+                selectedEffort={selectedEffort}
+                defaultEffort={currentCaps?.defaultEffort}
+                onSelectEffort={handleSelectEffort}
+                parameterDefinitions={currentCatalogModel?.parameters ?? []}
+                selectedParameters={selectedParameters}
+                onSelectParameter={handleSelectParameter}
+                supportsMaxMode={currentCatalogModel?.supportsMaxMode ?? false}
+                maxMode={maxModeForSend}
+                onToggleMaxMode={handleToggleMaxMode}
+                skills={skills}
+                skillIconUrl={client.skillIconUrl}
+                pendingSkill={pendingSkill}
+                activatingSkill={activatingSkill}
+                activeSkillName={activeSkill}
+                resettingSkill={resettingSkill}
+                onPendingSkillChange={handlePendingSkillChange}
+                onResetSkill={handleResetSkill}
+                autoConfirm={autoConfirm}
+                onAutoConfirmChange={handleAutoConfirmChange}
+                attachments={pendingUploads}
+                onAddFiles={addFiles}
+                onRemoveUpload={removeUpload}
+                onPreviewError={handleUploadPreviewError}
+                onPreview={(src, alt) => setLightbox({ src, alt })}
+                queueEnabled
+                onSendNow={handleSendNow}
+              />
+            )}
           </>
         )}
       </div>
       {lightbox ? (
         <Lightbox src={lightbox.src} alt={lightbox.alt} onClose={() => setLightbox(null)} />
+      ) : null}
+      {filePreview ? (
+        <FilePreview
+          file={filePreview}
+          src={client.uploadUrl(filePreview.id)}
+          downloadHref={client.uploadUrl(filePreview.id, filePreview.name ?? undefined)}
+          onClose={() => setFilePreview(null)}
+        />
       ) : null}
       {dragActive && (
         <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-background/70">
@@ -2299,6 +3184,8 @@ export const AgentChat = forwardRef<AgentChatHandle, AgentChatProps>(function Ag
         </div>
       )}
     </div>
+    </RevealContext.Provider>
+    </FoldAllContext.Provider>
     </ChatRuntimeContext.Provider>
   )
 })
@@ -2346,6 +3233,8 @@ interface MessageListProps {
   uploadUrl: (id: string, name?: string) => string
   /** Open the image lightbox (transcript thumbnails). */
   onPreview: (src: string, alt?: string) => void
+  /** Reader is at the transcript tail (gates step-group auto-fold). */
+  followTail?: boolean
 }
 
 const MessageList = memo(function MessageList({
@@ -2358,29 +3247,93 @@ const MessageList = memo(function MessageList({
   messagesEndRef,
   uploadUrl,
   onPreview,
+  followTail = true,
 }: MessageListProps) {
+  // Runs of ≥3 reasoning/tool rows fold into one StepGroup; everything else
+  // renders as before. Recomputed per messages change only — cheap (one
+  // linear pass) next to the per-row markdown work it wraps.
+  const blocks = useMemo(() => buildTranscriptBlocks(messages), [messages])
+  // Entrance animation gate. Rows that appear one at a time (a turn in
+  // progress) rise in; rows that arrive as a batch (a `history` frame
+  // replacing the transcript, this list mounting over a resumed session)
+  // render settled — forty rows lifting together is noise, not feedback.
+  // Ids are monotonic (`nextMsgId`), so "above the highest id rendered
+  // before this change" is "new". A replacement re-issues EVERY id: when no
+  // previous id survives and more than a few rows are new, it was a batch.
+  // (A brand-new chat's first send is 2 all-new rows — it animates.) The row
+  // snapshots its verdict at mount (see MessageRow), so the flip to "seen"
+  // on the next update cannot cut a running animation short. Read during
+  // render, committed after — a repeated render of the same `messages`
+  // reaches the same verdict.
+  const seenMaxIdRef = useRef(-1)
+  const prevMax = seenMaxIdRef.current
+  let fresh = 0
+  let maxId = prevMax
+  let survivors = 0
+  for (const m of messages) {
+    if (m.id > prevMax) fresh++
+    else survivors++
+    if (m.id > maxId) maxId = m.id
+  }
+  const batch = survivors === 0 && fresh > 3
+  const animateAboveId = batch ? Number.POSITIVE_INFINITY : prevMax
+  useLayoutEffect(() => {
+    seenMaxIdRef.current = maxId
+  }, [maxId])
   // Per-row user-message ordinal — the anchor `POST /api/chat/rewind` counts
   // by (user bubbles map 1:1 to the server's user-role messages).
-  let userOrdinal = -1
+  const userOrdinals = useMemo(() => {
+    const out = new Map<number, number>()
+    let ordinal = -1
+    for (const m of messages) if (m.role === "user") out.set(m.id, ++ordinal)
+    return out
+  }, [messages])
+  const lastIndex = messages.length - 1
+  const renderRow = (msg: Message, i: number, hideReasoning = false) => (
+    <MessageRow
+      key={msg.id}
+      msg={msg}
+      isFirst={i === 0}
+      isLast={streaming && i === lastIndex}
+      streaming={streaming}
+      renderers={renderers}
+      onEditMessage={onEditMessage}
+      onRewindMessage={onRewindMessage}
+      userIndex={msg.role === "user" ? (userOrdinals.get(msg.id) ?? -1) : -1}
+      onMessagePdf={onMessagePdf}
+      uploadUrl={uploadUrl}
+      onPreview={onPreview}
+      hideReasoning={hideReasoning}
+      enter={msg.id > animateAboveId}
+      afterPendingNote={i > 0 && messages[i - 1].role === "status" && messages[i - 1].pending === true}
+    />
+  )
   return (
     <div className="mx-auto max-w-3xl px-4 pt-6 pb-4">
-      {messages.map((msg, i) => {
-        if (msg.role === "user") userOrdinal++
+      {blocks.map((block) => {
+        if (block.kind === "row") return renderRow(block.msg, block.index, block.hideReasoning)
+        // A group is live while the stream is still feeding it: its last
+        // member is the transcript's last message (nothing has followed yet).
+        const tail = block.members[block.members.length - 1]
+        const live = streaming && tail.index === lastIndex && tail.part === "step"
         return (
-          <MessageRow
-            key={msg.id}
-            msg={msg}
-            isFirst={i === 0}
-            isLast={streaming && i === messages.length - 1}
-            streaming={streaming}
-            renderers={renderers}
-            onEditMessage={onEditMessage}
-            onRewindMessage={onRewindMessage}
-            userIndex={msg.role === "user" ? userOrdinal : -1}
-            onMessagePdf={onMessagePdf}
-            uploadUrl={uploadUrl}
-            onPreview={onPreview}
-          />
+          <StepGroup key={block.key} members={block.members} live={live} followTail={followTail}>
+            {block.members.map((m) =>
+              m.part === "step" ? (
+                renderRow(m.msg, m.index)
+              ) : (
+                // The answer's own reasoning, split off from its content row
+                // (which renders below the group with hideReasoning).
+                <div
+                  key={`r${m.msg.id}`}
+                  data-acc="msg-assistant"
+                  className={cn("mt-1", m.msg.id > animateAboveId && "animate-rise-in")}
+                >
+                  <ReasoningBlock content={m.msg.reasoning!} isStreaming={streaming && m.index === lastIndex} />
+                </div>
+              ),
+            )}
+          </StepGroup>
         )
       })}
       <div ref={messagesEndRef} />
@@ -2405,6 +3358,9 @@ const MessageRow = memo(function MessageRow({
   onMessagePdf,
   uploadUrl,
   onPreview,
+  hideReasoning = false,
+  enter = false,
+  afterPendingNote = false,
 }: {
   msg: Message
   isFirst: boolean
@@ -2418,7 +3374,20 @@ const MessageRow = memo(function MessageRow({
   onMessagePdf: (bodyEl: HTMLElement | null, title: string) => void
   uploadUrl: (id: string, name?: string) => string
   onPreview: (src: string, alt?: string) => void
+  /** The reasoning of this assistant row is rendered elsewhere (inside the
+   *  step group above it) — show only the content. */
+  hideReasoning?: boolean
+  /** Play the entrance animation. Read once at mount: the list's verdict
+   *  flips to "seen" on the next update, and a class removed mid-animation
+   *  would snap the row to its final state. */
+  enter?: boolean
+  /** The row directly above is a pending status note ("Compacting
+   *  context..."): an empty placeholder here stays silent instead of adding
+   *  a second spinner. */
+  afterPendingNote?: boolean
 }) {
+  const enterRef = useRef(enter)
+  const rise = enterRef.current ? "animate-rise-in" : undefined
   // Ref to the rendered answer body, printed as-is by the per-message PDF
   // export (so code highlighting, tables, etc. carry over faithfully).
   const bodyRef = useRef<HTMLDivElement>(null)
@@ -2426,7 +3395,7 @@ const MessageRow = memo(function MessageRow({
   const [showSummary, setShowSummary] = useState(false)
   if (msg.role === "tool") {
     return (
-      <div data-acc="tool-block" className="mt-1">
+      <div data-acc="tool-block" className={cn("mt-1", rise)}>
         <ToolCallBlock
           name={msg.toolName || ""}
           args={msg.toolArgs}
@@ -2441,8 +3410,16 @@ const MessageRow = memo(function MessageRow({
   }
 
   if (msg.role === "status") {
+    // A pending note is the turn's activity line while it lasts (the
+    // placeholder below it yields its own spinner — see `afterPendingNote`).
     return (
-      <div className="mt-2 py-1 text-center text-xs text-muted-foreground">
+      <div
+        className={cn(
+          "mt-2 flex items-center justify-center gap-2 py-1 text-center text-xs text-muted-foreground",
+          rise,
+        )}
+      >
+        {msg.pending && streaming && <Spinner size="sm" />}
         {msg.content}
       </div>
     )
@@ -2450,10 +3427,10 @@ const MessageRow = memo(function MessageRow({
 
   if (msg.role === "error") {
     return (
-      <div className="mt-2 flex justify-center">
+      <div className={cn("mt-2 flex justify-center", rise)}>
         <div className="flex items-start gap-2 rounded-sm border border-border bg-card px-3 py-2 max-w-[80%]">
           <XCircle className="h-3.5 w-3.5 mt-0.5 shrink-0 text-destructive" strokeWidth={2} />
-          <div className="min-w-0 flex-1 text-xs leading-4 text-foreground">{msg.content}</div>
+          <div className="min-w-0 flex-1 text-xs leading-4 text-foreground wrap-anywhere">{msg.content}</div>
         </div>
       </div>
     )
@@ -2491,7 +3468,10 @@ const MessageRow = memo(function MessageRow({
 
   if (msg.role === "user") {
     return (
-      <div className="group mt-6 flex flex-col items-end gap-1">
+      <div
+        data-msg-id={msg.id}
+        className={cn("group mt-6 flex scroll-mt-4 flex-col items-end gap-1", rise)}
+      >
         {msg.attachments?.length ? (
           <div className="flex max-w-[80%] flex-wrap justify-end gap-1.5">
             {msg.attachments.map((a) =>
@@ -2544,22 +3524,38 @@ const MessageRow = memo(function MessageRow({
   }
 
   // assistant
-  const showThinking = !msg.content && isLast && !msg.reasoning
-  if (!msg.content && !msg.reasoning && !isLast) return null
+  // A pending status note right above this placeholder is already the
+  // activity line (with its own spinner): a second "Thinking…" would be
+  // noise, so the placeholder renders nothing until the note resolves.
+  const showThinking = !msg.content && isLast && !msg.reasoning && !afterPendingNote
+  if (!msg.content && !msg.reasoning && !showThinking) return null
 
   const hasContent = !!msg.content
-  const hasReasoning = !!msg.reasoning
+  // Reasoning may be rendered inside the step group above (hideReasoning):
+  // then this row is content-only and spaces like an answer without one.
+  const hasReasoning = !!msg.reasoning && !hideReasoning
   const spacing = hasReasoning ? "mt-1" : hasContent || isLast ? "mt-5" : "mt-1"
 
   return (
     <div data-acc="msg-assistant" className={`group ${isFirst ? "" : spacing}`}>
-      {hasReasoning && <ReasoningBlock content={msg.reasoning!} isStreaming={isLast} />}
+      {hasReasoning && (
+        <ReasoningBlock content={msg.reasoning!} isStreaming={isLast} className={rise} />
+      )}
       {hasContent ? (
-        <div ref={bodyRef} data-acc="msg-assistant-body" className={hasReasoning ? "mt-4" : undefined}>
+        // The body mounts when the first content token lands, replacing the
+        // "Thinking…" line (or following the reasoning row): fade it in so
+        // the swap reads as a continuation rather than a cut. Fade only — a
+        // lift here would push the streaming text around under the eye. Same
+        // gate as the row: history bodies render settled.
+        <div
+          ref={bodyRef}
+          data-acc="msg-assistant-body"
+          className={cn(rise && "animate-fade-in", hasReasoning && "mt-4")}
+        >
           <Markdown content={msg.content} isStreaming={isLast} />
         </div>
       ) : showThinking ? (
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <div className={cn("flex items-center gap-2 text-xs text-muted-foreground", rise)}>
           <Spinner size="sm" />
           {t("thinking")}
         </div>

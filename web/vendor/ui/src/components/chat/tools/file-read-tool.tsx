@@ -48,7 +48,7 @@ export function FileReadTool({ args, result, isRunning }: ToolDisplayProps) {
       {/* File path badge */}
       {path && (
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="inline-flex items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 font-mono text-[11px] text-foreground/80">
+          <span className="inline-flex max-w-full min-w-0 items-center gap-1 rounded-md bg-muted/50 px-2 py-0.5 font-mono text-[11px] text-foreground/80 wrap-anywhere">
             <FileIcon ext={ext} />
             {path}
           </span>

@@ -1,0 +1,104 @@
+#!/bin/sh
+# NES -- the console's doorway from the Apps page. The machine itself is the
+# image's /usr/bin/nes (nes/ at the repository root, built into the image
+# by linux/external/package/nes); this app adds the one thing a card's play
+# button needs and the command line never did: a way to pick the ROM. It
+# lists the .nes files under /data (a file dropped onto the page lands
+# there), the person types a number, and `nes ROM` runs on the PTY rund
+# opened for this window (app.start {pty}). The picture goes to the screen
+# -- a mode-set the page answers by opening the screen window -- the game's
+# own lines stay here, and when it quits the list comes back.
+#
+# Keys in the game (nes/src/input.c): arrows/WASD move, K or X = A, J or
+# Z = B, Enter = Start, Space = Select, q or ESC quits. Typed here they
+# reach the game through the PTY (a keystroke holds its button a few
+# frames -- a terminal carries no key-up); with the screen window focused
+# they reach it as a PS/2 keyboard (real press and release, the better pad).
+
+NES=/usr/bin/nes
+ROOT=/data
+
+LIST=$(mktemp 2>/dev/null || echo "/tmp/nes-pick.$$")
+trap 'rm -f "$LIST"' EXIT
+
+cls() { printf '\033[H\033[2J'; }
+
+if [ ! -x "$NES" ]; then
+	cls
+	printf '  This machine has no nes: /usr/bin/nes is not in its image.\n\n'
+	printf '  The console ships with the vinx image (nes/ in the repository, built by\n'
+	printf '  linux/external/package/nes); a newer image brings it.\n\n'
+	printf '  Enter closes this window. '
+	IFS= read -r _
+	exit 1
+fi
+
+# The ROMs: regular files named *.nes under /data, three levels deep at
+# most, the system's own trees (installed packages, the page's state) left
+# out. One path per line, sorted, so a number names the same file until
+# the next scan.
+scan() {
+	find "$ROOT" -maxdepth 3 -type f -name '*.[nN][eE][sS]' 2>/dev/null |
+		grep -v -e "^$ROOT/apps/" -e "^$ROOT/\.vinx/" | sort > "$LIST"
+	count=$(wc -l < "$LIST")
+}
+
+draw() {
+	cls
+	printf '  \033[1mNES\033[0m -- the console on the screen, the ROMs from %s\n\n' "$ROOT"
+	if [ "$count" -eq 0 ]; then
+		printf '  No ROM here yet. Drop a .nes file onto the page: it lands in %s\n' "$ROOT"
+		printf '  and this list picks it up.\n\n'
+		printf '  r rescan   q quit\n'
+	else
+		i=0
+		while IFS= read -r f; do
+			i=$((i + 1))
+			kb=$((($(wc -c < "$f") + 1023) / 1024))
+			printf '  %2d) %-46.46s %5d KB\n' "$i" "${f#$ROOT/}" "$kb"
+		done < "$LIST"
+		printf '\n  number plays   r rescan   q quit\n'
+	fi
+	printf '\n  > '
+}
+
+play() {
+	cls
+	printf '  nes %s\n\n' "$1"
+	printf '  The picture is on the screen window; q or ESC in the game comes back here.\n\n'
+	"$NES" "$1"
+	rc=$?
+	# The wrapper (fb-run) restores the terminal on every exit path it sees;
+	# this is for the one it cannot -- a kill -9 leaves stdin raw.
+	stty sane 2>/dev/null
+	case $rc in
+	0) return ;;
+	75) printf '\n  The screen is busy: another framebuffer program holds it.\n' ;;
+	*) printf '\n  nes exited with status %d.\n' "$rc" ;;
+	esac
+	printf '\n  Enter goes back to the list. '
+	IFS= read -r _ || exit 0
+}
+
+while :; do
+	scan
+	draw
+	IFS= read -r ans || exit 0
+	case "$ans" in
+	q | Q) exit 0 ;;
+	'' | r | R) continue ;;
+	*[!0-9]* | 0*)
+		printf '  a number from the list, r or q\n'
+		sleep 1
+		;;
+	*)
+		rom=$(sed -n "${ans}p" "$LIST")
+		if [ -n "$rom" ]; then
+			play "$rom"
+		else
+			printf '  nothing is numbered %s\n' "$ans"
+			sleep 1
+		fi
+		;;
+	esac
+done

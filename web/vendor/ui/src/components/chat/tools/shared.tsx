@@ -42,6 +42,17 @@ export function RunningIndicator() {
   )
 }
 
+/** Title-case a snake_case tool name (`read_file` → `Read File`). */
+export function humanizeToolName(name: string): string {
+  return name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+/** The tool's display label: the sub-agent tool reads as a localized
+ *  "sub-task" chip, every other tool as its humanized name. */
+export function toolLabel(name: string): string {
+  return name === "task" ? t("subagentTag") : humanizeToolName(name)
+}
+
 export function tryParseJson(str?: string): Record<string, unknown> | null {
   if (!str) return null
   try {

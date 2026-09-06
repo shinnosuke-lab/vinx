@@ -136,7 +136,7 @@
 }
 
 /* ── Scroll-on-hover (scoped) ──
-   Aligned with OnTrakBridge (the gateway host app this agent ships beside):
+   Aligned with the host app this agent typically ships beside:
    the thumb is always visible — same 6px track/thumb as the global rule —
    with a stable gutter so layout never shifts. The class is kept for call
    sites; it now only adds the gutter reservation. */
@@ -144,7 +144,19 @@
   scrollbar-gutter: stable;
 }
 
-/* ── Entrance fade (OnTrakBridge parity) ── */
+/* ── Motion tokens ──
+   One duration ramp and one easing for every transcript animation, so the
+   page moves as one system rather than a pile of ad-hoc timings. Everything
+   below animates only transform / opacity / grid-template-rows (compositor-
+   cheap; never height, box-shadow or filter). The reduced-motion block at the
+   end of this section switches all of it off at once. */
+.acc-root {
+  --acc-motion-fast: 150ms;
+  --acc-motion-base: 220ms;
+  --acc-ease-out: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* ── Entrance fade ── */
 @keyframes acc-fade-in {
   from { opacity: 0; }
   to { opacity: 1; }
@@ -152,6 +164,326 @@
 
 .acc-root .animate-fade-in {
   animation: acc-fade-in 0.3s ease-out;
+}
+
+/* ── Transcript entrance: a short rise ──
+   New rows (user bubble, tool card, reasoning row, status/error line) and the
+   panels docked above the composer (confirm / ask / queue) arrive with a 6px
+   lift + fade. Mount-time animation only: React keeps rows keyed by id, so a
+   row plays this once when it first appears and never again on re-render.
+   Rows that mount as one batch (a session's history replacing the transcript)
+   do not carry the class at all — MessageRow snapshots that at mount, see
+   `mountBatchRef` in AgentChat.tsx. (Toggling an ancestor attribute would not
+   work: the moment it lifts, every suppressed animation starts at once.) */
+@keyframes acc-rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.acc-root .animate-rise-in {
+  /* `backwards`, not `both`: once done the row must carry NO transform —
+     a lingering `translateY(0)` would make every row a containing block for
+     `position: fixed` descendants (dropdown menus) and a stacking context. */
+  animation: acc-rise-in var(--acc-motion-base) var(--acc-ease-out) backwards;
+}
+
+/* ── Status pop: spinner → check / cross ──
+   The moment a tool call finishes gets a small scale-in on the verdict icon,
+   so completion registers at a glance in a fast-moving step ladder. */
+@keyframes acc-pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.acc-root .animate-pop-in {
+  animation: acc-pop-in var(--acc-motion-fast) var(--acc-ease-out) both;
+}
+
+/* ── Collapsible (reasoning rows, tool cards, step groups) ──
+   A grid whose single row animates 0fr ↔ 1fr: the one height transition CSS
+   can run without knowing the content's size. The inner element carries
+   `min-height: 0` (a grid item's default min-height is `auto`, which would pin
+   the row open) and `overflow: hidden`. The component keeps children
+   unmounted while folded and only mounts them for the open state — the exit
+   animation plays on the last rendered frame before unmount (see
+   collapsible.tsx).
+
+   `min-width: 0` on the item is the same fix along the other axis: once the
+   open state lifts the clip (`overflow: visible` below), a grid item's
+   `min-width: auto` resolves to its min-content width — the longest
+   unbreakable run inside it, e.g. a `nowrap`/`truncate` file path in a tool
+   header or a long line in a code block. That would widen the item past the
+   chat column and drag every sibling row in the group with it. */
+.acc-root .acc-collapsible {
+  display: grid;
+  grid-template-rows: 1fr;
+  grid-template-columns: minmax(0, 1fr);
+  opacity: 1;
+  transition:
+    grid-template-rows var(--acc-motion-base) var(--acc-ease-out),
+    opacity var(--acc-motion-base) var(--acc-ease-out);
+}
+
+.acc-root .acc-collapsible[data-state="closed"] {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.acc-root .acc-collapsible > * {
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* While the row is fully open the clip must go: tooltips, focus rings and the
+   copy buttons that peek past a card edge should not be cut. `[data-state=
+   "open"]` is set only after the enter transition has ended. */
+.acc-root .acc-collapsible[data-state="open"] > * {
+  overflow: visible;
+}
+
+/* ── Header label cross-fade ("Thinking…" → "Reasoning") ── */
+@keyframes acc-label-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.acc-root .animate-label-in {
+  animation: acc-label-in var(--acc-motion-fast) var(--acc-ease-out) both;
+}
+
+/* ── Jump-to-bottom button ──
+   Lives in the DOM permanently and toggles with `data-state`, so both the
+   entrance and the exit animate (a conditionally rendered node can only
+   animate in). Hidden state also drops pointer events so the invisible
+   button never eats a click meant for the transcript. */
+.acc-root .acc-jump {
+  opacity: 1;
+  transform: translate(-50%, 0);
+  transition:
+    opacity var(--acc-motion-fast) var(--acc-ease-out),
+    transform var(--acc-motion-fast) var(--acc-ease-out),
+    color var(--acc-motion-fast);
+}
+
+.acc-root .acc-jump[data-state="hidden"] {
+  opacity: 0;
+  transform: translate(-50%, 8px);
+  pointer-events: none;
+}
+
+/* "Live" dot: pulses to mark something in progress — the jump button's "new
+   output below" while the stream runs, the composer's full-auto badge. */
+@keyframes acc-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.7);
+  }
+}
+
+.acc-root .acc-live-dot {
+  animation: acc-dot-pulse 1.4s ease-in-out infinite;
+}
+
+/* ── Reveal flash: the tool card another card pointed at ("show original"
+   on a recall_result card, lib/reveal) lights up once as it scrolls into
+   view, so the eye lands on the right row. Background only (cheap). */
+@keyframes acc-reveal-flash {
+  0%,
+  35% {
+    background-color: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.acc-root .acc-reveal-flash {
+  border-radius: var(--radius-sm);
+  animation: acc-reveal-flash 1.6s var(--acc-ease-out) both;
+}
+
+/* ── Popovers (composer toolbar: model / tuning / usage / work dir, the slash
+   palette) and hover tooltips ──
+   `animate-in fade-in-0 zoom-in-95` in the markup was tailwindcss-animate
+   vocabulary, and that plugin is not installed — those classes never emitted
+   a rule, so every toolbar panel snapped open. `.acc-pop` is the real thing:
+   fade + 4% scale from the edge the panel grows out of, plus a 4px nudge in
+   the direction it opens. The side comes from `data-side` (our own panels)
+   or Radix's `data-side` on TooltipContent — same attribute, same rule. */
+@keyframes acc-pop-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes acc-pop-down {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes acc-pop-left {
+  from {
+    opacity: 0;
+    transform: translateX(4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+@keyframes acc-pop-right {
+  from {
+    opacity: 0;
+    transform: translateX(-4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+.acc-root .acc-pop {
+  /* Default (and `data-side="top"`): opens upward, so it grows from its
+     bottom edge. */
+  transform-origin: bottom left;
+  animation: acc-pop-up var(--acc-motion-fast) var(--acc-ease-out) backwards;
+}
+
+.acc-root .acc-pop[data-side="bottom"] {
+  transform-origin: top left;
+  animation-name: acc-pop-down;
+}
+
+/* Right-anchored menus grow from their right edge. */
+.acc-root .acc-pop[data-align="end"] {
+  transform-origin: bottom right;
+}
+
+.acc-root .acc-pop[data-side="bottom"][data-align="end"] {
+  transform-origin: top right;
+}
+
+.acc-root .acc-pop[data-side="left"] {
+  transform-origin: right center;
+  animation-name: acc-pop-left;
+}
+
+.acc-root .acc-pop[data-side="right"] {
+  transform-origin: left center;
+  animation-name: acc-pop-right;
+}
+
+/* Radix Tooltip content: it toggles `data-state` (delayed-open | instant-open
+   | closed) and sets `data-side`; the exit is not animated — Radix unmounts
+   the content immediately unless told to wait, and a tooltip that lingers
+   under the pointer reads as lag. */
+.acc-root .acc-tip {
+  transform-origin: var(--radix-tooltip-content-transform-origin, center);
+}
+
+.acc-root .acc-tip[data-state="delayed-open"],
+.acc-root .acc-tip[data-state="instant-open"] {
+  animation: acc-pop-up var(--acc-motion-fast) var(--acc-ease-out) backwards;
+}
+
+.acc-root .acc-tip[data-state="delayed-open"][data-side="bottom"],
+.acc-root .acc-tip[data-state="instant-open"][data-side="bottom"] {
+  animation-name: acc-pop-down;
+}
+
+.acc-root .acc-tip[data-state="delayed-open"][data-side="left"],
+.acc-root .acc-tip[data-state="instant-open"][data-side="left"] {
+  animation-name: acc-pop-left;
+}
+
+.acc-root .acc-tip[data-state="delayed-open"][data-side="right"],
+.acc-root .acc-tip[data-state="instant-open"][data-side="right"] {
+  animation-name: acc-pop-right;
+}
+
+/* ── Message outline rail (one tick per user message) ──
+   Ticks keep a fixed 12px box; emphasis is colour plus a transform-only
+   stretch, so nothing in the column reflows. The hover preview slides in from
+   the rail and, when the pointer moves to another tick, glides to the new
+   anchor instead of jumping (top is transitioned; it is the one layout
+   property here, on a 1-element absolutely positioned card). */
+.acc-root .acc-tick {
+  transform-origin: center;
+  transition:
+    background-color var(--acc-motion-fast) var(--acc-ease-out),
+    transform var(--acc-motion-fast) var(--acc-ease-out);
+}
+
+.acc-root .acc-tick[data-active="true"] {
+  transform: scaleX(1.5);
+}
+
+.acc-root .acc-tick[data-hot="true"]:not([data-active="true"]) {
+  transform: scaleX(1.25);
+}
+
+.acc-root .acc-tick-enter {
+  animation: acc-pop-in var(--acc-motion-base) var(--acc-ease-out) backwards;
+}
+
+.acc-root .acc-outline-preview {
+  animation: acc-pop-left var(--acc-motion-fast) var(--acc-ease-out) backwards;
+  transition: top var(--acc-motion-fast) var(--acc-ease-out);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .acc-root .animate-rise-in,
+  .acc-root .animate-pop-in,
+  .acc-root .animate-label-in,
+  .acc-root .acc-live-dot,
+  .acc-root .acc-pop,
+  .acc-root .acc-tip,
+  .acc-root .acc-tick-enter,
+  .acc-root .acc-outline-preview {
+    animation: none;
+  }
+  .acc-root .acc-collapsible,
+  .acc-root .acc-jump,
+  .acc-root .acc-tick,
+  .acc-root .acc-outline-preview {
+    transition: none;
+  }
 }
 
 /* ── Drawer slide-in (narrow-viewport overlay panels) ── */
@@ -220,7 +552,7 @@
 }
 
 /* ── Thin scrollbar variant (popovers / small panels) ──
-   Mirrors OnTrakBridge's `.scrollbar-thin`: width only; track/thumb inherit
+   A `.scrollbar-thin` utility: width only; track/thumb inherit
    the global rules. Deliberately NOT the standard `scrollbar-width` property —
    it flips Chromium back to default scrollbars (dark background), breaking the
    custom styling. */
@@ -263,10 +595,10 @@
   --color-destructive: hsl(0 84% 60%);
   --color-destructive-foreground: hsl(0 0% 100%);
 
-  --color-success: hsl(142 71% 45%);
+  --color-success: hsl(152 60% 40%);
   --color-success-foreground: hsl(0 0% 100%);
 
-  --color-warning: hsl(38 92% 50%);
+  --color-warning: hsl(36 92% 48%);
   --color-warning-foreground: hsl(0 0% 100%);
 
   --color-card: hsl(40 33% 99%);
@@ -379,6 +711,25 @@
 .markdown-body {
   line-height: 1.6;
   word-wrap: break-word;
+}
+
+/* ── CJK ↔ Latin spacing in conversation text ──
+   Chinese prose from the model is full of inline Latin (identifiers, product
+   names, numbers) and models are inconsistent about the typographic "half
+   space" between the scripts (`使用Rust编写` vs `使用 Rust 编写`). `text-autospace`
+   inserts a 1/8em gap at each script boundary (Chrome ≥ 128, Safari ≥ 18.4,
+   ignored elsewhere), so both spellings read the same. Prose only: code is
+   left exactly as written (`normal` on a `<code>` would reflow the model's
+   literal text), and the UI chrome, which sets its own gaps, is untouched. */
+.markdown-body,
+.acc-root [data-acc="msg-user"] {
+  text-autospace: normal;
+}
+.markdown-body code,
+.markdown-body pre,
+.markdown-body kbd,
+.markdown-body samp {
+  text-autospace: no-autospace;
 }
 
 .markdown-body h1,
@@ -657,11 +1008,16 @@
      hidden` keeps layout boxes, and viewport-sized shell pieces (e.g. the
      `h-screen` nav rail — 100vh resolves to the full page box in print) push
      the flow past one page and emit trailing blank pages. Drop every branch
-     that neither contains nor belongs to the transcript from the flow. */
+     that neither contains nor belongs to the transcript from the flow. The
+     UA's default body margin gets zeroed too — this library deliberately
+     never resets host styles on screen, so those 8px would otherwise spill
+     the flow past the content-sized single page. */
   html,
   body {
     height: auto !important;
     overflow: visible !important;
+    margin: 0 !important;
+    padding: 0 !important;
   }
   body *:not([data-chat-messages]):not(:has([data-chat-messages])):not([data-chat-messages] *) {
     display: none !important;
@@ -671,10 +1027,17 @@
      wrappers that are pushed right of the nav rail / history panel, and hidden
      chrome keeps its layout box — so the print inherited that horizontal
      offset (a sidebar-wide blank left margin, growing when expanded). Strip
-     positioning from every ancestor so the page becomes the containing block. */
+     positioning from every ancestor so the page becomes the containing block.
+     `min-height` must go too: `.acc-root { min-height: 100dvh }` (the mobile
+     viewport rule) resolves against the PAGE BOX in print — the exact height
+     of the content-sized single page — so once the shell is back in normal
+     flow it alone fills the page and any extra pixel emits a trailing blank
+     second page. */
   body :has([data-chat-messages]) {
     position: static !important;
     height: auto !important;
+    min-height: 0 !important;
+    margin: 0 !important;
     overflow: visible !important;
   }
   /* top/left only (no `inset: 0`): anchoring bottom would stretch the box to
@@ -710,34 +1073,33 @@
     padding-left: 0 !important;
     padding-right: 0 !important;
   }
-  /* ── Solo message export ──
-     The per-message "Save as PDF" button adds `.print-solo` to the container
-     and `data-print-solo` to the target answer body. Print only that body:
-     drop the session title, every other message row, and — inside the row that
-     holds the target — its siblings (the reasoning block, message actions). The
-     `:has()` guard keeps the target's ancestor row (and thus the target) alive. */
+  /* ── Solo block export ──
+     `printSoloElementToPdf` adds `.print-solo` to the container and
+     `data-print-solo` to the target (an assistant answer body, or a task
+     tool's prompt/result block — any depth). Print only that block: hide
+     every element that is not the target, not an ancestor of it and not
+     inside it. One depth-independent rule instead of per-level sibling
+     rules, so deeply nested targets (inside tool cards) work the same as
+     top-level message bodies. */
   [data-chat-messages].print-solo [data-print-title] {
     display: none !important;
   }
-  [data-chat-messages].print-solo > div > *:not([data-print-solo]):not(:has([data-print-solo])) {
+  [data-chat-messages].print-solo
+    *:not([data-print-solo]):not(:has([data-print-solo])):not([data-print-solo] *) {
     display: none !important;
   }
-  [data-chat-messages].print-solo > div > * > *:not([data-print-solo]):not(:has([data-print-solo])) {
-    display: none !important;
-  }
-  /* Collapse the spacing around the solo body so the single page height matches
-     the measured body height. `printElementToPdf` sizes the page from the body
-     element alone; the inner column's `pt-6 pb-4`, the message row's top margin,
-     and the body's own `mt-4` (present when a reasoning block precedes it) are
-     not in that measurement, so leaving them would push the content past one
-     page height and spill onto a blank second page. */
-  [data-chat-messages].print-solo > div {
-    padding-top: 0 !important;
-    padding-bottom: 0 !important;
-  }
-  [data-chat-messages].print-solo > div > * {
-    margin-top: 0 !important;
-    margin-bottom: 0 !important;
+  /* Strip the chrome off the target's ancestor chain (spacing, card borders
+     and backgrounds — e.g. the tool-call card around a task result) so the
+     single page height, measured from the target element alone by
+     `printElementToPdf`, stays exact: anything left on an ancestor would
+     push the content past one page height and spill onto a blank second
+     page. Descendant `*` never matches the container itself, so its 10mm
+     print padding survives. */
+  [data-chat-messages].print-solo *:has([data-print-solo]) {
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
   }
   [data-chat-messages].print-solo [data-print-solo] {
     margin: 0 !important;

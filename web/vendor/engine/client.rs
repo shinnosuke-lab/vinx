@@ -38,6 +38,9 @@ pub struct LlmClient {
     /// failing each one. Shared across clones (per-turn model swaps, reduced-
     /// effort retries) so one rejection teaches them all.
     max_tokens_unsupported: Arc<AtomicBool>,
+    /// Model the context-compaction summary runs on (`None` = this client's
+    /// own model). See [`LlmClient::with_compaction_model`].
+    compaction_model: Option<String>,
 }
 
 /// A streamed chat completion, fully assembled: the assistant message plus the
@@ -45,9 +48,13 @@ pub struct LlmClient {
 /// `None` when the stream closed via `[DONE]` without one). `length` means the
 /// response hit the completion-token cap — callers use it to tell "the payload
 /// IS truncated" apart from "the model chose to stop here".
+///
+/// `usage` is the provider's token accounting for this round when it reported
+/// one (the OpenAI `usage` chunk), `None` when it did not or reported zeros.
 pub struct StreamOutcome {
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
+    pub usage: Option<crate::types::TokenUsage>,
 }
 
 /// Stable marker carried by the "reasoning-only response" stream error (the
@@ -67,6 +74,45 @@ pub(crate) fn error_is_reasoning_only(error: &str) -> bool {
 /// Whether a chat-stream error reports a completion-token-cap truncation.
 pub(crate) fn error_is_length_truncated(error: &str) -> bool {
     error.contains(LENGTH_TRUNCATED_MARKER)
+}
+
+/// Whether an LLM-round error is the provider's "prompt does not fit the
+/// context window" verdict — its tokenizer's word, whatever our estimate said.
+/// The agent loop answers it with one forced compaction and a replay.
+///
+/// vinx: upstream reads a typed code off its own provider; OpenAI-compatible
+/// endpoints have no vendor-neutral code, so this is the pre-stream HTTP
+/// status (400, a few 413) plus the phrasings seen in the wild. The status
+/// guard keeps a 200 whose *content* quotes one of them from counting, and a
+/// 401/429/5xx never reaches the phrase check.
+pub fn error_is_context_overflow(error: &str) -> bool {
+    let Some(rest) = error.strip_prefix("LLM API error: ") else {
+        return false;
+    };
+    if !(rest.starts_with("400") || rest.starts_with("413")) {
+        return false;
+    }
+    let lower = rest.to_ascii_lowercase();
+    // A per-request rate limit can wear the same clothes — Groq answers a
+    // tokens-per-minute overrun with 413 "Request too large for model …
+    // on tokens per minute (TPM)". That wants a wait, not a lossy compaction.
+    if lower.contains("rate_limit") || lower.contains("rate limit") || lower.contains("per minute")
+    {
+        return false;
+    }
+    // One entry per vendor family; comments name the wording it matches.
+    const PHRASES: &[&str] = &[
+        "context_length_exceeded",  // OpenAI / Azure / vLLM / Groq error code
+        "context length",           // "maximum context length is N tokens"
+        "context window",           // "exceeds the model's context window"
+        "token limit",              // DeepSeek / Moonshot "exceeded model token limit"
+        "too many tokens",          // Mistral / Together
+        "prompt is too long",       // Anthropic-compatible gateways
+        "input is too long",        // Bedrock
+        "conversation too long",    // Sand / Claude gateways
+        "input token count",        // Gemini "input token count (N) exceeds the maximum"
+    ];
+    PHRASES.iter().any(|p| lower.contains(p))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +242,7 @@ impl LlmClient {
             vision_override: None,
             uploads_dir: None,
             max_tokens_unsupported: Arc::new(AtomicBool::new(false)),
+            compaction_model: None,
         }
     }
 
@@ -229,6 +276,54 @@ impl LlmClient {
         self
     }
 
+    /// A clone of this client with the LEAST reasoning the model accepts, for
+    /// auxiliary work whose output is bounded and mechanical (the compaction
+    /// summary). At the turn's own settings a thinking model spends more
+    /// output tokens deliberating over the summary than writing it — and
+    /// every one of them is wall-clock time the user's turn is stalled for.
+    ///
+    /// The lowest entry of the capability table's `effort_levels`; models
+    /// without an effort parameter come back unchanged (the configured value,
+    /// if any, still applies).
+    pub fn with_minimal_reasoning(&self) -> LlmClient {
+        let caps = crate::model_caps::model_caps(&self.model);
+        match caps.effort_levels.first() {
+            Some(lowest) => self.clone().with_reasoning_effort(Some(lowest.to_string())),
+            None => self.clone(),
+        }
+    }
+
+    /// Model the context-compaction summary runs on (config
+    /// `compaction_model`; empty/whitespace = the turn's own model). Kept on
+    /// the client so every host inherits it from the one place the client is
+    /// built, and per-turn clones carry it along. Nothing sets it in vinx
+    /// yet — the settings hook is a separate batch — so `for_compaction`
+    /// currently always summarizes on the turn's own model.
+    pub fn with_compaction_model(mut self, model: Option<String>) -> Self {
+        self.compaction_model = model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        self
+    }
+
+    /// The configured compaction model, if it differs from this client's own.
+    pub fn compaction_model(&self) -> Option<&str> {
+        self.compaction_model
+            .as_deref()
+            .filter(|m| *m != self.model)
+    }
+
+    /// The client the compaction summary is written with: the configured
+    /// compaction model when there is one, at minimal reasoning either way.
+    /// The configured `reasoning_effort` is re-floored against the new
+    /// model's capability table.
+    pub fn for_compaction(&self) -> LlmClient {
+        match self.compaction_model() {
+            Some(model) => self.clone().with_model(model).with_minimal_reasoning(),
+            None => self.with_minimal_reasoning(),
+        }
+    }
+
     /// List the models the upstream OpenAI-compatible endpoint advertises via
     /// `GET {base_url}/models` (`data[].id`). Not all providers implement it;
     /// callers treat any error as "no list available" and fall back to a
@@ -249,7 +344,9 @@ impl LlmClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("models list error: {} {}", status, log_truncate(&body, 200)).into());
+            return Err(
+                format!("models list error: {} {}", status, log_truncate(&body, 200)).into(),
+            );
         }
 
         let payload: serde_json::Value = response.json().await?;
@@ -399,7 +496,11 @@ impl LlmClient {
                         }),
                     }
                 }
-                let mut tail = if text.trim().is_empty() { String::new() } else { text };
+                let mut tail = if text.trim().is_empty() {
+                    String::new()
+                } else {
+                    text
+                };
                 for note in [&image_note, &file_note].into_iter().flatten() {
                     if !tail.is_empty() {
                         tail.push_str("\n\n");
@@ -798,7 +899,10 @@ impl LlmClient {
             max_completion_tokens: self.effective_max_completion_tokens(),
         };
 
-        let response = match self.send_chat_request(&url, &request, true).await {
+        let response = match self
+            .send_chat_request(&url, &request, true, cancel.as_ref())
+            .await
+        {
             Ok(response) => response,
             // Any 400 while the optional `max_completion_tokens` field is on
             // the wire gets one retry without it. Rejections don't reliably
@@ -817,7 +921,9 @@ impl LlmClient {
                     log_truncate(&error.to_string(), 300)
                 );
                 request.max_completion_tokens = None;
-                let response = self.send_chat_request(&url, &request, true).await?;
+                let response = self
+                    .send_chat_request(&url, &request, true, cancel.as_ref())
+                    .await?;
                 // Succeeding without the field proves the field was the
                 // problem: stop sending it (this client and its clones) for
                 // the rest of the process.
@@ -1081,6 +1187,10 @@ impl LlmClient {
         Ok(StreamOutcome {
             message,
             finish_reason,
+            usage: usage
+                .as_ref()
+                .map(crate::types::TokenUsage::from)
+                .filter(|u| !u.is_empty()),
         })
     }
 
@@ -1126,7 +1236,7 @@ impl LlmClient {
             max_completion_tokens: None,
         };
 
-        let response = self.send_chat_request(&url, &request, false).await?;
+        let response = self.send_chat_request(&url, &request, false, None).await?;
 
         let body: serde_json::Value = response.json().await?;
         let content = body["choices"][0]["message"]["content"]
@@ -1196,11 +1306,19 @@ impl LlmClient {
     /// 发送一次 chat-completion 请求,对网络错误与 429/5xx 做有限指数退避
     /// 重试。返回的 Response 已通过状态码检查,可直接进入流式 / JSON 解析。
     /// `stream` 为 true 时设 `Accept: text/event-stream`(与历史行为一致)。
+    ///
+    /// `cancel` covers the whole "connect + wait for headers + backoff sleep"
+    /// phase: when the upstream stays silent for a long time (kimi k3 has
+    /// been observed taking 30s+ to the first byte), the user's stop must take
+    /// effect immediately rather than waiting for `send().await` to return on
+    /// its own — the same flag is polled during the streaming phase by
+    /// [`Self::process_stream`].
     async fn send_chat_request(
         &self,
         url: &str,
         request: &ChatCompletionRequest,
         stream: bool,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
         let mut backoff = Duration::from_secs(1);
         for attempt in 1..=Self::MAX_REQUEST_ATTEMPTS {
@@ -1216,7 +1334,7 @@ impl LlmClient {
                     req_builder.header("Authorization", format!("Bearer {}", self.api_key));
             }
 
-            match req_builder.json(request).send().await {
+            match await_unless_cancelled(req_builder.json(request).send(), cancel).await? {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
@@ -1233,7 +1351,7 @@ impl LlmClient {
                             delay
                         );
                         drop(response);
-                        wasmtimer::tokio::sleep(delay).await;
+                        await_unless_cancelled(wasmtimer::tokio::sleep(delay), cancel).await?;
                         backoff = (backoff * 2).min(Duration::from_secs(8));
                         continue;
                     }
@@ -1255,7 +1373,7 @@ impl LlmClient {
                             e,
                             backoff
                         );
-                        wasmtimer::tokio::sleep(backoff).await;
+                        await_unless_cancelled(wasmtimer::tokio::sleep(backoff), cancel).await?;
                         backoff = (backoff * 2).min(Duration::from_secs(8));
                         continue;
                     }
@@ -1270,6 +1388,32 @@ impl LlmClient {
         }
         // 每次迭代必然 return;此处为防御性兜底。
         Err("LLM request: retry loop exited unexpectedly".into())
+    }
+}
+
+/// Await `fut` while polling `cancel` every 50ms (the same cadence as the
+/// stream loop in `process_stream`). A set flag wins immediately: the pending
+/// future (connect / response-header wait / backoff sleep) is dropped, which
+/// aborts any in-flight request. The error text mirrors the stream-phase
+/// cancellation so both phases surface identically.
+///
+/// vinx: the tick is `wasmtimer`'s sleep — tokio's timer has no wasm driver.
+async fn await_unless_cancelled<T>(
+    fut: impl std::future::Future<Output = T>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<T, Box<dyn Error + Send + Sync>> {
+    let Some(flag) = cancel else {
+        return Ok(fut.await);
+    };
+    tokio::pin!(fut);
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return Err("LLM stream cancelled".into());
+        }
+        tokio::select! {
+            out = &mut fut => return Ok(out),
+            _ = wasmtimer::tokio::sleep(Duration::from_millis(50)) => {}
+        }
     }
 }
 

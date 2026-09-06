@@ -28,8 +28,10 @@ export function isShellDocument(): boolean {
 	return new URLSearchParams(location.search).get('pane') === null;
 }
 
-/** True for any document under the terminal page (shell or pane iframe). */
-function isTerminalDocument(): boolean {
+/** True for any document under the terminal page (shell or pane iframe) —
+ * a machine with a console and windows but no Apps page (that is the chat
+ * page's, at #/apps). */
+export function isTerminalDocument(): boolean {
 	return /\/terminal(\/|$)/.test(location.pathname);
 }
 

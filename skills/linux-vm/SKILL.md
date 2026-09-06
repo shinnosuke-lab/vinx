@@ -1,7 +1,7 @@
 ---
 name: linux-vm
-description: Reference for the emulated Linux this page runs — the busybox userland, the toolchain (tcc, nasm/ndisasm for x86 assembly, make, lua, micropython, qjs, sqlite3, jq, strace, btmon for btsnoop Bluetooth captures) and micropython's stdlib limits, GUI programs with LVGL (tcc -llvgl, lvdemo, a bundled GB2312 Chinese font) and terminal UIs with ncurses/termbox2, the tool set (run_shell, run_js, file tools, share_local, download_file, read_terminal), the guest's browser-facing commands (open, imgcat, download, notify, say, camera, share, alpine, js, fetch, bridge, ble, nes) plus the page-visible hardware — the VGA screen window the guest paints via /dev/fb0 (fbdemo is the reference) with the mouse forwarded to evdev, the /dev/dsp sound card, a Web Serial device on ttyS2 — the /data persistent directory where every shell starts and the /data/share/local directory every machine shares, and what the network can and cannot reach. Read this before doing anything non-trivial.
-version: 0.7.0
+description: Reference for the emulated Linux this page runs — the busybox userland, the toolchain (tcc, nasm/ndisasm for x86 assembly, make, lua, micropython, qjs, sqlite3, jq, strace, btmon) and micropython's stdlib limits, GUI programs with LVGL (tcc -llvgl, lvdemo, bundled GB2312 font) and terminal UIs with ncurses/termbox2, the tools (run_shell, run_js, file/share/download tools, read_terminal), the guest's browser-facing commands (open, imgcat, download, notify, say, camera, share, alpine, js, fetch, bridge, ble, nes, rpc), app(1) packaging and services (command/service/web/tty/fb; tty apps get a terminal window; rpc serve hosts script methods), plus the page-visible hardware — the VGA screen window the guest paints via /dev/fb0 (fbdemo; fb-run serializes them), mouse forwarded to evdev, the /dev/dsp sound card, a Web Serial device on ttyS2 — /data (persistent, every shell starts there) and /data/share/local (shared across machines), and what the network can and cannot reach. Read before non-trivial work.
+version: 0.9.1
 author: vinx
 ---
 
@@ -11,6 +11,21 @@ The device behind `run_shell` is a 32-bit x86 Linux built with Buildroot and
 emulated in the browser by [v86](https://github.com/copy/v86). It is real
 Linux — a real kernel, a real filesystem, real processes — but small and
 slow: think "router shell", not "build server".
+
+**Whether it runs is the person's decision.** The machine costs RAM, CPU and
+(once) a ~22 MB download, so the chat page asks before its first boot and
+can be told to leave it off. While it is off you hold none of its tools —
+no `run_shell`, no file tools on it — and your briefing says so; do not
+promise work that needs a shell. Say plainly that the task needs the
+machine and that the power key on the machine capsule (bottom right of
+the page) boots it; your tools appear on the next message once it is up.
+Pure web apps (`kind: window`, no `exec`) open from the Apps page without
+the machine, and a new one installs without it too: write the window's
+three parts as drafts (`index.html` body fragment, `style.css`, `app.js`)
+and call the workspace's `install_app` — it lands on the Apps page and the
+card gets an Open button. The `app` CLI below is for apps with a program
+behind them, and for the pure web kind while the machine is up (then
+`install_app` retires and `app pack`/`app install` is the door).
 
 ## What is there
 
@@ -117,10 +132,15 @@ paths land where they persist.
 
 - Work the user should keep belongs in `/data`; everything else is gone on
   reload. Deleting a file in `/data` deletes it from the mirror too.
-- It is flat files: subdirectories are not mirrored across reloads —
-  **except `/data/share/local`**, the one directory level that exists, below.
+- Directory trees are mirrored whole — build a project under
+  `/data/proj/src/...` and it comes back on the next boot, executable bits
+  included. Bounds: 16 MB per file, 64 MB and 2000 files per machine, 8
+  levels deep; dot-named files and directories are working scratch and are
+  **not** mirrored (`.vinx/` is the system's own); `/data/host` belongs to
+  the person's real-disk mount, not to this archive.
 - Snapshots are best-effort; the last few seconds before a tab closes can be
-  lost. Anything critical: tell the user it is in `/data` so they can check.
+  lost (guest writes usually mirror within ~2–3 s). Anything critical: tell
+  the user it is in `/data` so they can check.
 
 ### /data/share/local, the directory every machine shares
 
@@ -161,12 +181,15 @@ ones that can change things.
 - `share_local(path)` copies a file (≤16 MB) into `/data/share/local`, where
   every machine the person has open sees it within seconds — the way to hand
   a result to their terminal. Unconfirmed: nothing leaves their browser.
-- `read_terminal(lines?)` (terminal page only) shows the last lines of the
-  person's own screen. When they say "look at this error", read it instead of
+- `read_terminal(lines?)` shows the last lines of the person's own console
+  screen — the terminal page's console, or on the chat page the machine
+  console panel. When they say "look at this error", read it instead of
   asking them to paste.
 - `run_shell(command, timeout?)` is everything else: `sh -c` as root, starting
-  in `/data`, stdout and stderr combined, capped at 64 KiB — filter, don't
-  dump. Each call is independent (no shell state survives), but the filesystem
+  in `/data`, stdout and stderr combined, inline up to 64 KiB — past that the
+  output is cut with a marker naming the `/data` file that holds the full text
+  (`read_file` can fetch it) — still: filter, don't dump. Each call is
+  independent (no shell state survives), but the filesystem
   and processes persist while the page stays open: backgrounding a daemon with
   `&` works.
 - `run_js(code, timeout?)` runs JavaScript **on the page hosting this VM**,
@@ -181,19 +204,23 @@ ones that can change things.
 A non-zero exit code comes back as data (`[exit code: N]` in the output), not
 as a tool failure — probing for a missing file is normal, not an error.
 
-The operator's terminal (ttyS0) and your tool channel (ttyS1) land on the
-same machine: files you create are visible at their prompt, and theirs to
-you. Say what you changed.
+The operator's terminal (ttyS0) and your tool channel (the ttyS3 control
+plane) land on the same machine: files you create are visible at their
+prompt, and theirs to you. Say what you changed.
 
 ## The guest's own browser-facing commands
 
-These commands exist for the *person at the terminal* (they emit escape
-sequences that only render on ttyS0 — running them through `run_shell` does
-nothing useful, since your output is captured, not drawn):
+These commands drive the hosting browser page. They work the same from
+`run_shell` and the person's prompt (they are control-plane calls, and a
+failure is a named error on stderr, not silence). The one exception is
+`imgcat`, which draws with escape sequences and therefore only renders on
+the person's terminal:
 
 - `open FILE|URL` — the browser opens it in a new tab (renders PDF/HTML/
-  images/video/text, downloads the rest).
-- `imgcat [-w WIDTH] FILE` — shows an image inline in their terminal. By
+  images/video/text, downloads the rest under the file's own name). A popup
+  blocker may park it on a footer chip; the command says so.
+- `imgcat [-w WIDTH] FILE` — shows an image inline in their terminal
+  (console-only: your run_shell output is captured, not drawn). By
   default it auto-fits (small images at their own size, big ones scaled to
   fill the viewport whole); `-w 60` pins a width in cells, `-w 50%` in
   viewport share, `-w 800px` in pixels (1:1). No sideways scrolling: a width
@@ -204,19 +231,18 @@ nothing useful, since your output is captured, not drawn):
 - `download FILE` — saves a file to their machine (≤2 MB; you have the
   `download_file` tool instead, which takes up to 16 MB).
 - `notify MESSAGE` — a system notification from the browser (or its corner
-  toast when permission is missing) — how a long job announces it finished.
+  toast when permission is missing) — how a long job announces it finished,
+  and it works from your channel too.
 - `say TEXT` — the browser speaks it aloud (speechSynthesis, the browser's
   default voice, no permission prompt).
 - `camera snap [NAME.png]` — one frame from the webcam (the browser shows
-  its permission prompt), PNG-encoded into `/data`. Only the request is
-  console-bound — the photo lands where your file tools reach: ask the
-  person to run it, then take the file from `/data` yourself.
+  its permission prompt), PNG-encoded into `/data`; the command answers with
+  the file's path and size, and the photo lands where your file tools reach.
 - `alpine` — chroots into an Alpine minirootfs with `apk`, a real package
   manager (32-bit x86 repo). Needs a relay network to download; everything it
   installs is RAM-resident and gone on reload. If the user wants software the
-  image lacks, suggesting `alpine` (or running it for them via run_shell —
-  the chroot setup works fine from your channel, only the escape-emitting
-  commands do not) is the move.
+  image lacks, suggesting `alpine` (or running it for them via run_shell) is
+  the move.
 - `bridge start|join CODE|show|say|stop` — joins this machine's LAN to
   friends' machines over WebRTC (LAN modes; run from Host LAN it switches
   the panel to Bridge LAN by itself — no need to flip modes first). `start`
@@ -228,21 +254,89 @@ nothing useful, since your output is captured, not drawn):
   split panes on one origin are already on the same LAN without it.
 - `ble scan|connect|show|services|read|write|notify|watch|disconnect` —
   Web Bluetooth from the shell: the page speaks GATT to one device.
-  `connect [SERVICE]` needs the person's click on the footer's ble chip,
-  and its picker window doubles as the scanner (`ble scan` proper needs a
-  Chrome flag). `services` lists what the device offers; `read`/`write`/
+  `connect [SERVICE]` blocks until the person clicks the footer's ble chip
+  (the picker window doubles as the scanner; a device the browser already
+  remembers reconnects without the click). `ble scan` proper needs a
+  Chrome flag. `services` lists what the device offers; `read`/`write`/
   `notify` take service and characteristic (full UUID, 16-bit short like
   `180d`, or a GATT name like `heart_rate`); `watch` follows subscribed
   values. Pairing has no API: a protected read/write pops the OS's own
   dialog and then simply succeeds.
 
-Not everything browser-facing is console-bound; these work the same from
-`run_shell` and the person's prompt:
+Two more things browser-adjacent:
 
 - `share local FILE` copies a file into `/data/share/local` (see above; the
   scope argument is required — `share net` is reserved and not
-  implemented). No escape sequences; you have the `share_local` tool for
-  the same thing.
+  implemented). You have the `share_local` tool for the same thing.
+- `app` — package and run apps on this machine, services and windows
+  included, and it works fully from `run_shell`. The loop: `app new NAME
+  --command|--service|--web|--tty|--fb` scaffolds `/data/work/NAME` (an
+  `app.json` plus `./run`; `--web` an `index.html`/`style.css`/`app.js`
+  triple; `--tty` a termbox2 `main.c` compiled in place by its run;
+  `--fb` an LVGL `main.c` with a Chinese label, run under fb-run),
+  `app check PATH --json` validates it with stable
+  `{code,path,message,hint}` errors you can fix one by one, `app pack
+  PATH` makes `NAME.vapp` (a plain tar.gz), `app install NAME.vapp`
+  validates and lands it in `/data/apps` (which persists, so installed
+  apps survive reloads). Then `app run NAME` runs it once in the
+  foreground — for a web app that means its window opens on the page;
+  `app start|stop|status NAME` supervise a backend as a service (own
+  process group, log at `/run/vinx/apps/NAME/log`, `app log NAME [-f]`
+  reads it, crash restarts are bounded); `app enable NAME` makes it start
+  on every boot (`disable` undoes that); `app list` shows everything.
+  The verbs follow the kind. A **service** starts, stops and can be
+  enabled. A **command** runs to completion: `app start` runs it once
+  (its exit is completion, not a crash), and enabled it runs once per
+  boot. A **pure web window** (`kind:"window"`, `ui.type:"web"`, no
+  `exec`) has no process at all — `app run` opens its window, `app stop`
+  closes it, and `app enable` makes the page open it whenever the page
+  loads (the page is its boot; the machine may even be off — `disable`
+  undoes that, and it is the same `/data/apps/enabled` list). Do it only
+  when the person asked for an app that "opens every time" — a window
+  that shows up uninvited is a nuisance. The
+  Apps page in the UI offers exactly these verbs per kind, so what the
+  person clicks and what you type are the same words. Give a web app a
+  `"title"` (≤64) and a `"description"` (≤240) in `app.json` — the Apps
+  page shows them; the id stays the name the system knows it by. (With the
+  machine off, the workspace's `install_app` installs a pure web window
+  from three drafts and takes the same id, title and description; it
+  writes that `app.json` for you and lands the same `.vapp`, and its
+  `autostart: true` is the same `app enable`.)
+  Services survive page reloads within a boot and, when enabled, come
+  back after one. Web windows run in a sandboxed frame: no page DOM, no
+  storage, no network (a strict CSP), and one tiny bridge —
+  `vinx.call('notify.show', {text})` and `vinx.close()` are the whole
+  API. **Write a web app to the window's contract, not like a web page:**
+  `index.html` is a *body fragment* — no `<html>/<head>/<body>`, no
+  `<link rel=stylesheet>`, no `<script src>` — because the window injects
+  `style.css` into a `<style>` and `app.js` into a `<script>` itself
+  (three files, self-contained, nothing fetched). The frame has an opaque
+  origin: `localStorage`, `sessionStorage`, `indexedDB` and `document.cookie`
+  are stand-ins that live only while the window is open — nothing you store
+  survives closing it; `fetch`, `XMLHttpRequest`, `WebSocket` and dynamic
+  `import()` are blocked. Need state that lasts? Give the app a backend
+  (`kind: "window"` with `exec`) and keep it there. `app check` flags the
+  habits (`HTML_EXTERNAL_REF`, `JS_SANDBOX_API`) as warnings — the window
+  still opens, but not the way you pictured — so read its output before
+  `app run`. A tty app gets a real PTY and its own floating terminal window on
+  the page (type in it, the app draws back; closing the window stops the
+  app) — start it with `app start`, and beware: `app run` of a tty app
+  from run_shell fails (your channel has no tty; `app run` is for the
+  person's console). An fb app draws on the machine's screen, one FB
+  program at a time (`fb-run` holds the lock and restores the console on
+  any exit).
+  A hybrid app (manifest `kind:"window"` + `exec`) pairs the window
+  with a backend; the person closing the window stops the backend.
+- `rpc` — the control plane the commands above ride, callable raw:
+  `rpc discover` lists every live method with its owner, `rpc call
+  METHOD [JSON|-]` calls one, `rpc watch [TOPIC...]` prints events
+  (`app.exited`, `window.closed`, ...) one line each until ^C, and
+  `rpc serve ext.APPID.NAME -- ./handler` hosts a method from a shell
+  script: params arrive on the handler's stdin, its stdout (one JSON
+  value) is the result, a non-zero exit becomes an error, and the
+  registration disappears with the process — a service app whose run is
+  `exec rpc serve ...` is callable by every other process and the page
+  while it runs.
 - The footer's serial chip wires a real serial device (Web Serial,
   Chromium-only, one click) to `/dev/ttyS2`. `microcom /dev/ttyS2` is the
   interactive end for the person; once the device is connected, plain

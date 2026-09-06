@@ -179,6 +179,24 @@ export interface SessionSummary {
   created_at: string
   updated_at: string
   message_count: number
+  /** RFC 3339 archive stamp; absent/null = live. Archived sessions are
+   *  hidden from the default list (`scope=active`) and come back
+   *  automatically when a new turn runs in them. */
+  archived_at?: string | null
+  /** User-assigned category label (absent/null = uncategorised). */
+  category?: string | null
+}
+
+/** Which sessions `GET /api/sessions` returns. */
+export type SessionScope = 'active' | 'archived' | 'all'
+
+/** Body of `PATCH /api/sessions/{id}`; every field is optional. `category`
+ *  distinguishes "leave alone" (absent) from "clear" (`null`). */
+export interface SessionPatch {
+  title?: string
+  pinned?: boolean
+  archived?: boolean
+  category?: string | null
 }
 
 /** Image attachment reference riding a message (bytes live server-side;
@@ -230,6 +248,11 @@ export interface ToolRenderProps {
    *  per-call live state (e.g. the `task` card reading its sub-agent's
    *  current activity from the chat runtime). */
   callId?: string
+  /** The surface's complete renderer map (defaults merged with the host's),
+   *  for composite cards that present ANOTHER tool's output the way that
+   *  tool's own card would — the `recall_result` card re-rendering a
+   *  recalled `run_shell` result as a shell card, say. */
+  renderers?: Record<string, ToolRenderer>
 }
 
 export type ToolRenderer = (props: ToolRenderProps) => ReactNode
@@ -262,6 +285,13 @@ export interface AgentChatProps {
   /** Called when the active session id changes (created or switched). */
   onSessionChange?: (sessionId: string | null) => void
   /**
+   * Called whenever the title shown in the chat header changes (session
+   * loaded, auto-titled by the agent, renamed; `''` for an untitled/new chat).
+   * An outer shell (e.g. `CopilotApp`) mirrors it into `document.title` so
+   * several open tabs can be told apart.
+   */
+  onTitleChange?: (title: string) => void
+  /**
    * When set, the chat header shows a back (`<`) button on its left that calls
    * this. An outer shell (e.g. `CopilotApp`) wires it to open the sessions list.
    */
@@ -283,9 +313,12 @@ export interface AgentChatProps {
 
 /**
  * Imperative handle exposed by [`AgentChat`] (via `ref`) so an outer shell can
- * drive it: start a fresh chat or open a persisted session.
+ * drive it: start a fresh chat, open a persisted session, or re-sync the
+ * sidebar list after another view (the sessions page) mutated sessions.
  */
 export interface AgentChatHandle {
   newChat(): void
   openSession(id: string): void
+  /** Re-fetch the sidebar's session list (archive / delete / pin happened elsewhere). */
+  refreshSessions?(): void
 }

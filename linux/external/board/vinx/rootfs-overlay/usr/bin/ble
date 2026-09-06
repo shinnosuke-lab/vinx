@@ -4,20 +4,19 @@
 # The browser exposes BLE at the GATT level only (no HCI), so this is a
 # command bridge, not an adapter: connect to one device, list its services,
 # read, write, subscribe. The device picker needs a human click -- `connect`
-# parks a request on the footer's ble chip and waits; a device Chrome already
-# remembers reconnects silently. Pairing has no API at all: a protected
-# read/write makes the OS pop its own dialog, and the operation then simply
-# succeeds -- unpairing lives in the system's Bluetooth settings.
+# parks a request on the footer's ble chip and blocks until the click picks
+# a device (or the picker is dismissed); a device Chrome already remembers
+# reconnects silently. Pairing has no API at all: a protected read/write
+# makes the OS pop its own dialog, and the operation then simply succeeds --
+# unpairing lives in the system's Bluetooth settings.
 #
-# Requests ride the private OSC; answers come back through /data files this
-# script polls (.ble-status for the connection, .ble-reply per command,
-# .ble-notify as a rolling feed). Console-only, like bridge(1): run_shell
-# output is not OSC-parsed.
-. /usr/lib/vinx.sh
+# Commands are ble.* control-plane calls (rpc(1) on ttyS3), answered as
+# results and honest errors -- they work from the console and from run_shell
+# alike. The one file left is the notification/scan feed: genuinely a
+# stream, kept as an explicit ring the methods name in their results
+# (system-v2 §6.8), which `ble watch` tails.
 
-STATUS=/data/.ble-status
-REPLY=/data/.ble-reply
-FEED=/data/.ble-notify
+FEED=/data/.vinx/tmp/ble-feed
 
 usage() {
 	cat >&2 <<'EOF'
@@ -36,15 +35,8 @@ EOF
 	exit 2
 }
 
-req() { printf '\033]7770;ble;%s\a\n' "$(vm_b64s "$1")"; }
-field() { sed -n "s/^$1=//p" "$2" 2>/dev/null; }
-
-# One id per invocation: the reply file is shared, and a stale answer must
-# not be mistaken for ours.
-SEQ="$$-$(date +%s)"
-
-# UUIDs, GATT names and 16-bit shorts share one safe charset; anything else
-# would also need escaping into the hand-built JSON below, so refuse it.
+# UUIDs, GATT names and 16-bit shorts share one safe charset; refusing the
+# rest keeps the errors early and readable.
 check_word() {
 	case "$1" in
 	'' | *[!a-zA-Z0-9._-]*)
@@ -54,30 +46,9 @@ check_word() {
 	esac
 }
 
-# Send a request and print the reply body. The page answers fast -- connect,
-# the long one, goes through the status file instead.
-ask() {
-	rm -f "$REPLY"
-	req "$1"
-	i=0
-	while [ "$i" -lt 15 ]; do
-		if [ "$(field seq "$REPLY")" = "$SEQ" ]; then
-			if [ "$(field ok "$REPLY")" = 1 ]; then
-				grep -v -e '^seq=' -e '^ok=' "$REPLY"
-				return 0
-			fi
-			echo "ble: $(field err "$REPLY")" >&2
-			return 1
-		fi
-		sleep 1
-		i=$((i + 1))
-	done
-	echo 'ble: no reply from the page (is this the console?)' >&2
-	return 1
-}
-
-# Print feed lines as they appear: each is "N text", N ever-increasing.
-# $1 caps the run in seconds; empty runs until ctrl-c.
+# Print feed lines as they appear: each is "N text", N ever-increasing, so
+# the ring can be tailed across rewrites. $1 caps the run in seconds; empty
+# runs until ctrl-c.
 watch_feed() {
 	deadline=$1
 	last=$(tail -n 1 "$FEED" 2>/dev/null | cut -d' ' -f1)
@@ -97,7 +68,7 @@ watch_feed() {
 	done
 }
 
-stop_scan() { req '{"op":"scan","on":false}'; }
+stop_scan() { rpc call ble.scan '{"on":false}' >/dev/null 2>&1; }
 
 cmd=$1
 [ $# -ge 1 ] && shift
@@ -107,13 +78,15 @@ scan)
 	secs=${1:-15}
 	[ $# -le 1 ] || usage
 	case "$secs" in '' | *[!0-9]*) usage ;; esac
-	# The feed file stays: the page rewrites its whole ring on every push, so
+	# The feed ring stays: the page rewrites it whole on every push, so
 	# deleting it here would only reset watch_feed's baseline and replay old
 	# notification lines as "scan results". The trap is set before anything
 	# is asked, or a ctrl-c during the wait would leave the scan request
 	# parked on the chip forever.
 	trap 'stop_scan; exit 0' INT
-	ask "{\"op\":\"scan\",\"on\":true,\"seq\":\"$SEQ\"}" || exit 1
+	res=$(rpc call ble.scan '{"on":true}') || exit 1
+	note=$(printf '%s' "$res" | jq -r '.note // empty')
+	[ -n "$note" ] && echo "ble: $note"
 	echo "ble: scanning for ${secs}s -- ctrl-c stops early"
 	watch_feed "$secs"
 	stop_scan
@@ -122,48 +95,22 @@ connect)
 	[ $# -le 1 ] || usage
 	svc=${1:-}
 	[ -n "$svc" ] && check_word "$svc" SERVICE
-	rm -f "$STATUS"
+	# The call blocks until a device is adopted: silently for one Chrome
+	# remembers, otherwise until the person clicks the pulsing ble chip
+	# (the page toasts that hint the moment the picker parks).
+	echo 'ble: asking the page for a device (a parked picker pulses the ble chip)...'
 	if [ -n "$svc" ]; then
-		req "{\"op\":\"connect\",\"service\":\"$svc\"}"
+		res=$(jq -cn --arg service "$svc" '{service: $service}' | rpc call ble.connect - -t 120) || exit 1
 	else
-		req '{"op":"connect"}'
+		res=$(rpc call ble.connect '{}' -t 120) || exit 1
 	fi
-	echo 'ble: asking the page for a device...'
-	i=0
-	hinted=0
-	while [ "$i" -lt 90 ]; do
-		case "$(field state "$STATUS")" in
-		connected)
-			echo "ble: connected to $(field device "$STATUS")"
-			exit 0
-			;;
-		failed)
-			echo "ble: $(field error "$STATUS")" >&2
-			exit 1
-			;;
-		picking)
-			# One hint, the first time the request is seen parked (silent
-			# reconnect attempts can delay that well past any fixed tick).
-			if [ "$hinted" -eq 0 ]; then
-				hinted=1
-				echo 'ble: click the ble chip in the footer to pick the device'
-			fi
-			;;
-		esac
-		sleep 1
-		i=$((i + 1))
-	done
-	echo 'ble: nothing arrived -- is this the console? was the picker dismissed?' >&2
-	exit 1
+	echo "ble: connected to $(printf '%s' "$res" | jq -r '.device')"
 	;;
 show)
-	case "$(field state "$STATUS")" in
-	connected) echo "ble: connected -- $(field device "$STATUS")" ;;
-	picking) echo 'ble: waiting for the footer chip click' ;;
-	failed)
-		echo "ble: failed -- $(field error "$STATUS")" >&2
-		exit 1
-		;;
+	res=$(rpc call ble.status '{}') || exit 1
+	case "$(printf '%s' "$res" | jq -r '.state')" in
+	connected) echo "ble: connected -- $(printf '%s' "$res" | jq -r '.device')" ;;
+	pending) echo 'ble: waiting for the footer chip click' ;;
 	*)
 		echo 'ble: no device (ble connect)'
 		exit 1
@@ -172,13 +119,22 @@ show)
 	;;
 services)
 	[ $# -eq 0 ] || usage
-	ask "{\"op\":\"services\",\"seq\":\"$SEQ\"}"
+	res=$(rpc call ble.services '{}' -t 20) || exit 1
+	ref=$(printf '%s' "$res" | jq -r '.servicesRef.path // empty')
+	if [ -n "$ref" ]; then
+		cat "$ref"
+		rm -f "$ref"
+	else
+		printf '%s' "$res" | jq -rj '.services // empty'
+		echo
+	fi
 	;;
 read)
 	[ $# -eq 2 ] || usage
 	check_word "$1" SVC
 	check_word "$2" CHR
-	ask "{\"op\":\"read\",\"svc\":\"$1\",\"chr\":\"$2\",\"seq\":\"$SEQ\"}"
+	res=$(jq -cn --arg svc "$1" --arg chr "$2" '{svc: $svc, chr: $chr}' | rpc call ble.read - -t 20) || exit 1
+	printf '%s\n' "$(printf '%s' "$res" | jq -r '.value')"
 	;;
 write)
 	[ $# -eq 3 ] || usage
@@ -191,7 +147,8 @@ write)
 		echo "ble: HEX is longer than 512 bytes (GATT's per-write cap)" >&2
 		exit 2
 	fi
-	ask "{\"op\":\"write\",\"svc\":\"$1\",\"chr\":\"$2\",\"hex\":\"$hex\",\"seq\":\"$SEQ\"}" &&
+	jq -cn --arg svc "$1" --arg chr "$2" --arg hex "$hex" '{svc: $svc, chr: $chr, hex: $hex}' |
+		rpc call ble.write - -t 20 >/dev/null &&
 		echo 'ble: written'
 	;;
 notify)
@@ -199,11 +156,14 @@ notify)
 	check_word "$1" SVC
 	check_word "$2" CHR
 	if [ "${3:-}" = off ]; then
-		ask "{\"op\":\"notify\",\"svc\":\"$1\",\"chr\":\"$2\",\"off\":true,\"seq\":\"$SEQ\"}" &&
+		jq -cn --arg svc "$1" --arg chr "$2" '{svc: $svc, chr: $chr, off: true}' |
+			rpc call ble.notify - -t 20 >/dev/null &&
 			echo 'ble: unsubscribed'
 	else
-		ask "{\"op\":\"notify\",\"svc\":\"$1\",\"chr\":\"$2\",\"seq\":\"$SEQ\"}" &&
-			echo 'ble: subscribed -- ble watch shows the values'
+		res=$(jq -cn --arg svc "$1" --arg chr "$2" '{svc: $svc, chr: $chr}' | rpc call ble.notify - -t 20) || exit 1
+		note=$(printf '%s' "$res" | jq -r '.note // empty')
+		[ -n "$note" ] && echo "ble: $note"
+		echo 'ble: subscribed -- ble watch shows the values'
 	fi
 	;;
 watch)
@@ -214,7 +174,7 @@ watch)
 	;;
 disconnect)
 	[ $# -eq 0 ] || usage
-	ask "{\"op\":\"disconnect\",\"seq\":\"$SEQ\"}" && echo 'ble: disconnected'
+	rpc call ble.disconnect '{}' >/dev/null && echo 'ble: disconnected'
 	;;
 *)
 	usage

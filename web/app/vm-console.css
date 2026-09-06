@@ -1,0 +1,191 @@
+/*
+ * The machine console (vm-console.tsx) on the chat page.
+ *
+ * The console is a DesktopWindow floating in a full-viewport, click-through
+ * host layer: drag, resize, maximize and the opacity droplet are the shared
+ * window chrome's. It is a terminal, and reads like the /terminal page
+ * (same Tokyo Night values, spelled out because this page never loads
+ * terminal.css). The inline NetworkControl and the panels it opens render
+ * inside this subtree, so the dark `--np-*` palette is scoped here rather
+ * than flipped at :root — the page around the console stays whatever theme
+ * it was.
+ */
+
+.vmc-host {
+	position: fixed;
+	inset: 0;
+	z-index: 2147483000;
+	/* The layer never eats the chat page's clicks; the window inside does. */
+	pointer-events: none;
+	color: #c0caf5;
+	font: 12px/1.5 Monaco, 'SF Mono', Menlo, 'JetBrains Mono', 'Cascadia Code', monospace;
+
+	/* net-panel.css's dark set, scoped: the chip in the title bar and the
+	 * network panel it opens live inside a dark console whatever the page
+	 * theme is. Values mirror its `:has(.acc-root.dark)` block. */
+	--np-panel: hsl(25 12% 13%);
+	--np-fg: hsl(36 30% 96%);
+	--np-muted: hsl(30 10% 62%);
+	--np-border: hsl(26 14% 20%);
+	--np-input-bg: hsl(24 12% 9%);
+	--np-primary: hsl(30 75% 46%);
+	--np-primary-hover: hsl(33 80% 56%);
+	--np-primary-fg: hsl(0 0% 100%);
+	--np-primary-wash: hsl(30 75% 46% / 0.1);
+	--np-hover-wash: hsl(36 30% 96% / 0.06);
+	--np-backdrop: hsl(0 0% 0% / 0.5);
+	--np-shadow: 0 16px 48px hsl(0 0% 0% / 0.5);
+}
+
+/* The console's own layer inside the host: fills it (the DesktopWindow
+ * positions against this box — a styleless div would measure zero and read
+ * as "hidden" to everyone, tests included), stays click-through like the
+ * host, and hides as one piece. */
+.vmc-console {
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+}
+
+.vmc-host .vga-window {
+	pointer-events: auto;
+	box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+
+/* Hidden, not unmounted: the xterm keeps hearing ttyS0 (see vm-console.tsx). */
+.vmc-hidden {
+	display: none;
+}
+
+/* The machine's state, one dot: grey off, amber booting, green ready, red
+ * failed — the terminal page's status colors. */
+.vmc-dot {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: #565f89;
+}
+.vmc-dot[data-state='booting'] {
+	background: #e0af68;
+}
+.vmc-dot[data-state='ready'] {
+	background: #9ece6a;
+}
+.vmc-dot[data-state='failed'] {
+	background: #f7768e;
+}
+
+/* The identity verdict, worn where it matters: this console's machine
+ * persists nothing when another tab holds the name. */
+.vmc-ephemeral {
+	flex: none;
+	padding: 1px 6px;
+	border: 1px solid #e0af68;
+	border-radius: 999px;
+	color: #e0af68;
+	font-size: 9.5px;
+	cursor: help;
+}
+
+/* The inline NetworkControl's chip: its shape lives in terminal.css's footer
+ * rule on the terminal page; this page gives it a title-bar shape instead. */
+.vmc-host .np-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 2px 6px;
+	border: 0;
+	border-radius: 4px;
+	background: transparent;
+	color: var(--np-primary);
+	font: 10.5px/1 inherit;
+	font-family: inherit;
+	cursor: pointer;
+	white-space: nowrap;
+}
+
+.vmc-host .np-chip:hover {
+	background: var(--np-hover-wash);
+}
+
+.vmc-body {
+	position: relative; /* the VgaWindow positions against this box */
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	/* The console's ground: the same Tokyo Night every console wears (the
+	 * window chrome itself is transparent — tenants paint their colour). */
+	background: #1a1b26;
+}
+
+.vmc-term {
+	flex: 1;
+	min-height: 0;
+	overflow: hidden;
+}
+
+.vmc-term .xterm,
+.vmc-term .terminal {
+	height: 100%;
+}
+
+/* Breathing room goes on the terminal element itself, not the host: the fit
+ * addon subtracts the terminal's own padding when sizing rows and columns,
+ * but knows nothing about its parent's. */
+.vmc-term .xterm {
+	padding: 10px 4px 10px 12px;
+}
+
+/* A popup-blocked open(1) parks here (terminal.css's .open-chip, moved
+ * above the machine capsule): the click it invites is the user gesture the
+ * blocker wants. Interactive despite the click-through host layer. */
+.vmc-open-chip {
+	position: fixed;
+	right: 16px;
+	bottom: 64px;
+	z-index: 2147483000;
+	pointer-events: auto;
+	background: rgba(31, 35, 53, 0.95);
+	border: 1px solid #835221;
+	color: var(--accent, #cd751d);
+	font-size: 11px;
+	padding: 6px 10px;
+	border-radius: 6px;
+	max-width: 40%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	cursor: pointer;
+}
+.vmc-open-chip:hover {
+	background: #24283b;
+	color: #c0caf5;
+}
+
+/* The macOS floating-scrollbar trick, same as terminal.css. */
+.vmc-term .xterm-viewport {
+	scrollbar-width: thin;
+	scrollbar-color: #2f354d transparent;
+}
+
+.vmc-term .xterm-viewport::-webkit-scrollbar {
+	width: 8px;
+}
+
+.vmc-term .xterm-viewport::-webkit-scrollbar-track {
+	background: transparent;
+}
+
+.vmc-term .xterm-viewport::-webkit-scrollbar-thumb {
+	background: #2f354d;
+	border: 2px solid transparent;
+	border-radius: 6px;
+	background-clip: padding-box;
+}
+
+.vmc-term .xterm-viewport::-webkit-scrollbar-thumb:hover {
+	background: #414868;
+	background-clip: padding-box;
+}

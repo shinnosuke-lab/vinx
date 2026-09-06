@@ -84,7 +84,22 @@ fn event_payload(event: &AgentEvent) -> Option<(&'static str, serde_json::Value)
             ("done", serde_json::json!({ "elapsed_ms": elapsed_ms }))
         }
         AgentEvent::Error(e) => ("error", serde_json::json!({ "message": e })),
-        AgentEvent::StatusUpdate(s) => ("status", serde_json::json!({ "text": s })),
+        AgentEvent::Usage { model, usage } => (
+            "usage",
+            serde_json::json!({
+                "model": model,
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": usage.cached_tokens,
+                "cache_write_tokens": usage.cache_write_tokens,
+            }),
+        ),
+        // `pending: true` = work in flight; the next `status` frame resolves
+        // it, and clients replace the row instead of stacking a second one.
+        AgentEvent::StatusUpdate { text, pending } => (
+            "status",
+            serde_json::json!({ "text": text, "pending": pending }),
+        ),
         AgentEvent::ModeSwitch(m) => ("mode", serde_json::json!({ "mode": m })),
         AgentEvent::ProfileSwitch(p) => ("profile", serde_json::json!({ "profile": p })),
         AgentEvent::RenderBarChart {
@@ -127,16 +142,29 @@ fn event_payload(event: &AgentEvent) -> Option<(&'static str, serde_json::Value)
         // Sub-agent envelope: the inner event's frame name + payload become
         // data fields, so one stable outer name (`subagent`) covers every
         // inner kind and old clients can ignore the whole family.
-        AgentEvent::Subagent { task_id, event } => {
+        // `session_id` names the child's transcript session so clients can
+        // deep-link to the live sub-session view; `label` names the task
+        // itself, so even a viewer that never saw the parent tool_start (a
+        // re-attach after a trimmed replay) can title the progress row.
+        AgentEvent::Subagent {
+            task_id,
+            session_id,
+            label,
+            event,
+        } => {
             let (inner_name, inner_data) = event_payload(event)?;
             (
                 "subagent",
-                serde_json::json!({ "task_id": task_id, "event": inner_name, "data": inner_data }),
+                serde_json::json!({
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "label": label,
+                    "event": inner_name,
+                    "data": inner_data,
+                }),
             )
         }
-        AgentEvent::UserInjected { text } => {
-            ("user_injected", serde_json::json!({ "text": text }))
-        }
+        AgentEvent::UserInjected { text } => ("user_injected", serde_json::json!({ "text": text })),
         // Internal / not forwarded. `SteerRequeued` instructs the driver to
         // re-queue the text; what clients see is the `queue` frame that
         // follows, so the queue stays the single client-visible mechanism.

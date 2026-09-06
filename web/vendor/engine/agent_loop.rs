@@ -17,9 +17,11 @@ use tokio::sync::mpsc;
 
 use crate::client::LlmClient;
 use crate::context::{
-    build_request_view, compact_context, compaction_threshold, compress_tool_result,
-    context_chars, latest_task_state, pruning_threshold, recall_tool_result, should_compact,
-    task_state_block, RecallOutcome, TASK_STATE_MAX_CHARS,
+    compact_context, compaction_tail_budget, compaction_tail_start, compaction_threshold,
+    compress_tool_result, context_chars, fresh_context_state, latest_task_state, prune_target,
+    pruning_threshold, recall_index, recall_tool_result, should_compact, task_state_block,
+    task_state_verdict, RecallOutcome, SharedContextState, SummaryScope, TaskStateVerdict,
+    SUMMARY_MARKER, TASK_STATE_AIM_CHARS, TASK_STATE_MAX_CHARS, TASK_STATE_TARGET_CHARS,
 };
 use crate::event::{
     build_ask_user_payload, AgentEvent, AskAnswer, AskQuestion, AskUserResponse, ConfirmResponse,
@@ -94,6 +96,11 @@ pub struct AgentLoop {
     /// compaction rewrites it (the summary replaces the live history; the
     /// archive keeps the original reachable). `None` = no archiving.
     store: Option<Arc<crate::web::store::SqliteStore>>,
+    /// Level-1 cut point + the provider's last prompt-token count, shared
+    /// with the session so they survive turn boundaries (see
+    /// [`SessionContextState`](crate::context::SessionContextState)). A
+    /// fresh, unshared one when no session provided its own.
+    context_state: SharedContextState,
 }
 
 impl AgentLoop {
@@ -116,7 +123,15 @@ impl AgentLoop {
             task_runner: None,
             steer_rx: None,
             store: None,
+            context_state: fresh_context_state(),
         }
+    }
+
+    /// Share the session's context memory (Level-1 cut point, last measured
+    /// prompt size) with this turn's loop.
+    pub fn with_context_state(mut self, state: SharedContextState) -> Self {
+        self.context_state = state;
+        self
     }
 
     pub fn with_context_tokens(mut self, tokens: usize) -> Self {
@@ -177,10 +192,7 @@ impl AgentLoop {
     }
 
     /// Enable the `task` sub-agent tool, executing calls through `runner`.
-    pub fn with_task_runner(
-        mut self,
-        runner: Option<Arc<crate::agent_task::TaskRunner>>,
-    ) -> Self {
+    pub fn with_task_runner(mut self, runner: Option<Arc<crate::agent_task::TaskRunner>>) -> Self {
         self.task_runner = runner;
         self
     }
@@ -383,7 +395,7 @@ impl AgentLoop {
             // `Some` = pruned request view (old tool results replaced by
             // placeholders on the wire only); the canonical `messages` keep
             // full content for persistence, display, and archiving.
-            let request_view = self.maybe_compact_context(messages, event_tx).await;
+            let mut request_view = self.maybe_compact_context(messages, event_tx).await;
 
             let active = self.active_tools();
             let tool_defs = if active.is_empty() {
@@ -399,6 +411,13 @@ impl AgentLoop {
                 pending_inline_seeds.clear();
                 Some(joined)
             };
+
+            // What this request weighs on the estimator's scale; paired with
+            // the provider's `prompt_tokens` below to calibrate the estimator.
+            let mut sent_chars = crate::context::request_chars(
+                request_view.as_deref().unwrap_or(messages),
+                tool_defs,
+            );
 
             let mut assistant_result = self
                 .llm
@@ -453,6 +472,60 @@ impl AgentLoop {
                 }
             }
 
+            // The provider said the prompt does not fit its context window.
+            // Its tokenizer is the ground truth, whatever the estimate said:
+            // compact the history (forced) and replay once. The history is
+            // unchanged by the failed round and nothing reached the UI, so
+            // the replay is invisible except for the "Compacting…" status.
+            if let Err(error) = &assistant_result {
+                let overflow = !cancel_flag.load(Ordering::Relaxed)
+                    && crate::client::error_is_context_overflow(&error.to_string());
+                if overflow {
+                    log::warn!(
+                        "agent loop #{}: provider reports context overflow; compacting and \
+                         replaying once: {}",
+                        loop_idx,
+                        error
+                    );
+                    // Replay only over a request that differs from the one
+                    // refused: a rewritten history always does; a view only
+                    // when it elides something (a forced cut over a history
+                    // with nothing to elide is the same bytes again — sending
+                    // them would just buy a second 400).
+                    let replay = match self
+                        .maybe_compact_context_inner(messages, event_tx, true)
+                        .await
+                    {
+                        ContextPrep::Compacted => Some(None),
+                        ContextPrep::View(view) => {
+                            (crate::context::request_chars(&view, tool_defs) < sent_chars)
+                                .then_some(Some(view))
+                        }
+                        ContextPrep::Canonical => None,
+                    };
+                    if let Some(forced_view) = replay {
+                        // vinx: the replay IS this round's request now — the
+                        // recall lookup and the estimator calibration below
+                        // must see what actually went out, not the first try.
+                        request_view = forced_view;
+                        sent_chars = crate::context::request_chars(
+                            request_view.as_deref().unwrap_or(messages),
+                            tool_defs,
+                        );
+                        assistant_result = self
+                            .llm
+                            .chat_stream_outcome(
+                                request_view.as_deref().unwrap_or(messages),
+                                tool_defs,
+                                event_tx,
+                                Some(cancel_flag.clone()),
+                                content_seed.clone(),
+                            )
+                            .await;
+                    }
+                }
+            }
+
             let outcome = match assistant_result {
                 Ok(outcome) => outcome,
                 Err(_) if cancel_flag.load(Ordering::Relaxed) => {
@@ -473,6 +546,20 @@ impl AgentLoop {
             // branch below).
             let turn_finish_reason = outcome.finish_reason;
             let assistant_msg = outcome.message;
+            if let Some(usage) = outcome.usage {
+                // The provider's own count of this request's prompt: the
+                // authoritative context size for the next round's pruning /
+                // compaction decision (see `maybe_compact_context`).
+                self.context_state
+                    .lock()
+                    .unwrap()
+                    .observe(sent_chars, usage.prompt_tokens);
+                // One record per LLM round; sinks aggregate per turn/session.
+                let _ = event_tx.send(AgentEvent::Usage {
+                    model: self.llm.model().to_string(),
+                    usage,
+                });
+            }
 
             if cancel_flag.load(Ordering::Relaxed) {
                 log::info!("agent loop #{}: cancelled after LLM stream", loop_idx);
@@ -594,15 +681,16 @@ impl AgentLoop {
                             .run_batch(task_calls, event_tx, cancel_flag.clone())
                             .await;
                         let mut answered = std::collections::HashSet::new();
-                        for (call_id, result_json, success) in results {
+                        for (call_id, result_json, _success) in results {
+                            // The `ToolCallResult` event already went out from
+                            // `run_batch` the moment each child ended; here the
+                            // paired tool message enters history, in call order.
+                            // vinx: `tool_result` — no `is_error` status on the
+                            // wire here (upstream's `tool_result_with_status`
+                            // feeds its Sand sink).
                             let tool_msg = ChatMessage::tool_result(&call_id, &result_json);
                             messages.push(tool_msg.clone());
                             new_messages.push(tool_msg);
-                            let _ = event_tx.send(AgentEvent::ToolCallResult {
-                                id: call_id.clone(),
-                                result: result_json,
-                                success,
-                            });
                             answered.insert(call_id);
                         }
                         answered
@@ -719,8 +807,7 @@ impl AgentLoop {
                             // `finish_reason=length` upgrades the guess to a
                             // certainty: the stream was cut by the output
                             // token cap mid-arguments.
-                            let cap_truncated =
-                                turn_finish_reason.as_deref() == Some("length");
+                            let cap_truncated = turn_finish_reason.as_deref() == Some("length");
                             let split_hint = if tc.function.name == "write_file" {
                                 "write the file in parts instead: one write_file call with \
                                  mode='overwrite' for the first chunk, then mode='append' \
@@ -812,31 +899,46 @@ impl AgentLoop {
                         .and_then(|v| v.as_str())
                         .map(str::trim)
                         .unwrap_or("");
-                    let (result, success) = if state.is_empty() {
-                        (
+                    // One verdict, shared with the replay and the view stub —
+                    // whatever is accepted here is exactly what
+                    // `latest_task_state` will return.
+                    let (result, success) = match task_state_verdict(state) {
+                        TaskStateVerdict::Empty => (
                             "[NO_RETRY] update_task_state requires a non-empty `state` \
-                             string."
+                             string. Nothing was recorded; the register is unchanged."
                                 .to_string(),
                             false,
-                        )
-                    } else if state.chars().count() > TASK_STATE_MAX_CHARS {
-                        (
+                        ),
+                        TaskStateVerdict::OverCap(n) => (
                             format!(
-                                "[NO_RETRY] Task state is {} chars — the cap is {}. \
-                                 Registers are small by design: keep the goal, current \
-                                 deltas and key call_ids, drop the narration.",
-                                state.chars().count(),
-                                TASK_STATE_MAX_CHARS
+                                "[NO_RETRY] Task state is {n} chars — the hard cap is {}. \
+                                 Nothing was recorded; the register is unchanged. Re-send a \
+                                 trimmed state (about {} chars: goal, current deltas, key \
+                                 call_ids — no narration).",
+                                TASK_STATE_MAX_CHARS, TASK_STATE_AIM_CHARS
                             ),
                             false,
-                        )
-                    } else {
-                        (
+                        ),
+                        // Recorded — refusing would drop the freshest state at
+                        // the moment the model is busiest and compaction
+                        // nearest. The nudge is for NEXT time: saying so
+                        // explicitly is what saves the round trip a model
+                        // would otherwise spend re-sending a trimmed copy.
+                        TaskStateVerdict::OverTarget(n) => (
+                            format!(
+                                "Task state recorded ({n} chars) — over the {}-char target. \
+                                 No action needed now; trim it on your next update (drop \
+                                 narration, keep goal / current deltas / key call_ids).",
+                                TASK_STATE_TARGET_CHARS
+                            ),
+                            true,
+                        ),
+                        TaskStateVerdict::Ok(_) => (
                             "Task state recorded. It survives context compaction \
                              verbatim; update it as the task moves."
                                 .to_string(),
                             true,
-                        )
+                        ),
                     };
                     if success {
                         tool_fail_count.remove(&fail_key);
@@ -1236,13 +1338,15 @@ impl AgentLoop {
     /// what goes on the wire, while the canonical `messages` keep every tool
     /// result's full content — in memory and in the session DB — so the user's
     /// transcript is never silently degraded. `None` means the canonical
-    /// history is under the pruning threshold and is sent as-is.
+    /// history goes out as it stands: either it is under the pruning
+    /// threshold, or Level 2 just rewrote it (summary + verbatim tail) and
+    /// the rewritten history IS the request.
     ///
-    /// Level 2 is the only destructive step, and it only runs after the FULL
-    /// canonical history has been archived successfully. An archive failure
-    /// (full disk, DB error) skips compaction for this round — better an
-    /// oversized context than destroying data with no backup — and the pruned
-    /// view keeps the request itself within budget until the next attempt.
+    /// Level 2 is the only destructive step, and it only runs after the span
+    /// it replaces has been archived successfully. An archive failure (full
+    /// disk, DB error) skips compaction for this round — better an oversized
+    /// context than destroying data with no backup — and the pruned view
+    /// keeps the request itself within budget until the next attempt.
     ///
     /// The canonical history is additionally hard-capped at
     /// `CANONICAL_CAP_FACTOR`× the compaction threshold: the pruned view can
@@ -1250,84 +1354,197 @@ impl AgentLoop {
     /// without the cap the canonical context — rewritten wholesale to SQLite
     /// on every sync — would grow unboundedly.
     async fn maybe_compact_context(
-        &self,
+        &mut self,
         messages: &mut Vec<ChatMessage>,
         event_tx: &mpsc::UnboundedSender<AgentEvent>,
     ) -> Option<Vec<ChatMessage>> {
-        let model = self.llm.model();
+        match self
+            .maybe_compact_context_inner(messages, event_tx, false)
+            .await
+        {
+            ContextPrep::View(view) => Some(view),
+            ContextPrep::Canonical | ContextPrep::Compacted => None,
+        }
+    }
+
+    /// [`Self::maybe_compact_context`] with `force`: compact even when the
+    /// estimate says the context fits. Used when the PROVIDER said it did not
+    /// (a context-overflow verdict) — its tokenizer, not the estimate, is the
+    /// ground truth.
+    async fn maybe_compact_context_inner(
+        &mut self,
+        messages: &mut Vec<ChatMessage>,
+        event_tx: &mpsc::UnboundedSender<AgentEvent>,
+        force: bool,
+    ) -> ContextPrep {
+        let model = self.llm.model().to_string();
         let configured = self.configured_context_tokens;
-        let prune_thresh = pruning_threshold(model, configured);
-        let compact_thresh = compaction_threshold(model, configured);
+        // Snapshot the shared state for this decision; the cut is written
+        // back below (the calibration is only written by `observe`).
+        let mut ctx = *self.context_state.lock().unwrap();
+        // The thresholds are defined on the default character scale; bring
+        // them onto THIS session's scale once, then compare raw sizes. A
+        // session whose content tokenizes denser than the default gets
+        // proportionally lower thresholds (see `SessionContextState`).
+        let prune_thresh = ctx.threshold_for(pruning_threshold(&model, configured));
+        let compact_thresh = ctx.threshold_for(compaction_threshold(&model, configured));
+        let target = ctx.threshold_for(prune_target(&model, configured));
 
         let canonical_size = context_chars(messages);
-        let view = build_request_view(messages, prune_thresh)?;
-        let view_size = context_chars(&view);
+
+        // Level 1: the stepped prune (the cut is an absolute position and
+        // only moves forward, so the request prefix is byte-identical between
+        // re-plans). A forced round cuts even when the estimate says it fits —
+        // the provider has just said otherwise.
+        let mut view = ctx.prune.view(messages, prune_thresh, target, compact_thresh);
+        if view.is_none() && force {
+            view = Some(ctx.prune.force_cut(messages, target));
+        }
+        let view_size = view.as_deref().map(context_chars).unwrap_or(canonical_size);
         log::info!(
-            "Level 1 view pruning: canonical={} view={} prune_thresh={}",
+            "Level 1 view pruning: canonical={} view={} elided={:?} planned={} chars_per_token={:?} \
+             prune_thresh={} target={} compact_thresh={}",
             canonical_size,
             view_size,
-            prune_thresh
+            ctx.prune.elided,
+            ctx.prune.planned_size,
+            ctx.chars_per_token.map(|r| (r * 100.0).round() / 100.0),
+            prune_thresh,
+            target,
+            compact_thresh
         );
+        // The cut (possibly re-planned) is the session's now.
+        self.context_state.lock().unwrap().prune = ctx.prune;
 
-        if !should_compact(canonical_size, view_size, compact_thresh) {
-            return Some(view);
+        // Level 2 decision.
+        let fallback = match view {
+            Some(view) => ContextPrep::View(view),
+            None => ContextPrep::Canonical,
+        };
+        if !force && !should_compact(canonical_size, view_size, compact_thresh) {
+            return fallback;
         }
+        // From here on a compaction is attempted; `fallback` is what goes out
+        // if it fails.
 
-        let _ = event_tx.send(AgentEvent::StatusUpdate(
-            "Compacting context...".to_string(),
-        ));
+        // A pending note: whatever comes out of the attempt below — the
+        // compaction figures or a skip notice — resolves it. Every exit
+        // path from here MUST send one, or the wait stays on screen.
+        let _ = event_tx.send(AgentEvent::StatusUpdate {
+            text: "Compacting context...".to_string(),
+            pending: true,
+        });
+        let skipped = |reason: String| AgentEvent::StatusUpdate {
+            text: format!("Context compaction skipped ({reason}); continuing without it"),
+            pending: false,
+        };
+        // The most recent exchanges stay behind the summary VERBATIM — the
+        // user's live request, the tool results the model was acting on — so
+        // the turn resumes exactly where it stopped. Only the span before them
+        // is summarized, archived and destroyed.
+        let mut tail_start = compaction_tail_start(messages, compaction_tail_budget(compact_thresh));
+        // vinx: a forced round answers the provider's verdict on the request
+        // just made. When that request IS the user's fresh message, the fix is
+        // to shed what is older — never the message itself: the budgeted tail
+        // drops it whenever it is larger than the budget (a pasted document),
+        // and summarizing it to a 500-char head would have the model answer a
+        // question it never saw. So the tail starts at that message at the
+        // latest, and when nothing older is left to shed the verdict stands —
+        // the user sees the provider's error and can shorten the message. An
+        // overflow mid-turn (newest message a tool result) keeps upstream's
+        // behaviour: the span is summarized and the turn goes on from it.
+        if force && messages.last().is_some_and(|m| m.role == Role::User) {
+            let live = messages.len() - 1;
+            tail_start = tail_start.min(live);
+            let first = usize::from(messages.first().is_some_and(|m| m.role == Role::System));
+            if tail_start <= first {
+                log::warn!(
+                    "forced compaction skipped: nothing older than the live request to shed"
+                );
+                let _ = event_tx.send(skipped(
+                    "the message alone exceeds the model's context window".to_string(),
+                ));
+                return fallback;
+            }
+        }
+        let tail_kept = messages.len() - tail_start;
+        // The task-state register is carried across the compaction verbatim —
+        // read it from the canonical history BEFORE that history is destroyed,
+        // and show it to the summarizer so the summary covers what it lacks
+        // instead of repeating it.
+        let task_state = latest_task_state(messages);
         // Summarize the canonical history (full tool results, not the view's
         // placeholders): compact_context caps each entry at 500 chars, so the
         // prompt stays bounded while the summary sees real content.
-        let Ok(summary) = compact_context(&self.llm, messages).await else {
-            return Some(view);
+        let scope = SummaryScope {
+            tail_kept,
+            task_state: task_state.as_deref(),
         };
-        // The summary is about to replace the raw history — snapshot the FULL
-        // canonical history to the archive first, and only destroy what was
-        // durably archived. On failure keep the context intact and retry on a
-        // later round. Archiving runs inline, where upstream hands it to a
-        // blocking thread: a page has one thread and the store is not `Send`,
-        // so there is nowhere to hand it to — it is one whole-table insert,
-        // once per compaction, which is rare and already on the slow path.
+        let started = wasmtimer::std::Instant::now();
+        let summary = match compact_context(&self.llm, &messages[..tail_start], scope).await {
+            Ok(summary) => summary,
+            Err(e) => {
+                log::warn!("compaction summary failed, keeping the context: {e}");
+                let _ = event_tx.send(skipped(format!("summarizer failed: {e}")));
+                return fallback;
+            }
+        };
+        let summarizer_secs = started.elapsed().as_secs_f64();
+        // Written by code, not by the summarizer: the ids of the span's largest
+        // results, so recall_result stays reachable without the LLM reciting
+        // them (≈ 12 output tokens each — the most expensive thing it wrote).
+        let index = recall_index(&messages[..tail_start]);
+        // The summary is about to replace the raw history — snapshot the span
+        // it replaces to the archive first, and only destroy what was durably
+        // archived. Exactly that span, not the tail: the tail stays live, and
+        // archiving what the next compaction archives again would show every
+        // kept message twice in the stitched transcript. On failure keep the
+        // context intact and retry on a later round.
         let mut archived_generation: Option<i64> = None;
         if let (Some(store), Some(sid)) = (&self.store, &self.session_id) {
-            match store.archive_messages(sid, messages) {
+            // Inline, not on a blocking thread: the wasm store lives on this
+            // thread, and an archive runs once per compaction, which is rare
+            // and already on the slow path.
+            match store.archive_messages(sid, &messages[..tail_start]) {
                 Ok(generation) => {
                     log::info!(
-                        "pre-compaction archive: session={} generation={} messages={}",
-                        sid,
+                        "pre-compaction archive: session={} generation={} messages={} \
+                         kept_verbatim={}",
+                        self.session_id.as_deref().unwrap_or(""),
                         generation,
-                        messages.len()
+                        tail_start,
+                        tail_kept
                     );
                     archived_generation = Some(generation);
                 }
                 Err(e) => {
                     log::warn!("pre-compaction archive failed, skipping compaction: {e}");
-                    return Some(view);
+                    let _ = event_tx.send(skipped(format!("archive failed: {e}")));
+                    return fallback;
                 }
             }
         }
-        // The task registers survive the switch VERBATIM — this is the whole
-        // point of update_task_state: the LLM summary is lossy reconstruction,
-        // the state block is not. Read before the history is destroyed.
-        let task_state = latest_task_state(messages);
-        let system = messages.first().cloned();
-        messages.clear();
-        if let Some(sys) = system {
-            messages.push(sys);
-        }
+        // Rebuild: [system] + summary + the verbatim tail.
+        let head_len = usize::from(messages.first().is_some_and(|m| m.role == Role::System));
+        let tail = messages.split_off(tail_start);
+        messages.truncate(head_len);
         // The first line is EXACTLY `[Conversation Summary]` — a frozen token:
         // the chat UI matches it byte-for-byte to collapse the message
-        // (AgentChat.tsx `summaryMarker`), and `latest_task_state` only trusts
-        // task-state blocks under it. Anything else goes on the lines below.
-        let mut body = crate::context::SUMMARY_MARKER.to_string();
+        // (AgentChat.tsx `summaryMarker`), and read_session's transcript
+        // stitching keys on it too. Anything else goes on the lines below.
+        let mut body = SUMMARY_MARKER.to_string();
         // When the raw history was archived, say so IN the summary message:
         // the call_ids the summary preserves stay actionable — recall_result
         // falls through to the archive for anything named here.
         if let Some(generation) = archived_generation {
             body.push_str(&format!(
-                "\nFull history archived (generation {generation}); tool results \
+                "\nEarlier history archived (generation {generation}); tool results \
                  named below remain retrievable via recall_result(call_id=...)."
+            ));
+        }
+        if tail_kept > 0 {
+            body.push_str(&format!(
+                "\nThe {tail_kept} most recent messages follow this summary verbatim."
             ));
         }
         if let Some(state) = task_state {
@@ -1337,11 +1554,57 @@ impl AgentLoop {
             body.push_str(&task_state_block(&state));
         }
         body.push_str("\n\n");
-        body.push_str(&summary);
+        // The narrative is LLM text and may quote a pasted transcript —
+        // neutralize any task-state delimiters in it so the block above stays
+        // the only one latest_task_state can find in this trusted message.
+        body.push_str(&crate::context::neutralize_task_state_markers(&summary));
+        if let Some(index) = index {
+            body.push_str("\n\n");
+            body.push_str(&index);
+        }
         messages.push(ChatMessage::user(&body));
-        log::info!("context compacted: {} chars -> summary", canonical_size);
-        None
+        messages.extend(tail);
+        // The history is new: the old cut point no longer describes it (the
+        // tokenizer calibration does — same content, same language).
+        self.context_state.lock().unwrap().reset_cut();
+        log::info!(
+            "context compacted: {} chars -> {} chars (summary {} chars + {} verbatim messages); \
+             summarizer took {:.1}s",
+            canonical_size,
+            context_chars(messages),
+            body.chars().count(),
+            tail_kept,
+            summarizer_secs
+        );
+        // Tell the user what the wait was — the same figures the log carries,
+        // plus the summarizer model when it is not the turn's own. This is
+        // the outcome that resolves the pending "Compacting context..." note.
+        let summarizer_note = self
+            .llm
+            .compaction_model()
+            .map(|m| format!(" on {m}"))
+            .unwrap_or_default();
+        let _ = event_tx.send(AgentEvent::StatusUpdate {
+            text: format!(
+                "Context compacted in {summarizer_secs:.0}s{summarizer_note}: summary {} chars, \
+                 {tail_kept} recent messages kept verbatim",
+                body.chars().count()
+            ),
+            pending: false,
+        });
+        ContextPrep::Compacted
     }
+}
+
+/// What [`AgentLoop::maybe_compact_context_inner`] decided the round sends.
+enum ContextPrep {
+    /// The canonical history as it stands.
+    Canonical,
+    /// Level 1: a pruned request VIEW; the canonical history is untouched.
+    View(Vec<ChatMessage>),
+    /// Level 2: the canonical history itself was rewritten (summary + verbatim
+    /// tail) and is the request.
+    Compacted,
 }
 
 /// Everything one turn needs, gathered into a struct so the parameter surface
@@ -1374,6 +1637,9 @@ pub struct TurnParams {
     pub steer_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// Session store for pre-compaction archiving; `None` = no archiving.
     pub store: Option<Arc<crate::web::store::SqliteStore>>,
+    /// The session's context memory (Level-1 cut point, last measured prompt
+    /// size), shared across turns; `None` = fresh per turn.
+    pub context_state: Option<SharedContextState>,
 }
 
 impl TurnParams {
@@ -1405,6 +1671,7 @@ impl TurnParams {
             task_runner: None,
             steer_rx: None,
             store: None,
+            context_state: None,
         }
     }
 }
@@ -1432,6 +1699,7 @@ pub async fn run_agent_turn(params: TurnParams) {
         task_runner,
         steer_rx,
         store,
+        context_state,
     } = params;
 
     let mut agent = AgentLoop::new(llm, registry)
@@ -1444,6 +1712,9 @@ pub async fn run_agent_turn(params: TurnParams) {
         .with_task_runner(task_runner)
         .with_steer(steer_rx)
         .with_store(store);
+    if let Some(state) = context_state {
+        agent = agent.with_context_state(state);
+    }
     if let Some(flag) = auto_confirm {
         agent = agent.with_auto_confirm(flag);
     }
@@ -1560,7 +1831,10 @@ pub fn resolve_recall(
                 content.len()
             );
             (
-                format!("[recalled {} result call_id=\"{}\"]\n{}", tool, call_id, content),
+                format!(
+                    "[recalled {} result call_id=\"{}\"]\n{}",
+                    tool, call_id, content
+                ),
                 true,
             )
         }
@@ -1615,21 +1889,24 @@ pub fn resolve_recall(
 /// verbatim, so what the model wrote here survives where the rest of the
 /// history is reduced to a lossy summary.
 pub fn update_task_state_definition() -> ToolDefinition {
-    ToolDefinition::new(
-        "update_task_state",
+    let description = format!(
         "Maintain a compact task-state block during long multi-step tasks: the goal, \
          what is done, what is in progress, key facts (include call_ids of \
-         load-bearing tool results), and next steps. Each call REPLACES the previous \
-         block, so always write the complete state. Keep it under 2000 characters. \
+         load-bearing tool results), and next steps — one terse line each, no \
+         narration. Each call REPLACES the previous block, so always write the \
+         complete state. Aim for about {} characters and stay under {}. \
          When the conversation is later compacted to fit the context window, this \
          block survives verbatim while everything else is summarized — put what you \
          cannot afford to lose here. Update it at natural milestones, not every turn.",
+        TASK_STATE_AIM_CHARS, TASK_STATE_TARGET_CHARS
+    );
+    ToolDefinition::new(
+        "update_task_state",
+        &description,
         ToolParameters::object(
             HashMap::from([(
                 "state".into(),
-                ToolParameter::string(
-                    "the complete task-state block (replaces the previous one)",
-                ),
+                ToolParameter::string("the complete task-state block (replaces the previous one)"),
             )]),
             vec!["state".into()],
         ),
@@ -1685,7 +1962,11 @@ pub fn ask_user_definition() -> ToolDefinition {
             ),
             (
                 "default_id".into(),
-                ToolParameter::string("recommended default option id"),
+                ToolParameter::string(
+                    "recommended default option id — also what is picked for the user \
+                     when they do not answer in time (unattended sessions); without it \
+                     the first option is",
+                ),
             ),
         ]),
         vec!["id".into(), "question".into(), "options".into()],
@@ -1699,6 +1980,11 @@ pub fn ask_user_definition() -> ToolDefinition {
          default_id when possible. The user can ALWAYS type a free-text answer instead \
          of picking an option — any answer may carry `custom_text`; when present, it is \
          the user's actual answer and takes precedence over selected option ids. \
+         If the result has `auto_picked: true`, the user did NOT answer: the session \
+         is unattended and the defaults were filled in after a timeout. Treat them as \
+         your own guess, not their decision — say what you assumed, keep the work that \
+         rests on it small and reversible, and for a question about what they actually \
+         want, prefer to stop and ask in prose over committing to a large piece of work. \
          Do not use for chitchat or to confirm obvious intent.",
         ToolParameters::object(
             HashMap::from([(
@@ -1884,7 +2170,11 @@ fn extract_task_id(output: &str) -> Option<String> {
 /// stable and insensitive to field ordering. Kept as a readable string (not a
 /// hash): the per-turn map is tiny and this stays greppable in logs.
 fn tool_fail_key(name: &str, args: &serde_json::Value) -> String {
-    format!("{}::{}", name, serde_json::to_string(args).unwrap_or_default())
+    format!(
+        "{}::{}",
+        name,
+        serde_json::to_string(args).unwrap_or_default()
+    )
 }
 
 /// Short, human-readable description of a tool call for breaker messages, so

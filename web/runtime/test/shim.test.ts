@@ -180,6 +180,7 @@ function fakeClient() {
 		search: record('search', [{ id: 'a', snippets: [] }]),
 		updateSession: record('updateSession'),
 		deleteSession: record('deleteSession'),
+		queuePromote: record('queuePromote', true),
 	};
 	return client;
 }
@@ -528,10 +529,55 @@ describe('sessions', () => {
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ title: 'renamed', pinned: true }),
 		});
-		expect(client.calls.find(([n]) => n === 'updateSession')?.[1]).toEqual(['abc', 'renamed', true]);
+		expect(client.calls.find(([n]) => n === 'updateSession')?.[1]).toEqual([
+			'abc',
+			{ title: 'renamed', pinned: true, archived: undefined, category: undefined },
+		]);
 
 		await handler(client)('/api/sessions/abc', { method: 'DELETE' });
 		expect(client.calls.find(([n]) => n === 'deleteSession')?.[1]).toEqual(['abc']);
+	});
+
+	it('patches archive and category flags, clearing the category with null', async () => {
+		const client = fakeClient();
+		await handler(client)('/api/sessions/abc', {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ archived: true, category: 'work' }),
+		});
+		expect(client.calls.find(([n]) => n === 'updateSession')?.[1]).toEqual([
+			'abc',
+			{ title: undefined, pinned: undefined, archived: true, category: 'work' },
+		]);
+		client.calls.length = 0;
+		await handler(client)('/api/sessions/abc', {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ category: null }),
+		});
+		expect(client.calls.find(([n]) => n === 'updateSession')?.[1]).toEqual([
+			'abc',
+			{ title: undefined, pinned: undefined, archived: undefined, category: null },
+		]);
+		// Over-long labels are refused up front rather than silently dropped.
+		const res = await handler(client)('/api/sessions/abc', {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ category: 'x'.repeat(65) }),
+		});
+		expect(res.status).toBe(400);
+	});
+
+	it('lists sessions by scope and rejects an unknown one', async () => {
+		const client = fakeClient();
+		await handler(client)('/api/sessions');
+		expect(client.calls.find(([n]) => n === 'sessions')?.[1]).toEqual([undefined]);
+		client.calls.length = 0;
+		await handler(client)('/api/sessions?scope=archived');
+		expect(client.calls.find(([n]) => n === 'sessions')?.[1]).toEqual(['archived']);
+		const bad = await handler(client)('/api/sessions?scope=bogus');
+		expect(bad.status).toBe(400);
+		expect((await bad.json()).error).toBe('invalid_scope');
 	});
 
 	it('404s a session that is gone', async () => {
@@ -594,6 +640,34 @@ describe('control endpoints', () => {
 		);
 		expect(await res.json()).toEqual({ ok: true, enabled: true });
 		expect(client.calls.find(([n]) => n === 'setAuto')?.[1]).toEqual(['s', true]);
+	});
+
+	it('applies the composer full-auto toggle only to a session it creates', async () => {
+		const client = fakeClient();
+		await handler(client)('/api/chat', post({ message: 'hi', session_id: null, full_auto: true }));
+		const auto = client.calls.find(([n]) => n === 'setAuto');
+		expect(auto?.[1][1]).toBe(true);
+		// Same session the turn went to, and before the send.
+		expect(auto?.[1][0]).toBe(client.calls.find(([n]) => n === 'send')?.[1][0]);
+		expect(client.calls.findIndex(([n]) => n === 'setAuto')).toBeLessThan(
+			client.calls.findIndex(([n]) => n === 'send'),
+		);
+		client.calls.length = 0;
+		await handler(client)('/api/chat', post({ message: 'hi', session_id: 'old', full_auto: true }));
+		expect(client.calls.find(([n]) => n === 'setAuto')).toBeUndefined();
+	});
+
+	it('promotes a queued message and 404s one that is no longer parked', async () => {
+		const client = fakeClient();
+		const res = await handler(client)(
+			'/api/chat/queue/promote',
+			post({ session_id: 's', id: 7 }),
+		);
+		expect(await res.json()).toEqual({ ok: true });
+		expect(client.calls.find(([n]) => n === 'queuePromote')?.[1]).toEqual(['s', 7]);
+		client.queuePromote = () => Promise.resolve(false);
+		const gone = await handler(client)('/api/chat/queue/promote', post({ session_id: 's', id: 8 }));
+		expect(gone.status).toBe(404);
 	});
 
 	it('sends a cancelled ask_user as no answers', async () => {
@@ -1086,6 +1160,20 @@ describe('the model picker', () => {
 		expect('model' in meta, 'an empty string would draw an empty chip').toBe(false);
 	});
 
+	it('tells the UI whether new chats start in full-auto, and follows the settings panel', async () => {
+		const config = memoryConfig();
+		const h = handler(fakeClient(), {}, config);
+		// Unset reads as an explicit false: the UI compares `=== true`.
+		expect((await (await h('/api/chat/meta')).json()).config).toEqual({ default_full_auto: false });
+
+		await h('/api/config', {
+			method: 'PUT',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ base_url: 'https://one/v1', model: 'm', api_key: '', default_full_auto: true }),
+		});
+		expect((await (await h('/api/chat/meta')).json()).config).toEqual({ default_full_auto: true });
+	});
+
 	it('follows the settings panel without a reload', async () => {
 		const config = memoryConfig();
 		const h = handler(fakeClient(), {}, config);
@@ -1159,6 +1247,9 @@ describe('/api/config', () => {
 
 		const shown = await (await h('/api/config')).json();
 		expect(shown.api_key).toBe('');
+		// ...but does say one is there, so the form can tell "stored" from
+		// "never set" without seeing it.
+		expect(shown.api_key_set).toBe(true);
 		expect(shown.base_url).toBe('https://api.example.com/v1');
 		// But the engine did get the real one.
 		expect(client.calls.find(([n]) => n === 'configure')?.[1]).toEqual([
@@ -1198,6 +1289,15 @@ describe('/api/config', () => {
 		const cfg = await (await handler(fakeClient())('/api/config')).json();
 		expect(cfg.enabled).toBe(true);
 		expect(cfg.base_url).toBe('');
+		expect(cfg.api_key_set).toBe(false);
+	});
+
+	it('does not persist the api_key_set annotation a form round-trips', async () => {
+		const config = memoryConfig();
+		const h = handler(fakeClient(), {}, config);
+		await h('/api/config', put({ base_url: 'https://one/v1', model: 'm', api_key: '', api_key_set: true }));
+		expect('api_key_set' in config.load()).toBe(false);
+		expect(config.sanitized().api_key_set).toBe(false);
 	});
 
 	it('survives corrupt storage rather than bricking the page', async () => {
@@ -1308,6 +1408,124 @@ describe('boot probes', () => {
 	it('keeps the apps repository a 404, which is how the UI hides that tab', async () => {
 		const res = await handler(fakeClient())('/api/apps/market');
 		expect(res.status).toBe(404);
+	});
+
+	// A pasted package URL names the app after its file — minus the hub's
+	// dotted version, and minus a query string or fragment, which are not
+	// part of the name (a signed CDN link would otherwise fall back to the
+	// timestamp name).
+	it('names an installed .vapp after the URL file name, query and fragment stripped', async () => {
+		const put: string[] = [];
+		const ran: string[] = [];
+		const vmApps = {
+			list: async () => [],
+			cli: async (args: string) => {
+				ran.push(args);
+				return 'installed /data/apps/demoweb.vapp\n';
+			},
+			putFile: async (path: string) => void put.push(path),
+		};
+		const h = handler(fakeClient(), {}, memoryConfig(), {
+			vmApps,
+			passthrough: (async () => new Response(new Uint8Array([0x1f, 0x8b, 8, 0]))) as typeof fetch,
+		});
+		const res = await h(
+			'/api/apps/install-url',
+			post({ url: 'http://hub/packages/DemoWeb.1.2.0.vapp?sig=abc&t=1#frag' }),
+		);
+		expect(res.status).toBe(200);
+		expect(put).toEqual(['.vinx/tmp/demoweb.vapp']);
+		expect(ran).toEqual(['install /data/.vinx/tmp/demoweb.vapp']);
+		expect((await res.json()).name).toBe('demoweb');
+	});
+
+	// A machine the person left powered off refuses every route into it
+	// with a MachineOffError (app/vm.ts whenUp); the shim turns that into
+	// 503 + a stable code, so the Apps page can say it in their language
+	// instead of showing the bridge's English. Any other failure keeps the
+	// guest's own words at 500.
+	it('answers MACHINE_OFF for a machine the person left off, and the guest’s words otherwise', async () => {
+		const off = Object.assign(new Error('the machine is powered off — the power key boots it'), {
+			name: 'MachineOffError',
+		});
+		const vmApps = {
+			list: async () => [],
+			cli: async (args: string) => {
+				if (args.startsWith('start ')) throw off;
+				throw new Error('app: demo is a pure web app (no backend)');
+			},
+			putFile: async () => {
+				throw off;
+			},
+		};
+		const h = handler(fakeClient(), {}, memoryConfig(), { vmApps });
+		const start = await h('/api/releases/app/demo/start', { method: 'POST' });
+		expect(start.status).toBe(503);
+		expect(await start.json()).toEqual({ error: off.message, code: 'MACHINE_OFF' });
+		const install = await h('/api/apps/install', {
+			method: 'POST',
+			headers: { 'x-file-name': 'demo.vapp' },
+			body: new Uint8Array([1, 2, 3]),
+		});
+		expect(install.status).toBe(503);
+		expect((await install.json()).code).toBe('MACHINE_OFF');
+		const stop = await h('/api/releases/app/demo/stop', { method: 'POST' });
+		expect(stop.status).toBe(500);
+		expect(await stop.json()).toEqual({ error: 'app: demo is a pure web app (no backend)' });
+	});
+
+	// `run` is the Apps page's verb for a window app. A bridge that can open
+	// one by itself (a pure web app from the machine's mirror, machine off
+	// or not) is asked first; without that, the guest CLI STARTS it — rund
+	// spawns a backend window app (on a PTY for a tty app) and the desktop
+	// grows the window on its stream. Not `app run`: that is the console's
+	// verb and refuses a tty app from a channel with no terminal (exit 2),
+	// which a backgrounded, output-discarding call used to swallow — the
+	// "open window does nothing" of the bundled lasertyper.
+	it('runs a window app through the page’s opener when there is one, else the CLI', async () => {
+		const ran: string[] = [];
+		const opened: string[] = [];
+		const base = {
+			list: async () => [],
+			cli: async (args: string) => {
+				ran.push(args);
+				return '';
+			},
+			putFile: async () => {},
+		};
+		const withOpener = handler(fakeClient(), {}, memoryConfig(), {
+			vmApps: { ...base, run: async (id: string) => void opened.push(id) },
+		});
+		expect((await withOpener('/api/releases/app/cute2048/run', { method: 'POST' })).status).toBe(200);
+		expect(opened).toEqual(['cute2048']);
+		expect(ran).toEqual([]);
+
+		const cliOnly = handler(fakeClient(), {}, memoryConfig(), { vmApps: base });
+		expect((await cliOnly('/api/releases/app/cute2048/run', { method: 'POST' })).status).toBe(200);
+		expect(ran).toEqual(['start cute2048']);
+		expect((await cliOnly('/api/releases/app/Not%20An%20Id/run', { method: 'POST' })).status).toBe(400);
+	});
+
+	// The list carries the manifest kind for the card's verb, and a window
+	// app whose window is open on this desktop reads as active — rund never
+	// sees a window, so the desktop's word is the only one there is.
+	it('lists the kind, and an open window as active', async () => {
+		const vmApps = {
+			list: async () => [
+				{ id: 'cute2048', state: 'off', enabled: false, size: 10, kind: 'window', windowOpen: true },
+				{ id: 'notes', state: 'off', enabled: false, size: 10, kind: 'window', windowOpen: false },
+				{ id: 'svc', state: 'running', enabled: true, size: 10, kind: 'service' },
+			],
+			cli: async () => '',
+			putFile: async () => {},
+		};
+		const res = await handler(fakeClient(), {}, memoryConfig(), { vmApps })('/api/releases?kind=app');
+		const { releases } = await res.json();
+		expect(releases.map((r: any) => [r.name, r.status, r.app_kind])).toEqual([
+			['cute2048', 'active', 'window'],
+			['notes', 'inactive', 'window'],
+			['svc', 'active', 'service'],
+		]);
 	});
 
 	it('lists the device tools once they are registered', async () => {

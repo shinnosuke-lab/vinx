@@ -27,8 +27,23 @@ export interface AgentWebConfig {
 	reasoning_effort?: string;
 	/** Default effort for `task` sub-agents (empty = inherit the parent's). */
 	subagent_reasoning_effort?: string;
+	/**
+	 * New sessions start in FULL-AUTO (tool confirmations skipped; questions
+	 * still prompt). Reported to the UI through `/api/chat/meta` as
+	 * `config.default_full_auto`, which seeds the composer's badge on a fresh
+	 * chat; each session can still be switched off via its badge.
+	 */
+	default_full_auto?: boolean;
 	meta?: Record<string, unknown>;
 }
+
+/**
+ * What `GET /api/config` answers: the config with the secret blanked, plus
+ * whether one is stored at all. The form cannot tell "no key" from "key
+ * withheld" by looking at the empty field, and a user who set one weeks ago
+ * has no other way to check — `api_key_set` is that answer without the key.
+ */
+export type SanitizedConfig = AgentWebConfig & { api_key_set: boolean };
 
 const KEY = 'vinx.web.config';
 
@@ -86,9 +101,11 @@ export class ConfigStore {
 		}
 	}
 
-	/** The config as the settings form should see it: no secret. */
-	sanitized(): AgentWebConfig {
-		return { ...this.load(), api_key: '' };
+	/** The config as the settings form should see it: no secret, only whether
+	 *  one is stored. */
+	sanitized(): SanitizedConfig {
+		const current = this.load();
+		return { ...current, api_key: '', api_key_set: current.api_key.trim().length > 0 };
 	}
 
 	/**
@@ -97,10 +114,13 @@ export class ConfigStore {
 	 */
 	save(submitted: Partial<AgentWebConfig>): AgentWebConfig {
 		const current = this.load();
+		// `api_key_set` is a GET-only annotation; a form that round-trips the
+		// whole object must not persist it as if it were a setting.
+		const { api_key_set: _ignored, ...fields } = submitted as Partial<SanitizedConfig>;
 		const next: AgentWebConfig = {
 			...current,
-			...submitted,
-			api_key: submitted.api_key?.trim() ? submitted.api_key : current.api_key,
+			...fields,
+			api_key: fields.api_key?.trim() ? fields.api_key : current.api_key,
 		};
 		this.storage.setItem(KEY, JSON.stringify(next));
 		return next;

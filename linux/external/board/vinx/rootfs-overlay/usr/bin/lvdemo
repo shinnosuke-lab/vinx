@@ -10,11 +10,14 @@ src=/usr/share/lvgl/lvdemo.c
 bin=/tmp/.lvdemo
 
 # Pop the page's screen window: drawing on fb0 changes no video mode, so
-# the page cannot notice by itself. Best-effort -- js(1) needs the
-# hostcall channel, and an already-open window is a no-op.
-js -e 'window.vinxScreenShow?.()' >/dev/null 2>&1 || true
+# the page cannot notice by itself. window.focus is the desktop's window
+# method (system-v2 §10.7). Best-effort -- rpc(1) needs the control plane,
+# and an already-open window is a no-op.
+rpc call window.focus '{"id":"screen"}' >/dev/null 2>&1 || true
 
 if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
 	tcc "$src" -o "$bin" -llvgl
 fi
-exec "$bin" "$@"
+# Compile outside the lock (seconds of tcc must not hold the screen),
+# run inside it: one FB program at a time, stty given back on any exit.
+exec fb-run "$bin" "$@"

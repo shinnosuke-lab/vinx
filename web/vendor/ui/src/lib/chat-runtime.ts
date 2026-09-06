@@ -18,6 +18,14 @@ export interface SubagentLive {
   startedAt: number
   /** True after a per-task cancel was requested, until its tool_result lands. */
   cancelling: boolean
+  /** The child's transcript session id (`task-<uuid>`), from the `subagent`
+   *  frames — lets the task card deep-link to the live sub-session view
+   *  while the child is still running. */
+  sessionId?: string
+  /** The task's human-readable name (its `description` argument), riding the
+   *  `subagent` frames — titles the progress row even when this tab never saw
+   *  the parent round's tool_start (re-attach after a trimmed replay). */
+  label?: string
 }
 
 export interface ChatRuntime {
@@ -30,6 +38,16 @@ export interface ChatRuntime {
   /** Host-provided deep link to a session id (e.g. `#/chat/<id>`), used by
    *  the `task` card's "view transcript" anchor. */
   sessionHref?: (id: string) => string
+  /** Look up an earlier tool call of this transcript by its tool_call id.
+   *  The `recall_result` card uses it to show a recalled output the way the
+   *  original card did: the original's arguments drive that renderer's
+   *  header (the command, the path, the pattern). Undefined when the call is
+   *  not in the transcript any more (recalled from the archive after a
+   *  compaction rewrote the history, or this surface keeps none). */
+  findToolCall?: (callId: string) => { name: string; args?: string } | undefined
+  /** Scroll the transcript to an earlier tool call, unfolding whatever hides
+   *  it (its step group, the card itself) — see lib/reveal. */
+  revealToolCall?: (callId: string) => void
 }
 
 export const ChatRuntimeContext = createContext<ChatRuntime | null>(null)

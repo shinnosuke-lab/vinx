@@ -7,12 +7,16 @@
 # here; expression results count (`js -e '6*7'` prints 42). qjs(1) is the
 # in-guest JavaScript; this one is for when you need the *browser*.
 #
-# Rides the hostcall channel on /dev/ttyS3 (see /usr/lib/hostcall.sh), which
-# works the same from the console and from the agent's run_shell. One warning
-# is structural: the timeout can only interrupt code that awaits -- a
+# Rides the control plane: `rpc call debug.js` through rpcd on /dev/ttyS3
+# (see rpc(1) and system-v2 §6), which works the same from the console and
+# from the agent's run_shell. The method is named debug.* on purpose -- the
+# page is a debugging surface, not a public API (§14). One warning is
+# structural: the timeout can only interrupt code that awaits -- a
 # synchronous infinite loop freezes the page itself, so do not write one.
-
-. /usr/lib/hostcall.sh
+#
+# Code past what a 4 KiB control frame carries is staged into
+# /data/.vinx/tmp and sent as {codeRef}; big output comes back the same way
+# ({outputRef}), exact bytes over 9p instead of a UART crawl.
 
 usage() {
 	cat >&2 <<'EOF'
@@ -50,12 +54,37 @@ case "$tmo" in ''|*[!0-9]*) tmo=30 ;; esac
 [ "$tmo" -gt 120 ] && tmo=120
 [ "$tmo" -lt 1 ] && tmo=1
 
-payload=$(jq -cn --arg code "$code" --argjson t $((tmo * 1000)) '{code: $code, timeoutMs: $t}')
-reply=$(hostcall js "$payload" "$tmo") || exit 1
+# Inline when it fits a frame with room for the envelope; otherwise stage
+# the code in the session tmp namespace and send a ref (§6.8).
+staged=
+if [ "${#code}" -gt 3000 ]; then
+	if ! grep -q ' /data 9p ' /proc/mounts; then
+		echo 'js: the script is too large for the wire and no /data mount can relay it' >&2
+		exit 1
+	fi
+	mkdir -p /data/.vinx/tmp || exit 1
+	staged="/data/.vinx/tmp/js-$$-$(date +%s).code"
+	printf '%s' "$code" > "$staged" || exit 1
+	payload=$(jq -cn --arg path "$staged" --argjson size "$(wc -c < "$staged")" \
+		--argjson t $((tmo * 1000)) '{codeRef: {path: $path, size: $size}, timeoutMs: $t}')
+else
+	payload=$(jq -cn --arg code "$code" --argjson t $((tmo * 1000)) '{code: $code, timeoutMs: $t}')
+fi
 
-hostcall_body "$reply"
+# The transport deadline outlives the script budget by a little (§6.5).
+reply=$(printf '%s' "$payload" | rpc call debug.js - -t $((tmo + 10)))
+rc=$?
+[ -n "$staged" ] && rm -f "$staged"
+[ "$rc" -eq 0 ] || exit 1
+
+# The output, wherever it is: inline, or a /data ref this side consumes.
+ref=$(printf '%s' "$reply" | jq -r '.outputRef.path // empty')
+if [ -n "$ref" ]; then
+	cat "$ref"
+	rm -f "$ref"
+else
+	printf '%s' "$reply" | jq -rj '.output // empty'
+fi
 # The body rarely ends in a newline of its own; give the shell prompt one.
 echo
-err=$(printf '%s' "$reply" | jq -r '.error // empty')
-[ -n "$err" ] && echo "js: $err" >&2
 [ "$(printf '%s' "$reply" | jq -r '.ok')" = "true" ]

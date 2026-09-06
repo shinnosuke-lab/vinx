@@ -1,114 +1,81 @@
 /**
- * The guest side of the bridge: `bridge(1)` in the VM speaks OSC 7770 to the
- * page, and the page answers through a file.
+ * The guest side of the bridge: `bridge(1)` in the VM drives the WebRTC LAN
+ * bridge through the network.bridge.* control-plane methods (hostcall.ts
+ * serves them; this module is their implementation).
  *
- * Command flow: the script prints `bridge;<b64 JSON>` and the terminal's OSC
- * handler calls `handleBridgeOsc`. Result flow: every change to the room —
- * created, joined, roster moved, failed, stopped — is rendered into
- * `/data/.bridge-status`, a flat key=value file the script polls and parses
- * with nothing fancier than a shell `case`. The file is the *only* return
- * channel: run_shell output is not OSC-parsed, and the console cannot be
- * written to without colliding with whatever the person is typing.
- *
- * The same tracking serves the panel: rooms started from the UI also land in
- * the status file (when a VM is running), so `bridge show` in the guest sees
- * a room the person started with clicks. One room per page either way —
+ * Control only — the rooms themselves are net-bridge.ts's. start/join block
+ * until the room is on (or reject with its failure), which is what lets the
+ * guest CLI be one call instead of the old start-then-poll dance; status
+ * reads the live room, so a room the person started with panel clicks
+ * answers here too — the job /data/.bridge-status used to do, retired with
+ * the rest of the file protocol in Phase 3. One room per page either way —
  * net-bridge keeps the singleton.
  */
 
+import type { BridgeControl, BridgeStatus } from './hostcall';
 import { currentRoom, hostRoom, joinRoom, type RoomBridge } from './net-bridge';
-import { sharedVm, type VinxVm, type VmState } from './vm';
 
-const STATUS_FILE = '.bridge-status';
-
-export interface BridgeRequest {
-	op: 'start' | 'join' | 'stop' | 'say';
-	code?: string;
-	name?: string;
-	ip?: string;
-	text?: string;
-	to?: string;
+function snapshot(b: RoomBridge | null): BridgeStatus {
+	if (!b || b.state === 'closed') return { state: 'off' };
+	if (b.state === 'failed') return { state: 'failed', error: b.error || 'the bridge failed' };
+	return {
+		state: b.state === 'on' ? 'on' : 'joining',
+		role: b.role,
+		room: b.room,
+		members: b.members.map((m) => ({ name: m.name, ip: m.ip || '?', host: m.host })),
+	};
 }
 
-function statusText(b: RoomBridge | null, error = ''): string {
-	if (!b || b.state === 'closed') {
-		return error ? `state=failed\nerror=${error}\n` : 'state=off\n';
-	}
-	if (b.state === 'failed') {
-		return `state=failed\nerror=${b.error || error}\n`;
-	}
-	const lines = [
-		`state=${b.state === 'on' ? 'on' : 'joining'}`,
-		`role=${b.role}`,
-		`room=${b.room}`,
-		`members=${b.members.length}`,
-	];
-	for (const m of b.members) {
-		lines.push(`member=${m.name} ${m.ip || '?'}${m.host ? ' host' : ''}`);
-	}
-	return lines.join('\n') + '\n';
+/** Resolve when the room reaches `on`; reject when it fails or closes.
+ * The caller's deadline (rpc serve budget) bounds the wait — an abort just
+ * stops this promise, the room keeps whatever it was doing. */
+function untilOn(b: RoomBridge, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const settle = (err?: Error) => {
+			if (settled) return;
+			settled = true;
+			if (err) reject(err);
+			else resolve();
+		};
+		const check = () => {
+			if (b.state === 'on') settle();
+			else if (b.state === 'failed') settle(new Error(b.error || 'the bridge failed'));
+			else if (b.state === 'closed') settle(new Error('the bridge closed before it came up'));
+		};
+		b.onChange(check);
+		signal?.addEventListener('abort', () => settle(new Error('cancelled')), { once: true });
+		check();
+	});
 }
 
-function vmState(vm: VinxVm): VmState {
-	let s: VmState = 'off';
-	vm.onState((v) => {
-		s = v;
-	})();
-	return s;
-}
+export const bridgeControl: BridgeControl = {
+	async start(name, ip, signal) {
+		const b = await hostRoom(name, ip);
+		await untilOn(b, signal);
+		return snapshot(b);
+	},
 
-async function writeStatus(text: string): Promise<void> {
-	const vm = sharedVm();
-	// Never *boot* a machine just to file paperwork: without a running VM
-	// there is no reader (and on the chat page, no terminal either).
-	if (vmState(vm) !== 'ready') return;
-	try {
-		await vm.putFile(STATUS_FILE, new TextEncoder().encode(text));
-	} catch {
-		/* a reload race; the next change rewrites it */
-	}
-}
+	async join(code, name, ip, signal) {
+		const b = await joinRoom(code, name, ip);
+		await untilOn(b, signal);
+		return snapshot(b);
+	},
 
-/** Follow a room's life and mirror every change into the guest's file.
- * Deliberately does not touch the stored network mode: bridging is a live
- * action, and `vinx.vm.relay` belongs to the panel's Save button alone.
- * The panel reads the live room at open and shows "Bridge LAN" anyway. */
-export function trackRoom(b: RoomBridge): void {
-	void writeStatus(statusText(b));
-	b.onChange(() => void writeStatus(statusText(b)));
-}
-
-/**
- * One command from the guest script. Resolution is asynchronous by design:
- * the script polls the status file, so this only kicks things off.
- */
-export async function handleBridgeOsc(req: BridgeRequest): Promise<void> {
-	const name = (req.name || 'someone').slice(0, 32);
-	const ip = (req.ip || '').slice(0, 15);
-	if (req.op === 'start') {
-		await writeStatus('state=starting\n');
-		try {
-			trackRoom(await hostRoom(name, ip));
-		} catch (e) {
-			await writeStatus(statusText(null, e instanceof Error ? e.message : String(e)));
-		}
-	} else if (req.op === 'join') {
-		if (!req.code) {
-			await writeStatus(statusText(null, 'join needs a room code'));
-			return;
-		}
-		await writeStatus('state=joining\n');
-		try {
-			trackRoom(await joinRoom(req.code, name, ip));
-		} catch (e) {
-			await writeStatus(statusText(null, e instanceof Error ? e.message : String(e)));
-		}
-	} else if (req.op === 'stop') {
+	stop() {
 		currentRoom()?.stop();
-		await writeStatus('state=off\n');
-	} else if (req.op === 'say') {
-		// Fire and forget: the script checked state=on before sending, and
-		// the danmaku overlay is the delivery receipt everyone can see.
-		currentRoom()?.say(String(req.text || ''), req.to ? String(req.to) : undefined);
-	}
-}
+	},
+
+	// Fire and forget past the liveness check: the danmaku overlay is the
+	// delivery receipt everyone can see.
+	say(text, to) {
+		const b = currentRoom();
+		if (!b || b.state !== 'on') return false;
+		b.say(String(text), to ? String(to) : undefined);
+		return true;
+	},
+
+	status() {
+		return snapshot(currentRoom());
+	},
+};

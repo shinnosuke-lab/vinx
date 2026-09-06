@@ -7,15 +7,16 @@ fails), and it sends no `Access-Control-Allow-Origin` -- harmless for the
 single-origin layout here, but kept so a cross-origin skills fetch or a future
 split still works. Both are one line each below.
 
-    python3 deploy/assets-server.py <directory> [port]
+    python3 deploy/assets-server.py <directory> [port] [--bind HOST]
 
-Prints `ASSETS_PORT=<port>` once listening.
+Prints `ASSETS_PORT=<port>` once listening. `--bind` picks the interface
+(default 127.0.0.1). The app shell needs nothing special from this server:
+it ships in dist/ with its policy in a <meta> tag (system-v2 §10.3).
 """
 
 import functools
 import sys
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 # The same tree, aliased under a sub-path. The page is built with relative
 # URLs (`base: './'`) precisely so it can be deployed under one (GitHub
@@ -48,13 +49,28 @@ Handler.extensions_map[".wasm"] = "application/wasm"
 
 
 def main():
-    if len(sys.argv) < 2:
-        sys.exit("usage: assets-server.py <directory> [port]")
-    directory = sys.argv[1]
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    args = list(sys.argv[1:])
+    bind = "127.0.0.1"
+    if "--bind" in args:
+        at = args.index("--bind")
+        try:
+            bind = args[at + 1]
+        except IndexError:
+            sys.exit("--bind wants a host")
+        del args[at : at + 2]
+    if not args:
+        sys.exit("usage: assets-server.py <directory> [port] [--bind HOST]")
+    directory = args[0]
+    port = int(args[1]) if len(args) > 1 else 0
 
     handler = functools.partial(Handler, directory=directory)
-    server = HTTPServer(("127.0.0.1", port), handler)
+    # Threaded: a browser opens speculative connections and keeps them idle,
+    # and a single-threaded server blocks on the first idle socket it
+    # accepts -- every later request queues behind it until the browser
+    # gives up. Seen as an app window whose frame never navigated, ~90 tests
+    # into the suite, once enough idle sockets had piled up.
+    server = ThreadingHTTPServer((bind, port), handler)
+    server.daemon_threads = True
     print("ASSETS_PORT=%d" % server.server_address[1], flush=True)
     server.serve_forever()
 

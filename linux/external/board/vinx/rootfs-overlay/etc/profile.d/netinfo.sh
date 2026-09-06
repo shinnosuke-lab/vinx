@@ -1,5 +1,5 @@
 # Shown when the console shell opens (a login shell), not for run_shell tool
-# calls (agentd runs plain `sh`, which does not source this). The page bakes
+# calls (rund runs plain `sh`, which does not source this). The page bakes
 # its network choice into the kernel cmdline as vinx.net=<mode>, so the hints
 # can tell the truth per mode -- on a wsproxy relay the 10.0.2.x alias never
 # crosses the server (it drops source IPs it did not lease), and advising it

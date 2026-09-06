@@ -16,7 +16,7 @@
  * In pane mode this file is what it always was: a dumb terminal. xterm.js on
  * one side of the wire, the guest's getty on the other, bytes both ways over
  * ttyS0. The shell does its own line editing and history because it is a real
- * shell. The AI panel shares the same machine over ttyS1.
+ * shell. The AI panel shares the same machine over the ttyS3 control plane.
  */
 
 import { lazy, StrictMode, Suspense, useCallback, useEffect, useRef, useState } from 'react';
@@ -31,19 +31,21 @@ import { Terminal } from '@xterm/xterm';
 // chunk below.
 import type { TerminalAgentChatHandle } from '@vinx/agent-chat';
 
-import { sharedVm, type BootProgress, type VmState } from './vm';
+import { sharedVm, type BootProgress, type SerialProbe, type VmState } from './vm';
+import { RpcCallError } from './rpc';
 import { t } from './i18n';
+import { consoleTerminalOptions, loadWebglRenderer } from './term-theme';
 import { resolveRelay } from './vm-config';
 import { NetPrompt, NetworkControl } from './net-panel';
 import { isShellDocument, type PaneId } from './pane-id';
 import { setTerminalReader } from './terminal-buffer';
-import { triggerDownload } from './downloads';
-import { bytesFromB64, fileOpener, textFromB64, urlOpener, type OpenRequest } from './opener';
-import { captureFrame } from './camera';
-import { handleBridgeOsc, type BridgeRequest } from './bridge-ctl';
-import { handleBleOsc, type BleRequest } from './ble';
+import { type OpenRequest } from './opener';
+import { setBleNote } from './ble';
 import { mountDanmaku } from './danmaku';
-import { Icon, ICON_MONITOR, ICON_SPARK, ICON_SPLIT_H, ICON_SPLIT_V, ICON_UPLOAD } from './icons';
+import { autostartWebApps } from './app-autostart';
+import { windowManager } from './window-manager';
+import { WebWindows, useWindowTable } from './web-windows';
+import { Icon, ICON_MONITOR, ICON_SPARK, ICON_SPLIT_H, ICON_SPLIT_V, ICON_TERMINAL, ICON_UPLOAD } from './icons';
 import {
 	BleControl,
 	MountControl,
@@ -167,16 +169,31 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 	const [dropNote, setDropNote] = useState('');
 	// The VGA screen panel; the machine renders whether it is shown or not.
 	const [screenOpen, setScreenOpen] = useState(false);
-	// Published for the guest: lvdemo(1) runs `js -e 'window.vinxScreenShow?.()'`
-	// before painting — drawing on /dev/fb0 changes no video mode, so the
-	// auto-open below never hears about it; the guest says so itself.
-	useEffect(() => {
-		const w = window as unknown as Record<string, unknown>;
-		w.vinxScreenShow = () => setScreenOpen(true);
-		return () => {
-			delete w.vinxScreenShow;
-		};
-	}, []);
+	// This desktop document's window table (§10.7): web app windows live in
+	// it entirely; the screen joins through a native shim below so
+	// window.list/close/focus see it too. Subscribing here keeps the
+	// screen's z-index fresh as windows raise over each other.
+	const wm = useWindowTable();
+	const screenOpenRef = useRef(false);
+	screenOpenRef.current = screenOpen;
+	useEffect(
+		() =>
+			windowManager().registerNative('screen', {
+				isOpen: () => screenOpenRef.current,
+				open: () => setScreenOpen(true),
+				close: () => setScreenOpen(false),
+			}),
+		[],
+	);
+	// Published for the guest: lvdemo(1) calls `rpc call window.focus
+	// '{"id":"screen"}'` before painting — drawing on /dev/fb0 changes no
+	// video mode, so the auto-open below never hears about it; the guest
+	// says so itself. The window.focus registration lives in the boot
+	// effect below — a bare sharedVm() here would run first (effects fire
+	// in declaration order) and create the VM with default options,
+	// discarding `?relay=` (the trap existingVm()'s doc names). The old
+	// window.vinxScreenShow global went with Phase 3, its callers all on
+	// rpc call window.focus since Phase 2.
 	// The guest's own graphical mode while it differs from the boot console's
 	// (nes's 256x224); the screen window auto-sizes to an integer multiple.
 	const [screenFit, setScreenFit] = useState<{ w: number; h: number } | null>(null);
@@ -215,7 +232,10 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 				try {
 					const bytes = new Uint8Array(await f.arrayBuffer());
 					await vm.putFile(name, bytes);
-					await storeShareFile(name, bytes);
+					// Only the owner tab writes the machine's mirror; on an
+					// ephemeral machine the file still lands in the guest and
+					// lives as long as the tab does.
+					if (await vm.isOwner()) await storeShareFile(name, bytes);
 					used += bytes.byteLength;
 					note(`${f.name} → /data/${name}`);
 				} catch (err) {
@@ -249,52 +269,15 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 	useEffect(() => {
 		// The VM's network, from `?relay=` / localStorage; see vm-config.ts.
 		const vm = sharedVm({ networkRelay: resolveRelay() });
-		const term = new Terminal({
-			// The unicode11 addon registers through a proposed API, and the
-			// clipboard addon's OSC 52 path likewise.
-			allowProposedApi: true,
-			cursorBlink: true,
-			cursorStyle: 'block',
-			cursorInactiveStyle: 'outline',
-			// iTerm2's "Left Option acts as Esc+": Option-B/F word motion and
-			// friends work in shells instead of typing ∫ and ƒ.
-			macOptionIsMeta: true,
-			scrollback: 5000,
-			// iTerm2's stack: Monaco first, then the monos a Mac or a Linux box
-			// actually has. 12px matches its default; the loose line height and
-			// letter spacing are what professional terminals ship and xterm's
-			// defaults lack.
-			fontFamily: "Monaco, 'SF Mono', Menlo, 'JetBrains Mono', 'Cascadia Code', monospace",
-			fontSize: 12,
-			lineHeight: 1.15,
-			letterSpacing: 0.5,
-			// The default DOM renderer, deliberately: it puts the screen in the
-			// document, which is what lets the browser suite read it. Tokyo
-			// Night's palette — deep blue-grey ground, soft pastels, a cyan
-			// that reads as terminal without glaring.
-			theme: {
-				background: '#1a1b26',
-				foreground: '#c0caf5',
-				cursor: '#cd751d',
-				selectionBackground: '#33467c',
-				black: '#15161e',
-				red: '#f7768e',
-				green: '#9ece6a',
-				yellow: '#e0af68',
-				blue: '#7aa2f7',
-				magenta: '#bb9af7',
-				cyan: '#7dcfff',
-				white: '#a9b1d6',
-				brightBlack: '#414868',
-				brightRed: '#f7768e',
-				brightGreen: '#9ece6a',
-				brightYellow: '#e0af68',
-				brightBlue: '#7aa2f7',
-				brightMagenta: '#bb9af7',
-				brightCyan: '#7dcfff',
-				brightWhite: '#c0caf5',
-			},
+		// The guest's window.focus (§10.7): the VGA panel answers to 'screen'.
+		const unregisterFocus = vm.onWindowFocus((id) => {
+			if (id !== 'screen') return false;
+			setScreenOpen(true);
+			return true;
 		});
+		// Palette, font and input conventions shared with the chat page's
+		// machine console; see term-theme.ts.
+		const term = new Terminal(consoleTerminalOptions());
 		const fit = new FitAddon();
 		term.loadAddon(fit);
 		// Emoji and the newer Unicode blocks measured right; the built-in
@@ -364,98 +347,63 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 		term.loadAddon(images);
 		(window as { vinxImages?: ImageAddon }).vinxImages = images;
 
+		// The console itself, visible to the browser suite: with the WebGL
+		// renderer the DOM carries no text rows, so the tests read the
+		// screen through the buffer API instead of .xterm-rows.
+		(window as { __vinxConsole?: Terminal }).__vinxConsole = term;
+
 		// The audio probe, visible to the test suites (the same stance as
 		// vinxImages and data-audio-state): does sound actually flow?
 		(window as { vinxAudioRms?: (ms?: number) => Promise<unknown> }).vinxAudioRms = (ms?: number) =>
 			vm.audioRms(ms);
 
-		// download(1) in the guest: the same OSC 1337 File sequence imgcat
-		// sends but inline=0, iTerm2's "save this" disposition, which the
-		// image addon does not implement. Registered after the addon loads —
-		// xterm asks the newest handler first — so this one sees every File
-		// sequence and passes inline=1 through (return false) for drawing.
-		term.parser.registerOscHandler(1337, (data) => {
-			if (!data.startsWith('File=')) return false;
-			const colon = data.indexOf(':');
-			if (colon < 0) return false;
-			const fields: Record<string, string> = {};
-			for (const part of data.slice(5, colon).split(';')) {
-				const eq = part.indexOf('=');
-				if (eq > 0) fields[part.slice(0, eq).toLowerCase()] = part.slice(eq + 1);
-			}
-			if (fields.inline === '1') return false;
-			try {
-				const name = fields.name ? textFromB64(fields.name) : 'download';
-				triggerDownload(name, bytesFromB64(data.slice(colon + 1)));
-			} catch {
-				// A mangled payload was still ours; swallowing beats drawing
-				// kilobytes of base64 on the screen.
-			}
-			return true;
-		});
+		// The serial probe, same stance again: raw UART instruments for the
+		// Phase 0 protocol measurements (app/test/serial-bench.mjs) and the
+		// failure-case suite. Nothing on the page calls it.
+		(window as { vinxSerialProbe?: SerialProbe }).vinxSerialProbe = vm.serialProbe();
 
-		// The guest's private OSC: open(1) — `url;<b64>` opens a link,
-		// `file;<b64 name>;<b64 bytes>` opens a typed blob, and a popup
-		// blocker's veto parks the request on the chip in the footer corner —
-		// plus notify(1), say(1) and camera(1), each one browser API deep.
-		term.parser.registerOscHandler(7770, (data) => {
-			try {
-				const [kind, a, b] = data.split(';');
-				if (kind === 'notify' && a) {
-					const text = textFromB64(a);
-					// The system notification only where already granted; no
-					// requestPermission here — outside a gesture Chrome would
-					// just deny it. The corner toast is the honest fallback.
-					if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-						new Notification('vinx', { body: text });
-					} else {
-						note(`notify: ${text}`);
-					}
-				} else if (kind === 'say' && a) {
-					speechSynthesis.speak(new SpeechSynthesisUtterance(textFromB64(a)));
-				} else if (kind === 'camera' && a) {
-					// The script validated the name; re-check here so a forged
-					// sequence cannot name a path. A bad name is just dropped —
-					// the guest-side poll times out with its own message.
-					const name = textFromB64(a);
-					if (/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/.test(name)) {
-						captureFrame(vm, name).catch((err) => {
-							note(`camera: ${err instanceof Error ? err.message : String(err)}`);
-						});
-					}
-				} else if (kind === 'bridge' && a) {
-					// bridge(1): start/join/stop a WebRTC room, or `say` words
-					// onto every member's screen. Replies travel through
-					// /data/.bridge-status, which the script polls — see
-					// bridge-ctl.ts for why a file and not text.
-					const req = JSON.parse(textFromB64(a)) as BridgeRequest;
-					if (req.op === 'start' || req.op === 'join' || req.op === 'stop' || req.op === 'say') {
-						handleBridgeOsc(req).catch((err) => {
-							note(`bridge: ${err instanceof Error ? err.message : String(err)}`);
-						});
-					}
-				} else if (kind === 'ble' && a) {
-					// ble(1): Web Bluetooth, GATT-deep. Answers travel through
-					// /data/.ble-* files the script polls; the picker parks on
-					// the footer chip for its gesture — see ble.ts.
-					const req = JSON.parse(textFromB64(a)) as BleRequest;
-					const ops = ['scan', 'connect', 'services', 'read', 'write', 'notify', 'disconnect'];
-					if (ops.includes(req.op)) {
-						handleBleOsc(req, note).catch((err) => {
-							note(`ble: ${err instanceof Error ? err.message : String(err)}`);
-						});
-					}
-				} else {
-					let req: OpenRequest | null = null;
-					if (kind === 'url' && a) req = urlOpener(textFromB64(a));
-					else if (kind === 'file' && a && b) req = fileOpener(textFromB64(a), bytesFromB64(b));
-					if (req && !req.open()) setPendingOpen(req);
-				}
-			} catch {
-				// Same stance as above: it was addressed to us, drop it.
-			}
-			return true;
-		});
+		// The control link, for the E2E suite: plain-data answers that cross
+		// frame.evaluate cleanly (an RpcCallError would serialise to {}).
+		(window as { vinxRpc?: unknown }).vinxRpc = {
+			call: (method: string, params?: Record<string, unknown>, deadlineMs?: number) =>
+				vm.rpcCall(method, params, { deadlineMs }).then(
+					(result) => ({ ok: true, result }),
+					(e: unknown) => ({
+						ok: false,
+						error:
+							e instanceof RpcCallError
+								? { code: e.code, name: e.name, message: e.message, hint: e.hint }
+								: { name: 'Error', message: String(e) },
+					}),
+				),
+			// The runShell adapter itself (scriptRef staging, output-ref
+			// folding) — what the engine's run_shell rides; the suite pins
+			// its truncation marker here. A rejection comes back plain-data.
+			run: (command: string, timeoutS?: number) =>
+				vm.runShell(command, timeoutS).then(
+					(r) => r,
+					(e: unknown) => ({ exit_code: -1, output: e instanceof Error ? e.message : String(e) }),
+				),
+			state: () => vm.rpcLink?.state,
+			stats: () => vm.rpcLink?.stats(),
+			peer: () => vm.rpcLink?.peerHello,
+			reattach: () => vm.rpcLink?.attach(),
+			// The ttyS1 stream lane's ledger (§6.9), for the E2E suite: is
+			// the mux actually moving bytes, dropping any, seeing noise?
+			mux: () => ({ ...(vm.streamMux?.stats ?? {}) }),
+		};
+
+		// The guest's browser capabilities — notify(1), say(1), camera(1),
+		// open(1), download(1), ble(1), bridge(1) — arrive as control-plane
+		// methods now (§15 Phase 3; hostcall.ts serves them, vm.ts wires the
+		// desktop surfaces). What this page still registers is its own UI:
+		// the corner toast for notify's fallback and the ble chip's hints,
+		// and the open chip a popup-blocked open parks on. imgcat's OSC 1337
+		// (inline=1) stays with the image addon — it is terminal rendering,
+		// not a capability.
+		const unregisterNote = vm.onDesktopNote((text) => note(`notify: ${text}`));
+		setBleNote(note);
+		const unregisterParker = vm.onOpenParked(setPendingOpen);
 
 		// Typed bytes straight to the UART; the shell echoes them back, so the
 		// terminal deliberately does not echo locally.
@@ -491,6 +439,8 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 		// one can see.
 		const raf = requestAnimationFrame(() => {
 			term.open(host.current!);
+			// Crisp text; falls back to the DOM renderer without WebGL.
+			loadWebglRenderer(term);
 			fit.fit();
 			term.focus();
 			resize.observe(host.current!);
@@ -582,12 +532,29 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 			unwatch();
 			unwatchProgress();
 			unwatchMode?.();
+			unregisterFocus();
+			unregisterNote();
+			unregisterParker();
+			setBleNote(() => {});
 			resize.disconnect();
 			window.removeEventListener('pointerdown', resumeAudio);
 			window.removeEventListener('keydown', resumeAudio);
 			setTerminalReader(null);
 			readTail.current = null;
-			term.dispose();
+			// The image addon before the terminal, defensively: inside
+			// term.dispose()'s addon sweep (renderer already gone) its
+			// teardown dereferences torn-down internals and would throw
+			// through the React unmount (see ByteStreamTerm's cleanup).
+			try {
+				images.dispose();
+			} catch {
+				/* already half-gone */
+			}
+			try {
+				term.dispose();
+			} catch {
+				/* a disposed-addon straggler */
+			}
 			// The VM keeps running: the AI panel shares it, and a reload is what
 			// tears it down.
 		};
@@ -595,8 +562,8 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 
 	// The veil covers the terminal until the machine is usable, then fades;
 	// it stays mounted through the fade so the transition can play. A boot
-	// stuck past 30 s in the kernel/restore phase (normally 1-2 s; downloads
-	// are excluded, they may honestly take minutes on slow links) drops the
+	// stuck past 30 s in the kernel phase (normally seconds; downloads are
+	// excluded, they may honestly take minutes on slow links) drops the
 	// veil early: whatever the kernel is printing is the diagnosis, and this
 	// exact veil once hid an initramfs unpack failure for three minutes.
 	const booting = vmPhase === 'off' || vmPhase === 'booting';
@@ -605,8 +572,7 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 		if (!booting) setStalled(false);
 	}, [booting]);
 	useEffect(() => {
-		const phase = bootProgress?.phase;
-		if (!booting || (phase !== 'kernel' && phase !== 'restore')) return;
+		if (!booting || bootProgress?.phase !== 'kernel') return;
 		const timer = setTimeout(() => setStalled(true), 30_000);
 		return () => clearTimeout(timer);
 	}, [booting, bootProgress?.phase]);
@@ -672,11 +638,8 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 	// line says which leg that number is in.
 	const bootPercent = bootProgress ? `${Math.round(bootProgress.fraction * 100)}%` : '';
 	const bootStage =
-		(bootProgress?.phase === 'restore'
-			? t('bootRestore')
-			: bootProgress?.phase === 'kernel'
-				? t('bootKernel')
-				: t('bootDownload')) + (bootPercent ? ` ${bootPercent}` : '');
+		(bootProgress?.phase === 'kernel' ? t('bootKernel') : t('bootDownload')) +
+		(bootPercent ? ` ${bootPercent}` : '');
 
 	// Everything a bug report needs, one click: versions, mode, phase, the
 	// recorded reason and the console's last words.
@@ -703,7 +666,15 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 			onDragLeave={() => setDragging(false)}
 			onDrop={onDrop}
 		>
-			{screenOpen && <VgaWindow onClose={() => setScreenOpen(false)} fitTo={screenFit} />}
+			{screenOpen && (
+				<VgaWindow
+					onClose={() => setScreenOpen(false)}
+					fitTo={screenFit}
+					zIndex={wm.zOf('screen')}
+					onRaise={() => wm.raise('screen')}
+				/>
+			)}
+			<WebWindows />
 			<div className="screen" ref={host} />
 			{!veilGone && (
 				<div className={`boot-veil${veilUp ? '' : ' boot-veil-done'}`}>
@@ -784,6 +755,19 @@ function Console({ onAskAI }: { onAskAI: (text: string) => void }) {
 				>
 					<Icon d={ICON_MONITOR} size={12} />
 					screen
+				</button>
+				<button
+					type="button"
+					className="screen-chip"
+					title="Open a shell in a new terminal window (proc.pty)"
+					onClick={() => {
+						void sharedVm()
+							.openShellWindow()
+							.catch((e) => note(`terminal: ${e instanceof Error ? e.message : String(e)}`));
+					}}
+				>
+					<Icon d={ICON_TERMINAL} size={12} />
+					terminal
 				</button>
 				<button
 					type="button"
@@ -1085,6 +1069,9 @@ function ShellApp() {
 // Chat floats over the shell document, which spans the whole window; the
 // pane iframes stay clean or every line would show once per pane.
 if (isShellDocument()) mountDanmaku();
+// Each pane is a machine's desktop, and a page load is its boot: the pure
+// web apps enabled on that machine open in the pane now, from its mirror.
+else void autostartWebApps();
 
 createRoot(document.getElementById('root')!).render(
 	<StrictMode>{isShellDocument() ? <ShellApp /> : <PaneApp />}</StrictMode>,

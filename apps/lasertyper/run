@@ -1,0 +1,9 @@
+#!/bin/sh
+# Compile in place (tcc; termbox2 is a single header) and exec. The PTY
+# is already stdin/stdout -- rund spawned us on one (app.start {pty}).
+set -e
+cd "$(dirname "$0")"
+if [ ! -x main ] || [ main.c -nt main ]; then
+	tcc main.c -o main
+fi
+exec ./main

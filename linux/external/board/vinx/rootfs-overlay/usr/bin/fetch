@@ -9,10 +9,10 @@
 #
 # curl-shaped where it counts: body to stdout, -o for a file, -i to include
 # the status line and headers, non-2xx exits 22 (like curl -f), transport
-# failure exits 7. Rides the hostcall channel on /dev/ttyS3; big bodies come
-# back through /data (exact bytes, no UART crawl).
-
-. /usr/lib/hostcall.sh
+# failure exits 7. Rides the control plane: `rpc call http.fetch` through
+# rpcd on /dev/ttyS3 (see rpc(1) and system-v2 §6). Request bodies past a
+# frame go up as a /data ref ({bodyRef}); big response bodies come back the
+# same way -- exact bytes over 9p, no UART crawl, no truncation.
 
 usage() {
 	cat >&2 <<'EOF'
@@ -60,28 +60,49 @@ case "$tmo" in ''|*[!0-9]*) tmo=30 ;; esac
 [ "$tmo" -gt 120 ] && tmo=120
 [ "$tmo" -lt 1 ] && tmo=1
 
-# A body goes over as base64: exact bytes, no JSON-in-shell quoting traps,
-# and `-d @file` can carry binary. POST is implied, as curl does it.
-body_b64=
+# A small body inlines as base64 (exact bytes, no JSON-in-shell quoting
+# traps, `-d @file` can carry binary). A body past what a 4 KiB frame can
+# hold is staged raw under /data/.vinx/tmp and sent as {bodyRef} (§6.8).
+# POST is implied by -d, as curl does it.
+body_json='{}'
+staged=
 if [ -n "$have_body" ]; then
+	src=
 	case "$body" in
 		@*)
-			f=${body#@}
-			[ -f "$f" ] || { echo "fetch: $f: no such file" >&2; exit 1; }
-			body_b64=$(base64 "$f" | tr -d '\n') ;;
-		*)
-			body_b64=$(printf '%s' "$body" | base64 | tr -d '\n') ;;
+			src=${body#@}
+			[ -f "$src" ] || { echo "fetch: $src: no such file" >&2; exit 1; }
+			;;
 	esac
+	if [ -n "$src" ]; then size=$(wc -c < "$src"); else size=${#body}; fi
+	if [ "$size" -gt 2000 ]; then
+		if ! grep -q ' /data 9p ' /proc/mounts; then
+			echo 'fetch: the body is too large for the wire and no /data mount can relay it' >&2
+			exit 1
+		fi
+		mkdir -p /data/.vinx/tmp || exit 1
+		staged="/data/.vinx/tmp/body-$$-$(date +%s).bin"
+		if [ -n "$src" ]; then cp -- "$src" "$staged" || exit 1
+		else printf '%s' "$body" > "$staged" || exit 1; fi
+		body_json=$(jq -cn --arg path "$staged" --argjson size "$(wc -c < "$staged")" \
+			'{bodyRef: {path: $path, size: $size}}')
+	else
+		if [ -n "$src" ]; then b64=$(base64 "$src" | tr -d '\n')
+		else b64=$(printf '%s' "$body" | base64 | tr -d '\n'); fi
+		body_json=$(jq -cn --arg b "$b64" '{bodyB64: $b}')
+	fi
 	[ -n "$method" ] || method=POST
 fi
 [ -n "$method" ] || method=GET
 
 payload=$(jq -cn \
 	--arg url "$url" --arg method "$method" --argjson headers "$hdrs" \
-	--arg bodyB64 "$body_b64" --argjson t $((tmo * 1000)) \
-	'{url: $url, method: $method, headers: $headers, timeoutMs: $t}
-	 + (if $bodyB64 != "" then {bodyB64: $bodyB64} else {} end)')
-reply=$(hostcall fetch "$payload" "$tmo") || exit 7
+	--argjson body "$body_json" --argjson t $((tmo * 1000)) \
+	'{url: $url, method: $method, headers: $headers, timeoutMs: $t} + $body')
+reply=$(printf '%s' "$payload" | rpc call http.fetch - -t $((tmo + 10)))
+rc=$?
+[ -n "$staged" ] && rm -f "$staged"
+[ "$rc" -eq 0 ] || exit 7
 
 if [ "$(printf '%s' "$reply" | jq -r '.ok')" != "true" ]; then
 	echo "fetch: $(printf '%s' "$reply" | jq -r '.error // "failed"')" >&2
@@ -95,12 +116,29 @@ if [ -n "$include" ]; then
 	echo
 fi
 
+# The body, wherever it is: a /data ref (consumed here), inline base64, or
+# inline text.
+emit_body() {
+	_fb_ref=$(printf '%s' "$reply" | jq -r '.bodyRef.path // empty')
+	if [ -n "$_fb_ref" ]; then
+		cat "$_fb_ref"
+		rm -f "$_fb_ref"
+		return
+	fi
+	_fb_b64=$(printf '%s' "$reply" | jq -r '.bodyB64 // empty')
+	if [ -n "$_fb_b64" ]; then
+		printf '%s' "$_fb_b64" | base64 -d
+		return
+	fi
+	printf '%s' "$reply" | jq -rj '.body // empty'
+}
+
 if [ -n "$out" ]; then
-	hostcall_body "$reply" > "$out"
+	emit_body > "$out"
 	sz=$(wc -c < "$out")
 	echo "fetch: HTTP $status, $sz bytes -> $out" >&2
 else
-	hostcall_body "$reply"
+	emit_body
 fi
 [ "$(printf '%s' "$reply" | jq -r '.truncated // empty')" = "true" ] \
 	&& echo "fetch: body truncated at 2 MB" >&2

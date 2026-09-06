@@ -107,6 +107,11 @@
 	color: var(--color-muted-foreground);
 	opacity: 0.7;
 }
+/* The note carrying a failed boot's reason: the wait will not end well. */
+.rp-note-err {
+	color: var(--color-destructive, #dc2626);
+	opacity: 0.9;
+}
 
 /* A non-zero exit rides in the header; make it read as a signal, not decor. */
 .rp-exit {

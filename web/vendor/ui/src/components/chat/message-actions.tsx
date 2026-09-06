@@ -2,6 +2,7 @@ import { useState, memo, type RefObject } from "react"
 import { Copy, Check, Download, Printer } from "lucide-react"
 import { Button } from "@agentchat/components/ui/button"
 import { copyToClipboard } from "@agentchat/lib/utils"
+import { deriveMessageTitle, saveMarkdownFile } from "@agentchat/lib/export"
 import { t } from "@agentchat/lib/i18n"
 
 interface MessageActionsProps {
@@ -10,28 +11,6 @@ interface MessageActionsProps {
   bodyRef: RefObject<HTMLElement>
   /** Save just this message's body to PDF (browser print dialog). */
   onExportPdf: (bodyEl: HTMLElement | null, title: string) => void
-}
-
-/**
- * A human-readable, filename-safe title for a single exported message: the
- * first non-empty line with markdown decoration stripped, truncated. Beats the
- * app brand ("Save as PDF" default) or an opaque timestamp as a file name.
- */
-function deriveMessageTitle(content: string): string {
-  const firstLine =
-    content
-      .split("\n")
-      .map((l) => l.trim())
-      .find((l) => l.length > 0) ?? ""
-  const plain = firstLine
-    .replace(/^#{1,6}\s+/, "") // heading marker
-    .replace(/^[>\-*+]\s+/, "") // quote / list marker
-    .replace(/[*_`~]/g, "") // emphasis / code marks
-    .replace(/[\\/:*?"<>|\n\r\t]+/g, " ") // filename-unsafe chars
-    .replace(/\s+/g, " ")
-    .trim()
-  const truncated = plain.length > 40 ? plain.slice(0, 40).trim() : plain
-  return truncated || "message"
 }
 
 export const MessageActions = memo(function MessageActions({ content, bodyRef, onExportPdf }: MessageActionsProps) {
@@ -47,13 +26,7 @@ export const MessageActions = memo(function MessageActions({ content, bodyRef, o
   }
 
   const handleSaveMd = () => {
-    const blob = new Blob([content], { type: "text/markdown" })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = `${deriveMessageTitle(content)}.md`
-    a.click()
-    URL.revokeObjectURL(url)
+    saveMarkdownFile(content, deriveMessageTitle(content))
     setSaved(true)
     setTimeout(() => setSaved(false), 1500)
   }

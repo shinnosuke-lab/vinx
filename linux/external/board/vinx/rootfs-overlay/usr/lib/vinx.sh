@@ -1,11 +1,11 @@
-# Shared by imgcat(1), download(1) and open(1): the guest half of the escape
-# pipe to the page. A file becomes one OSC sequence -- base64 payload, no
-# newlines (the page's parsers are strict RFC 4648) -- written straight to the
-# terminal, where the page-side handlers pick it up.
+# Shared by imgcat(1) -- the one tool still on the escape pipe (terminal
+# rendering, not a capability) -- and by open(1)/download(1) for the size
+# gate on what they stage into /data/.vinx/tmp for their resource.* calls.
 #
-# 2 MiB cap: the payload crosses the emulated UART byte by byte, and past a
-# couple of MB the wait stops feeling instant. Bigger things belong in /data
-# (the page mirrors it) or the agent's download_file tool (9p, no UART).
+# 2 MiB cap: imgcat's payload crosses the emulated UART byte by byte, and
+# past a couple of MB the wait stops feeling instant; the staged tools keep
+# the same ceiling so "too big" means one thing. Bigger things belong in
+# /data (the page mirrors it) or the agent's download_file tool.
 
 VINX_MAX=2097152
 

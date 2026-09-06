@@ -8,7 +8,8 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { fetchDeviceConfig, GatewayError, isLocalHost, resolveGateway } from '../src/device';
-import { deviceTools } from '../src/index';
+import { NO_MACHINE_PAYLOAD, VM_ENDPOINT } from '../src/device-vm';
+import { deviceTools, followPower } from '../src/index';
 
 const PAGE = 'http://assets.example.com';
 
@@ -168,5 +169,95 @@ describe('deviceTools', () => {
 		expect(fetched).toEqual(['http://10.0.0.5/api/tools?console=1']);
 		expect(installed).toEqual(['http://10.0.0.5/api/tools/call?console=1']);
 		vi.unstubAllGlobals();
+	});
+});
+
+// The in-page machine's tools follow its power (MountOptions.onPower): a
+// person who leaves the machine off has a model that is not offered a
+// shell, and is briefed to say so. These pin the bookkeeping — what the
+// engine is asked to install and remove, in what order, and that the
+// registry ends where the LAST event points however the replies land.
+describe('followPower', () => {
+	const payload = { tools: [{ name: 'run_shell' }, { name: 'read_file' }], system_prompt: 'a VM' };
+	const harness = () => {
+		const log: string[] = [];
+		const client = {
+			installTools: async (p: unknown, endpoint: string) => {
+				const names = ((p as { tools: { name: string }[] }).tools ?? []).map((t) => t.name);
+				log.push(`install ${names.join(',') || '(briefing)'} @${endpoint}`);
+				return names;
+			},
+			uninstallTools: async (names: string[]) => {
+				log.push(`uninstall ${names.join(',')}`);
+				return names;
+			},
+		};
+		let fire: (up: boolean) => void = () => {};
+		let unwatched = false;
+		const onPower = (listener: (up: boolean) => void) => {
+			fire = listener;
+			return () => {
+				unwatched = true;
+			};
+		};
+		return { log, client, onPower, fire: (up: boolean) => fire(up), unwatched: () => unwatched };
+	};
+
+	it('installs the tools when the machine is up from the start', async () => {
+		const h = harness();
+		const f = followPower(h.client, payload, h.onPower);
+		h.fire(true);
+		await f.settled();
+		expect(h.log).toEqual([`install run_shell,read_file @${VM_ENDPOINT}`]);
+		expect(f.names()).toEqual(['run_shell', 'read_file']);
+		expect(f.up()).toBe(true);
+	});
+
+	it('briefs a model beside a powered-off machine instead of arming it', async () => {
+		const h = harness();
+		const f = followPower(h.client, payload, h.onPower);
+		h.fire(false);
+		await f.settled();
+		expect(h.log).toEqual([`install (briefing) @${VM_ENDPOINT}`]);
+		expect(f.names()).toEqual([]);
+		expect(f.up()).toBe(false);
+		expect((NO_MACHINE_PAYLOAD as { system_prompt: string }).system_prompt).toMatch(/power/);
+	});
+
+	it('takes the tools back on power-off and re-arms on the next boot', async () => {
+		const h = harness();
+		const f = followPower(h.client, payload, h.onPower);
+		h.fire(true);
+		h.fire(false);
+		h.fire(true);
+		await f.settled();
+		expect(h.log).toEqual([
+			`install run_shell,read_file @${VM_ENDPOINT}`,
+			'uninstall run_shell,read_file',
+			`install (briefing) @${VM_ENDPOINT}`,
+			`install run_shell,read_file @${VM_ENDPOINT}`,
+		]);
+		expect(f.up()).toBe(true);
+	});
+
+	// vm.ts reports booting and ready as two events; both mean "up" to the
+	// toolbox, and the second must not install twice (the registry refuses
+	// duplicates loudly).
+	it('ignores repeats of the same state', async () => {
+		const h = harness();
+		const f = followPower(h.client, payload, h.onPower);
+		h.fire(true);
+		h.fire(true);
+		h.fire(false);
+		h.fire(false);
+		await f.settled();
+		expect(h.log).toEqual([
+			`install run_shell,read_file @${VM_ENDPOINT}`,
+			'uninstall run_shell,read_file',
+			`install (briefing) @${VM_ENDPOINT}`,
+		]);
+		expect(h.unwatched()).toBe(false);
+		f.unwatch();
+		expect(h.unwatched()).toBe(true);
 	});
 });

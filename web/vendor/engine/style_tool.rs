@@ -239,9 +239,11 @@ impl SetChatStyleTool {
             return Ok(Some(Vec::new()));
         }
         let Some(policy) = self.policy.as_ref().filter(|_| self.themes_dir.is_some()) else {
-            return Err("Error: theme assets are unavailable on this deployment. Use inline \
+            return Err(
+                "Error: theme assets are unavailable on this deployment. Use inline \
                         data: URIs or a CSS-only look."
-                .into());
+                    .into(),
+            );
         };
         let mut out = Vec::with_capacity(list.len());
         for item in list {
@@ -291,58 +293,58 @@ impl Tool for SetChatStyleTool {
     fn definition(&self) -> ToolDefinition {
         let mut properties = HashMap::from([
             (
-                        "css".into(),
-                        ToolParameter::string(
-                            "Complete CSS stylesheet to inject (replaces the previous one). \
+                "css".into(),
+                ToolParameter::string(
+                    "Complete CSS stylesheet to inject (replaces the previous one). \
                              Empty string resets the styling.",
-                        ),
-                    ),
-                    (
-                        "js".into(),
-                        ToolParameter::string(
-                            "Optional JavaScript effect script, executed as (egg) => { ... } \
+                ),
+            ),
+            (
+                "js".into(),
+                ToolParameter::string(
+                    "Optional JavaScript effect script, executed as (egg) => { ... } \
                              after the previous script is cleaned up. Omit or empty for \
                              CSS-only looks.",
-                        ),
-                    ),
-                    (
-                        "persist".into(),
-                        ToolParameter::boolean(
-                            "Save as the persistent theme (re-applied on every page load) — \
+                ),
+            ),
+            (
+                "persist".into(),
+                ToolParameter::boolean(
+                    "Save as the persistent theme (re-applied on every page load) — \
                              only when the user asks to keep it. persist with empty css+js \
                              deletes the saved theme. Default false: current page only.",
-                        )
-                        .with_default(serde_json::json!(false)),
-                    ),
-                    (
-                        "name".into(),
-                        ToolParameter::string(
-                            "ALWAYS provide: a short, human-friendly name for this look (2-4 \
+                )
+                .with_default(serde_json::json!(false)),
+            ),
+            (
+                "name".into(),
+                ToolParameter::string(
+                    "ALWAYS provide: a short, human-friendly name for this look (2-4 \
                              words, e.g. 'Cyberpunk Neon' or 'Ocean Calm'). It pre-fills the \
                              user's 'save this theme' button, and on persist:true it is the \
                              saved theme's slot/label (saving activates it; a new name keeps \
                              other saved themes for switching; omitting it on persist uses the \
                              'default' slot). 'active' is reserved.",
-                        ),
-                    ),
-                    (
-                        "description".into(),
-                        ToolParameter::string(
-                            "Persist-only: a short one-line label for the saved theme (e.g. \
+                ),
+            ),
+            (
+                "description".into(),
+                ToolParameter::string(
+                    "Persist-only: a short one-line label for the saved theme (e.g. \
                              'Midnight violet, cyan accents'). Ignored unless persist:true.",
-                        ),
-                    ),
-                    (
-                        "palette".into(),
-                        ToolParameter::array_of(
-                            "Persist-only: 3-5 representative colors of this theme as hex \
+                ),
+            ),
+            (
+                "palette".into(),
+                ToolParameter::array_of(
+                    "Persist-only: 3-5 representative colors of this theme as hex \
                              strings (e.g. ['#1a1230','#b48cff','#22d3ee']) for a swatch \
                              preview — report the final rendered colors, since the CSS uses \
                              indirected hsl(var(--egg-h) …) tokens. Ignored unless persist:true.",
-                            ToolParameter::string("hex color, e.g. #b48cff"),
-                        ),
-                    ),
-                ]);
+                    ToolParameter::string("hex color, e.g. #b48cff"),
+                ),
+            ),
+        ]);
         if self.assets_enabled() {
             properties.insert(
                 "assets".into(),
@@ -569,11 +571,7 @@ impl Tool for SetChatStyleTool {
                 .with_success(true);
         }
         let rules = css.matches('{').count();
-        let mut msg = format!(
-            "Applied {} bytes of CSS (~{} rules)",
-            css.len(),
-            rules
-        );
+        let mut msg = format!("Applied {} bytes of CSS (~{} rules)", css.len(), rules);
         if !js.trim().is_empty() {
             msg.push_str(&format!(" and {} bytes of JS", js.len()));
         }

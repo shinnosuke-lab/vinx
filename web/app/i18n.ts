@@ -141,13 +141,69 @@ const I18N: Record<string, Record<string, string>> = {
 
 		bootDownload: 'Fetching the machine image…',
 		bootKernel: 'Starting Linux…',
-		bootRestore: 'Waking the saved machine…',
 		bootSlow: 'Boot is slower than usual — showing the console output…',
 		bootPlayHint: 'space to play while you wait',
 		bootFailedTitle: 'The Linux VM did not start',
 		bootCopyDiag: 'Copy diagnostics',
 		bootCopied: 'Copied — paste it into a bug report',
 		bootRetry: 'Retry',
+
+		// The machine's boot as one line, wherever a surface waits on it
+		// (the capsule's tooltip, the Apps page, the run_shell card).
+		vmBootDownloading: 'Fetching the machine image… {0}% (about 22 MB the first time)',
+		vmBootStarting: 'Starting Linux… {0}%',
+		vmBootFailed: 'The Linux machine did not start: {0}',
+		vmBootFailedShort: 'The Linux machine did not start',
+		vmOff: 'The machine is powered off',
+		vmRetryBoot: 'Retry',
+		vmOpenConsole: 'Console',
+		vmStopBoot: 'Stop',
+		vmOffTitle: 'Power on this machine (the first boot downloads about 22 MB)',
+
+		// The first-visit question: whether to boot the machine at all. Asked
+		// once — either answer is the machine's remembered power from then on.
+		vmAskTitle: 'This page has a Linux machine',
+		vmAskBody:
+			'The agent uses it to run commands, keep files and install apps; pure web apps ' +
+			'do not need it. The first boot downloads about 22 MB (cached after that).',
+		vmAskBoot: 'Power on',
+		vmAskBootD: 'Boot now; the agent gets its shell and file tools as soon as the machine is up.',
+		vmAskSkip: 'Not now — web only',
+		vmAskSkipD: 'Chat and web apps work without it; the agent has no shell until you press the power key.',
+		vmAskNote:
+			'The machine stays the way you leave it: next time this page opens it is on or off ' +
+			'as you last left it. The power key at the bottom right changes that any time.',
+		vmAskLater: 'Power it on any time from the key at the bottom right.',
+		npConfirm: 'OK',
+
+		vmcPowerOn: 'Power on this machine (the console opens to show the boot)',
+		vmcPowerOff: 'Power off this machine',
+		vmcPowerOffBtn: 'Power off',
+		vmcPowerOffConfirm:
+			'Power off this machine? Anything outside /data is lost; /data survives.',
+		vmcPowerOffNext: 'It stays off the next time this page opens, until you press the power key.',
+		vmcTitle: 'vinx linux — this machine',
+		vmcScreenBtn: 'Screen (the machine’s VGA window)',
+		vmcClose: 'Close the console (the machine keeps running)',
+		vmcOpenBtn: 'Open terminal',
+		// The open_file card (open-file-tool.tsx).
+		ofOpen: 'Open {0}',
+		ofOpenTitle: 'Opens in a new browser tab',
+		ofLoading: 'Fetching {0}…',
+		ofGone: '{0} is no longer in the workspace.',
+		ofBlocked: 'The browser blocked the new tab — allow pop-ups for this page and click again.',
+		// The install_app card (install-app-tool.tsx).
+		iaInstalled: '{0} is installed — find it on the Apps page, or open it here.',
+		iaInstalledMachine: '{0} is installed on this machine.',
+		iaOpen: 'Open {0}',
+		iaOpenTitle: 'Opens the app in a window on this page',
+		iaAppsPage: 'Apps page',
+		iaGone: '{0} is no longer installed.',
+		vmcEphemeral: 'ephemeral',
+		vmcEphemeralTitle:
+			'Another tab already owns this machine’s identity: this one runs as an ' +
+			'ephemeral machine — /data was restored as usual, but nothing written here ' +
+			'is saved back. Explicit shares (share/local) still work.',
 	},
 	zh: {
 		npTitle: '网络',
@@ -263,13 +319,58 @@ const I18N: Record<string, Record<string, string>> = {
 
 		bootDownload: '正在下载系统镜像…',
 		bootKernel: '正在启动 Linux…',
-		bootRestore: '正在唤醒已保存的系统…',
 		bootSlow: '启动比平时慢,已显示控制台输出…',
 		bootPlayHint: '等待时按空格玩一局',
 		bootFailedTitle: 'Linux 虚拟机没有启动成功',
 		bootCopyDiag: '复制诊断信息',
 		bootCopied: '已复制 — 可直接粘贴反馈',
 		bootRetry: '重试',
+
+		vmBootDownloading: '正在下载系统镜像… {0}%(首次约 22 MB)',
+		vmBootStarting: '正在启动 Linux… {0}%',
+		vmBootFailed: 'Linux 机器没有启动成功:{0}',
+		vmBootFailedShort: 'Linux 机器没有启动成功',
+		vmOff: '机器已关机',
+		vmRetryBoot: '重试',
+		vmOpenConsole: '控制台',
+		vmStopBoot: '停止',
+		vmOffTitle: '开机(首次开机需下载约 22 MB)',
+
+		vmAskTitle: '这个页面里有一台 Linux 机器',
+		vmAskBody:
+			'agent 用它跑命令、存文件、装应用;纯 Web 应用不需要它。首次开机需下载约 22 MB 系统镜像,之后走浏览器缓存。',
+		vmAskBoot: '开机',
+		vmAskBootD: '现在启动;机器就位后 agent 即拥有 shell 和文件工具。',
+		vmAskSkip: '先不开,只用 Web',
+		vmAskSkipD: '聊天和 Web 应用不需要它;在你按下电源键之前 agent 没有 shell。',
+		vmAskNote: '机器会保持你最后一次的开关状态:下次打开页面时,它按你上次留下的样子开着或关着。随时可用右下角的电源键改变。',
+		vmAskLater: '随时可以从右下角的电源键开机。',
+		npConfirm: '确定',
+
+		vmcPowerOn: '开机(控制台会打开,显示启动过程)',
+		vmcPowerOff: '关机(停止本机)',
+		vmcPowerOffBtn: '关机',
+		vmcPowerOffConfirm: '关闭这台机器?/data 之外的内容将丢失;/data 会保留。',
+		vmcPowerOffNext: '下次打开页面时机器保持关机,直到你再按电源键。',
+		vmcTitle: 'vinx linux — 本机',
+		vmcScreenBtn: '屏幕(本机的 VGA 窗口)',
+		vmcClose: '关闭控制台(机器继续运行)',
+		vmcOpenBtn: '打开终端',
+		ofOpen: '打开 {0}',
+		ofOpenTitle: '在新标签页中打开',
+		ofLoading: '正在读取 {0}…',
+		ofGone: '{0} 已不在工作区里。',
+		ofBlocked: '浏览器拦截了新标签页——允许本页弹出窗口后再点一次。',
+		iaInstalled: '{0} 已安装——在应用页可以找到,也可以在这里打开。',
+		iaInstalledMachine: '{0} 已安装到本机。',
+		iaOpen: '打开 {0}',
+		iaOpenTitle: '在本页的窗口中打开这个应用',
+		iaAppsPage: '应用页',
+		iaGone: '{0} 已不再安装。',
+		vmcEphemeral: '临时机',
+		vmcEphemeralTitle:
+			'另一个标签页已持有这台机器的身份:本标签页以临时机运行 — ' +
+			'/data 照常恢复,但这里写入的内容不会存回存档;share/local 分享不受影响。',
 	},
 };
 

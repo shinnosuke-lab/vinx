@@ -816,7 +816,10 @@ fn resolve_icon(dir: &Path, declared: Option<&str>) -> Option<PathBuf> {
 /// exist (callers check `is_file()` first). Rejects `..` traversal + symlink
 /// escapes.
 fn is_within(base: &Path, path: &Path) -> bool {
-    match (crate::vfs::canonicalize(base), crate::vfs::canonicalize(path)) {
+    match (
+        crate::vfs::canonicalize(base),
+        crate::vfs::canonicalize(path),
+    ) {
         (Ok(b), Ok(p)) => p.starts_with(b),
         _ => false,
     }

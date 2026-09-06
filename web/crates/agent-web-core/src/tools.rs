@@ -110,7 +110,9 @@ impl CallOutcome {
             // so keep it next to the error rather than choosing one.
             let error = self.error.unwrap_or_else(|| "the tool failed".into());
             match self.output.filter(|o| !o.is_empty()) {
-                Some(output) => ToolResult::text(format!("{error}\n\noutput before the failure:\n{output}")),
+                Some(output) => {
+                    ToolResult::text(format!("{error}\n\noutput before the failure:\n{output}"))
+                }
                 None => ToolResult::text(error),
             }
         };
@@ -145,7 +147,11 @@ fn absolute(endpoint: &str) -> String {
     format!("{}{}", origin.trim_end_matches('/'), endpoint)
 }
 
-pub fn install(registry: &Arc<ToolRegistry>, payload: ToolsPayload, endpoint: String) -> Vec<String> {
+pub fn install(
+    registry: &Arc<ToolRegistry>,
+    payload: ToolsPayload,
+    endpoint: String,
+) -> Vec<String> {
     let (tx, rx) = mpsc::unbounded_channel::<ToolCall>();
     let mut registered = Vec::new();
 
@@ -212,10 +218,14 @@ async fn invoke(
 
     match serde_json::from_str::<CallOutcome>(&text) {
         Ok(outcome) => outcome.into_result(),
-        Err(_) if !status.is_success() => {
-            failure(format!("the gateway answered HTTP {status}: {}", trim(&text)))
-        }
-        Err(e) => failure(format!("the gateway's reply was not valid JSON ({e}): {}", trim(&text))),
+        Err(_) if !status.is_success() => failure(format!(
+            "the gateway answered HTTP {status}: {}",
+            trim(&text)
+        )),
+        Err(e) => failure(format!(
+            "the gateway's reply was not valid JSON ({e}): {}",
+            trim(&text)
+        )),
     }
 }
 

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { Check, ChevronDown, Gauge, Sparkles } from "lucide-react"
+import { Check, ChevronDown, Gauge, Layers, SlidersHorizontal, Sparkles, Zap } from "lucide-react"
 import { cn } from "@agentchat/lib/utils"
 import { t } from "@agentchat/lib/i18n"
+import type { CatalogParameterDefinition } from "@agentchat/client"
 
 interface ProviderInfo {
   name: string
@@ -114,22 +115,51 @@ interface ModelBadgeProps {
   disabled?: boolean
 }
 
-interface EffortBadgeProps {
-  /** The `reasoning_effort` levels the current model accepts. Empty hides the
-   *  badge entirely — the model takes no effort parameter. */
-  levels: string[]
+/** `extra high` → `Extra High`, `low` → `Low`; leaves `300k`-style tokens
+ *  and already-cased text (`Max`) intact. */
+function titleCase(s: string): string {
+  return s.replace(/\b[a-z]/g, (c) => c.toUpperCase())
+}
+
+interface TuningBadgeProps {
+  /** Catalog parameter definitions of the current model (may be empty). */
+  parameterDefinitions?: CatalogParameterDefinition[]
+  /** Selected parameter values by definition id ("" / absent = default). */
+  selectedParameters?: Record<string, string>
+  onSelectParameter?: (id: string, value: string) => void
+  /** Whether the current model supports a max mode (shows the toggle row). */
+  supportsMaxMode?: boolean
+  maxMode?: boolean
+  onToggleMaxMode?: (on: boolean) => void
+  /** Legacy `reasoning_effort` levels (openai-style backends). Rendered as its
+   *  own section when the model has no catalog parameter definitions. */
+  effortLevels?: string[]
   /** Currently selected effort ("" = the provider default). */
-  selected: string
-  /** The provider's server-side default level (labels the "default" row). */
+  selectedEffort?: string
+  /** The provider's server-side default level (labels the "default" chip). */
   defaultEffort?: string | null
-  /** Called with the chosen level ("" = back to default). */
-  onSelect?: (effort: string) => void
+  onSelectEffort?: (effort: string) => void
   disabled?: boolean
 }
 
-/** Reasoning-effort switcher next to the model badge. Options come from the
- *  model's capability record; hidden when the model has no adjustable effort. */
-export function EffortBadge({ levels, selected, defaultEffort, onSelect, disabled }: EffortBadgeProps) {
+/** One compact icon button bundling every per-turn model tuning control —
+ *  catalog parameter definitions (Reasoning/Context…), the max-mode toggle and
+ *  the legacy reasoning-effort switcher — into a single popup with grouped
+ *  sections, instead of a row of separate chips that overflows the toolbar.
+ *  The popup stays open while values are adjusted; outside click / Esc closes. */
+export function TuningBadge({
+  parameterDefinitions = [],
+  selectedParameters = {},
+  onSelectParameter,
+  supportsMaxMode,
+  maxMode,
+  onToggleMaxMode,
+  effortLevels = [],
+  selectedEffort = "",
+  defaultEffort,
+  onSelectEffort,
+  disabled,
+}: TuningBadgeProps) {
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
 
@@ -149,64 +179,181 @@ export function EffortBadge({ levels, selected, defaultEffort, onSelect, disable
     }
   }, [open])
 
-  if (levels.length === 0 || !onSelect) return null
+  const hasParameters = parameterDefinitions.length > 0 && !!onSelectParameter
+  // The effort section only appears when the model has no catalog parameters:
+  // catalog models express reasoning via their parameters, mixing both would be noise.
+  const hasEffort = !hasParameters && effortLevels.length > 0 && !!onSelectEffort
+  // The explicit max toggle also hides once parameter definitions exist: in
+  // the parameter world max mode is a property of the chosen tuple (the catalog's
+  // own picker has no separate switch either — `effort=max` / `context=1m`
+  // simply land on a max variant, which the backend derives server-side).
+  const hasMax = !hasParameters && !!supportsMaxMode && !!onToggleMaxMode
+  if (!hasParameters && !hasEffort && !hasMax) return null
 
-  const defaultLabel = defaultEffort
-    ? `${t("effortDefault")} (${defaultEffort})`
-    : t("effortDefault")
-  const badgeLabel = selected || t("effortDefault")
+  // Anything off-default? → mark the trigger so the state stays visible even
+  // with the popup closed.
+  const tuned =
+    (hasParameters && parameterDefinitions.some((d) => selectedParameters[d.id]?.trim())) ||
+    (hasEffort && !!selectedEffort) ||
+    (hasMax && !!maxMode)
+
+  const sectionIcon = (id: string) =>
+    id === "context" ? Layers : id === "reasoning" || id === "thinking" ? Zap : Gauge
+
+  /** Chip text for a raw parameter value. Boolean parameters read as a
+   *  switch — Off / On — whatever the catalog ships (the wire values `false`
+   *  / `true` read as code, and e.g. `fast` names only its `true` side, so
+   *  using displayName there would give an asymmetric `false | Fast`; the
+   *  section header already says what is being switched). Enum values use
+   *  the catalog's `displayName` (`300K`, `Extra High`), falling back to
+   *  Title Case of the raw value. */
+  const chipLabel = (def: CatalogParameterDefinition, value: string) => {
+    if (def.kind === "boolean" || value === "true" || value === "false") {
+      return value === "true" ? t("tuningOn") : t("tuningOff")
+    }
+    const v = def.values.find((x) => x.value === value)
+    return v?.displayName?.trim() ? v.displayName : titleCase(value)
+  }
+
+  const chip = (selected: boolean) =>
+    cn(
+      "whitespace-nowrap rounded-sm border px-1.5 py-0.5 text-[11px] leading-4 transition-colors",
+      selected
+        ? "border-primary/40 bg-primary/15 text-primary"
+        : "border-border text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+    )
 
   return (
     <div ref={rootRef} className="relative">
       <button
         type="button"
         disabled={disabled}
-        aria-haspopup="listbox"
+        aria-haspopup="menu"
         aria-expanded={open}
-        title={t("effortBadgeHint")}
+        title={t("tuningBadgeHint")}
         onClick={() => setOpen((v) => !v)}
         className={cn(
-          "flex h-6 items-center gap-1 rounded-sm px-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground",
+          "relative flex h-6 items-center gap-0.5 rounded-sm px-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground",
           "disabled:cursor-not-allowed disabled:opacity-50",
+          open && "bg-muted/50 text-foreground",
         )}
       >
-        <Gauge className="h-3.5 w-3.5 shrink-0" />
-        <span className="truncate">{badgeLabel}</span>
+        <SlidersHorizontal className="h-3.5 w-3.5 shrink-0" />
         <ChevronDown className="h-3 w-3 shrink-0 opacity-60" />
+        {tuned && (
+          <span className="animate-pop-in absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-primary" />
+        )}
       </button>
 
       {open && (
         <div
-          className="absolute bottom-full left-0 z-30 mb-2 w-52 overflow-hidden rounded-md border border-border bg-card shadow-md animate-in fade-in-0 zoom-in-95 duration-100"
-          role="listbox"
+          data-side="top"
+          className="acc-pop absolute bottom-full left-0 z-30 mb-2 min-w-60 max-w-[26rem] overflow-hidden rounded-md border border-border bg-card shadow-md"
+          role="menu"
         >
-          <ul className="py-1">
-            {["", ...levels].map((level) => {
-              const isSelected = level === selected
-              return (
-                <li key={level || "__default"}>
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected={isSelected}
-                    onClick={() => {
-                      onSelect(level)
-                      setOpen(false)
-                    }}
+          {/* `w-max` lets the widest chip row size the popup (up to max-w) so
+              rows stay on one line where possible; `flex-wrap` still catches
+              a catalog with many values. */}
+          <div className="w-max min-w-60 max-w-[26rem] max-h-72 overflow-y-auto py-1">
+            {hasParameters &&
+              parameterDefinitions.map((def) => {
+                const Icon = sectionIcon(def.id)
+                const selected = selectedParameters[def.id] ?? ""
+                return (
+                  <div key={def.id} className="px-2.5 py-1.5">
+                    <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/80">
+                      <Icon className="h-3 w-3" />
+                      {def.name?.trim() || def.id}
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {def.values.map((v) => {
+                        const isSelected = v.value === selected
+                        return (
+                          <button
+                            key={v.value}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={isSelected}
+                            onClick={() =>
+                              // Re-clicking the active chip clears back to the
+                              // model default ("" = don't send this parameter).
+                              onSelectParameter?.(def.id, isSelected ? "" : v.value)
+                            }
+                            className={chip(isSelected)}
+                          >
+                            {chipLabel(def, v.value)}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )
+              })}
+
+            {hasEffort && (
+              <div className="px-2.5 py-1.5">
+                <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/80">
+                  <Gauge className="h-3 w-3" />
+                  {t("effortBadgeHint")}
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {["", ...effortLevels].map((level) => {
+                    const isSelected = level === selectedEffort
+                    const label = level
+                      ? titleCase(level)
+                      : defaultEffort
+                        ? `${t("effortDefault")} (${titleCase(defaultEffort)})`
+                        : t("effortDefault")
+                    return (
+                      <button
+                        key={level || "__default"}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={isSelected}
+                        onClick={() => onSelectEffort?.(level)}
+                        className={chip(isSelected)}
+                      >
+                        {label}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {hasMax && (
+              <>
+                {(hasParameters || hasEffort) && (
+                  <div className="mx-2.5 my-1 border-t border-border/60" />
+                )}
+                <button
+                  type="button"
+                  role="menuitemcheckbox"
+                  aria-checked={!!maxMode}
+                  onClick={() => onToggleMaxMode?.(!maxMode)}
+                  className="flex w-full items-center justify-between px-2.5 py-1.5 text-xs text-foreground transition-colors hover:bg-muted/60"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <Sparkles className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    {t("tuningMaxMode")}
+                  </span>
+                  <span
                     className={cn(
-                      "flex w-full items-center gap-2 px-2 py-1.5 text-left text-xs transition-colors hover:bg-muted/60",
-                      isSelected && "bg-muted/40",
+                      "relative h-3.5 w-6 rounded-full transition-colors",
+                      maxMode ? "bg-primary" : "bg-muted-foreground/30",
                     )}
                   >
-                    <span className="min-w-0 flex-1 truncate">
-                      {level || defaultLabel}
-                    </span>
-                    {isSelected && <Check className="h-3.5 w-3.5 shrink-0 text-primary" />}
-                  </button>
-                </li>
-              )
-            })}
-          </ul>
+                    <span
+                      className={cn(
+                        "absolute top-0.5 h-2.5 w-2.5 rounded-full bg-card transition-transform",
+                        maxMode ? "translate-x-3" : "translate-x-0.5",
+                      )}
+                    />
+                  </span>
+                </button>
+              </>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -302,7 +449,8 @@ export function ModelBadge({
 
       {open && (
         <div
-          className="absolute bottom-full left-0 z-30 mb-2 w-64 max-w-[calc(100vw-2rem)] overflow-hidden rounded-md border border-border bg-card shadow-md animate-in fade-in-0 zoom-in-95 duration-100"
+          data-side="top"
+          className="acc-pop absolute bottom-full left-0 z-30 mb-2 w-64 max-w-[calc(100vw-2rem)] overflow-hidden rounded-md border border-border bg-card shadow-md"
           role="listbox"
         >
           {showFilter && (

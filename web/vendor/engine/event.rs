@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ChatMessage, RiskLevel};
+use crate::types::{ChatMessage, RiskLevel, TokenUsage};
 
 /// One selectable option inside an `AskQuestion`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,10 +95,18 @@ pub enum AgentEvent {
 
     /// An event from a sub-agent (`task` tool call), wrapped so channels can
     /// tell child output from parent output. `task_id` is the parent `task`
-    /// tool_call id. Child `ConfirmTool` events are the exception — they are
-    /// forwarded unwrapped (see `agent_task`) so confirm UIs work untouched.
+    /// tool_call id; `session_id` is the child's hidden transcript session
+    /// (`task-<uuid>`), so delivery layers can mirror child events onto a
+    /// live view of that session; `label` is the task's human-readable name
+    /// (its `description` argument), riding every envelope so a viewer that
+    /// never saw the parent round's tool_start (e.g. a re-attach whose replay
+    /// was trimmed) can still title the progress row. Child `ConfirmTool`
+    /// events are the exception — they are forwarded unwrapped (see
+    /// `agent_task`) so confirm UIs work untouched.
     Subagent {
         task_id: String,
+        session_id: String,
+        label: String,
         event: Box<AgentEvent>,
     },
 
@@ -135,6 +143,14 @@ pub enum AgentEvent {
     AssistantDone {
         elapsed_ms: u64,
     },
+    /// Token accounting for ONE LLM round (a turn with tool calls emits
+    /// several), straight from the provider's `usage` report. Emitted only
+    /// when the provider reported one. `model` is the model the round was
+    /// sent to. Sinks use it for per-session counters; ignoring it is fine.
+    Usage {
+        model: String,
+        usage: TokenUsage,
+    },
     Error(String),
     SessionSync {
         new_messages: Vec<ChatMessage>,
@@ -151,7 +167,14 @@ pub enum AgentEvent {
     ProfileSwitch(String),
 
     // Status
-    StatusUpdate(String),
+    /// A one-line note to the user about what the loop itself is doing, apart
+    /// from the model's output ("Compacting context..."). `pending` marks
+    /// work in flight that the NEXT `StatusUpdate` resolves: a sink shows it
+    /// as the current activity and lets that next note replace it, so the
+    /// transcript keeps the outcome rather than the wait. A note with
+    /// `pending: false` is such an outcome (or a standalone remark) and
+    /// stays.
+    StatusUpdate { text: String, pending: bool },
 
     // Optional rich rendering (channels can ignore)
     RenderBarChart {
@@ -229,7 +252,9 @@ impl From<bool> for ConfirmResponse {
 /// User's response to an `AskUser` event.
 #[derive(Debug, Clone)]
 pub enum AskUserResponse {
-    Answered { answers: Vec<AskAnswer> },
+    Answered {
+        answers: Vec<AskAnswer>,
+    },
     Cancelled,
     /// Not an answer: the user is interacting with the pending question
     /// (selecting options, typing a custom reply). Resets the unattended
@@ -240,8 +265,14 @@ pub enum AskUserResponse {
 
 /// Serialize the user's answers (matched against `questions` by `question_id`)
 /// into the structured JSON tool_result the LLM consumes:
-/// `{ cancelled, auto_picked, answers: [{ question_id, question, selected_ids,
-/// selected_labels, custom_text? }] }`.
+/// `{ cancelled, auto_picked, note?, answers: [{ question_id, question,
+/// selected_ids, selected_labels, custom_text? }] }`.
+///
+/// `note` appears only with `auto_picked: true`, and says in words what the
+/// flag means: a model reading `selected_labels: ["Images"]` next to a bare
+/// boolean it was never told about has answered "understood — it's the
+/// images" and built a feature nobody asked for. The sentence travels with
+/// the data so it cannot be missed.
 pub(crate) fn build_ask_user_payload(
     questions: &[AskQuestion],
     answers: &[AskAnswer],
@@ -293,6 +324,83 @@ pub(crate) fn build_ask_user_payload(
     let mut root = serde_json::Map::new();
     root.insert("cancelled".into(), serde_json::Value::Bool(cancelled));
     root.insert("auto_picked".into(), serde_json::Value::Bool(auto_picked));
+    if auto_picked {
+        root.insert(
+            "note".into(),
+            serde_json::Value::String(
+                "The user did not answer: the session is unattended and these are the \
+                 default options, filled in after a timeout — not their choice. Treat them \
+                 as your own guess: say what you assumed, keep the work that rests on it \
+                 small and reversible, and for a question about what they actually want, \
+                 prefer to stop and ask in prose over committing to a large piece of work."
+                    .into(),
+            ),
+        );
+    }
     root.insert("answers".into(), serde_json::Value::Array(items));
     serde_json::Value::Object(root).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_question() -> Vec<AskQuestion> {
+        vec![AskQuestion {
+            id: "q".into(),
+            question: "Which?".into(),
+            options: vec![
+                AskOption {
+                    id: "a".into(),
+                    label: "A".into(),
+                    hint: None,
+                },
+                AskOption {
+                    id: "b".into(),
+                    label: "B".into(),
+                    hint: None,
+                },
+            ],
+            allow_custom: false,
+            multi_select: false,
+            default_id: None,
+        }]
+    }
+
+    /// The flag alone was read as an answer once; the sentence rides along.
+    #[test]
+    fn an_auto_pick_says_so_in_words() {
+        let answers = vec![AskAnswer {
+            question_id: "q".into(),
+            selected_ids: vec!["a".into()],
+            custom_text: None,
+        }];
+        let picked: serde_json::Value = serde_json::from_str(&build_ask_user_payload(
+            &one_question(),
+            &answers,
+            false,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(picked["auto_picked"], true);
+        let note = picked["note"]
+            .as_str()
+            .expect("a note travels with an auto-pick");
+        assert!(note.contains("did not answer"), "{note}");
+        assert!(note.contains("not their choice"), "{note}");
+        assert_eq!(picked["answers"][0]["selected_labels"][0], "A");
+
+        let answered: serde_json::Value = serde_json::from_str(&build_ask_user_payload(
+            &one_question(),
+            &answers,
+            false,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(answered["auto_picked"], false);
+        assert!(
+            answered.get("note").is_none(),
+            "a real answer carries no note: {answered}"
+        );
+    }
 }

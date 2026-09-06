@@ -65,11 +65,7 @@ impl BridgedTool {
         risk: RiskLevel,
         tx: mpsc::UnboundedSender<ToolCall>,
     ) -> Self {
-        BridgedTool::new(
-            ToolDefinition::new(name, description, parameters),
-            risk,
-            tx,
-        )
+        BridgedTool::new(ToolDefinition::new(name, description, parameters), risk, tx)
     }
 }
 

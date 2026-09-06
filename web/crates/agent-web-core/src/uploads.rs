@@ -66,7 +66,9 @@ pub fn valid_id(id: &str) -> bool {
     stem.len() == 32
         && stem.chars().all(|c| c.is_ascii_hexdigit())
         && (1..=8).contains(&ext.len())
-        && ext.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && ext
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 /// A non-image's extension, taken from its original name: lowercase
@@ -122,7 +124,12 @@ pub struct Stored {
 /// between them they decide the extension, and the extension decides
 /// everything else.
 pub fn store(name: &str, mime: &str, body: &[u8]) -> Result<Stored, Refused> {
-    let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     if body.is_empty() {
         return Err(Refused::bad("empty body"));
     }
@@ -155,7 +162,9 @@ pub fn store(name: &str, mime: &str, body: &[u8]) -> Result<Stored, Refused> {
 
 /// Read an upload back, for `GET /api/chat/upload/{id}`.
 pub fn load(id: &str) -> Option<Vec<u8>> {
-    valid_id(id).then(|| crate::vfs::read(path_of(id)).ok()).flatten()
+    valid_id(id)
+        .then(|| crate::vfs::read(path_of(id)).ok())
+        .flatten()
 }
 
 /// Turn the references riding a message into attachments the engine can use.
@@ -173,10 +182,7 @@ pub fn resolve(refs: Vec<Attachment>) -> Vec<Attachment> {
                 return None;
             }
             match crate::vfs::metadata(path_of(&r.id)) {
-                Ok(m) if m.is_file() => Some(Attachment {
-                    size: m.len(),
-                    ..r
-                }),
+                Ok(m) if m.is_file() => Some(Attachment { size: m.len(), ..r }),
                 _ => {
                     log::warn!("attachment dropped (no longer in the workspace): {}", r.id);
                     None

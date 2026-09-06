@@ -16,6 +16,7 @@ import { ThemesPage } from "./components/themes/themes-page"
 import { ConfirmDialogHost } from "./components/ui/confirm-dialog"
 import { ConnectionBanner } from "./components/shared/connection-banner"
 import { Toaster, toast } from "./components/ui/toast"
+import { useAttention } from "./lib/alerts"
 import { setLabels, setLanguage, t } from "./lib/i18n"
 import { themeToCssVars } from "./lib/theme"
 import { cn, useMediaQuery, MOBILE_QUERY, MEDIUM_QUERY } from "./lib/utils"
@@ -99,6 +100,17 @@ function viewToHash(view: ShellView, sessionId: string | null): string {
   }
 }
 
+/** i18n label key per non-chat view for the tab title (same copy as the nav rail). */
+const VIEW_LABEL_KEY: Record<ShellView, string> = {
+  chat: "newChat",
+  sessions: "sessions",
+  skills: "skills",
+  apps: "apps",
+  releases: "releasesNav",
+  themes: "themesNav",
+  config: "settings",
+}
+
 interface AgentMeta {
   brand?: string
   logo?: string
@@ -179,6 +191,10 @@ export function CopilotApp({
   const [sessionsRefresh, setSessionsRefresh] = useState(0)
   const [meta, setMeta] = useState<AgentMeta | null>(() => readBrandingCache(basePath))
   const [metaLoaded, setMetaLoaded] = useState(false)
+  // Title of the conversation currently shown in the chat (`''` = new chat),
+  // reported by AgentChat; feeds the tab title so open tabs are telling apart.
+  const [chatTitle, setChatTitle] = useState("")
+  const attention = useAttention()
 
   const client = useMemo(() => createChatClient(basePath), [basePath])
 
@@ -328,14 +344,21 @@ export function CopilotApp({
     link.href = effectiveFavicon
   }, [effectiveFavicon])
 
-  // Keep the tab title in sync with the brand. When the host configured no
-  // brand, fall back to the default identity once meta has loaded (avoids
-  // clobbering the title while /api/chat/meta resolves).
+  // Keep the tab title in sync with what is on screen: `<session> · <brand>`
+  // in the chat (untitled/new chat = `<New chat> · <brand>`), `<page> · <brand>`
+  // elsewhere, so several open tabs can be told apart at a glance. When the
+  // host configured no brand, fall back to the default identity once meta has
+  // loaded (avoids clobbering the title while /api/chat/meta resolves).
   useEffect(() => {
     if (typeof document === "undefined") return
-    const title = effectiveBrand ?? (metaLoaded ? t("vinxAgent") : undefined)
-    if (title) document.title = title
-  }, [effectiveBrand, metaLoaded])
+    const brandTitle = effectiveBrand ?? (metaLoaded ? t("defaultBrand") : undefined)
+    if (!brandTitle) return
+    const context = view === "chat" ? chatTitle || t("newChat") : t(VIEW_LABEL_KEY[view])
+    // `●` while a background tab has an unseen turn end / decision point:
+    // the one glance at the tab bar that says which session wants you.
+    const badge = attention ? "● " : ""
+    document.title = badge + (context ? `${context} · ${brandTitle}` : brandTitle)
+  }, [effectiveBrand, metaLoaded, view, chatTitle, attention])
 
   const handleNewChat = useCallback(() => {
     chatRef.current?.newChat()
@@ -350,6 +373,16 @@ export function CopilotApp({
     setActiveSessionId(id)
     setSessionsRefresh((n) => n + 1)
   }, [])
+
+  // The chat stays mounted while other views are shown, so its sidebar list
+  // never sees archive / restore / delete / pin edits made on the sessions
+  // page. Re-sync it each time the chat view comes back into view.
+  const prevViewRef = useRef<ShellView>(view)
+  useEffect(() => {
+    const prev = prevViewRef.current
+    prevViewRef.current = view
+    if (view === "chat" && prev !== "chat") chatRef.current?.refreshSessions?.()
+  }, [view])
 
   // URL → state: on mount (deep link, incl. a shared `#/chat/<id>`) and on
   // back/forward navigation.
@@ -489,6 +522,7 @@ export function CopilotApp({
           labels={labels}
           hideSidebar
           onSessionChange={handleSessionChange}
+          onTitleChange={setChatTitle}
           onBack={isNarrow ? undefined : () => setView("sessions")}
           sessionHref={(id) => viewToHash("chat", id)}
         />

@@ -63,7 +63,7 @@ export function portalContainer(): HTMLElement {
  * where `navigator.clipboard` is undefined (only localhost/HTTPS get it), so
  * a direct `navigator.clipboard.writeText` silently breaks every copy button
  * in production while working in local dev. Falls back to the classic hidden
- * textarea + `execCommand("copy")` (same approach as OnTrakBridge).
+ * textarea + `execCommand("copy")`.
  */
 export async function copyToClipboard(text: string): Promise<boolean> {
   if (navigator.clipboard?.writeText) {

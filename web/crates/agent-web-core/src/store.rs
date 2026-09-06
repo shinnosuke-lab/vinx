@@ -41,7 +41,50 @@ pub struct SessionSummary {
     pub created_at: String,
     pub updated_at: String,
     pub message_count: i64,
+    /// When the session was archived (RFC 3339); `None` = live. Archived
+    /// sessions are excluded from [`SessionScope::Active`] listings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    /// User-assigned category (free text, trimmed); `None` = uncategorised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
+
+/// Which sessions [`SessionStore::list_scoped`] returns — the `scope` query
+/// parameter of `GET /api/sessions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionScope {
+    /// Live sessions only (`archived_at IS NULL`) — the default everywhere.
+    Active,
+    /// Archived sessions only.
+    Archived,
+    /// Both.
+    All,
+}
+
+impl SessionScope {
+    /// Parse the `scope` query parameter; `None` for anything unknown.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "archived" => Some(Self::Archived),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn sql_filter(self) -> &'static str {
+        match self {
+            Self::Active => "AND s.archived_at IS NULL",
+            Self::Archived => "AND s.archived_at IS NOT NULL",
+            Self::All => "",
+        }
+    }
+}
+
+/// Longest accepted session category (characters). Categories are labels
+/// for grouping the list, not descriptions.
+pub const MAX_CATEGORY_CHARS: usize = 64;
 
 /// One result of [`SessionStore::search`]: a session whose user/assistant
 /// messages cover every query term.
@@ -72,6 +115,16 @@ const SEARCH_SNIPPET_RADIUS: usize = 60;
 
 /// Session detail: title, timestamps, active skill, and the non-system history.
 pub type SessionDetail = (String, String, String, Option<String>, Vec<ChatMessage>);
+
+/// Organisation flags of one session, off the listing row: pin state,
+/// archive stamp and category. What the session detail's `meta` carries so
+/// a resumed session shows them without a second trip through the list.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionFlags {
+    pub pinned: bool,
+    pub archived_at: Option<String>,
+    pub category: Option<String>,
+}
 
 /// Last timestamp handed out, in microseconds since the epoch.
 static LAST_MICROS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -139,7 +192,10 @@ impl SessionStore {
                  origin TEXT NOT NULL DEFAULT 'web',
                  active_skill TEXT,
                  created_at TEXT NOT NULL,
-                 updated_at TEXT NOT NULL
+                 updated_at TEXT NOT NULL,
+                 archived_at TEXT,
+                 category TEXT,
+                 full_auto INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS messages (
                  session_id TEXT NOT NULL,
@@ -178,6 +234,16 @@ impl SessionStore {
         );
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN active_skill TEXT", &[]);
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT", &[]);
+        // Archive stamp (NULL = live) and user-assigned category (NULL =
+        // uncategorised), both from the xcore sync; see `set_archived`.
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN archived_at TEXT", &[]);
+        let _ = conn.execute("ALTER TABLE sessions ADD COLUMN category TEXT", &[]);
+        // Full-auto persisted per session so the badge survives a reload; see
+        // `set_full_auto`.
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN full_auto INTEGER NOT NULL DEFAULT 0",
+            &[],
+        );
         Ok(SessionStore {
             conn: RefCell::new(conn),
         })
@@ -203,7 +269,7 @@ impl SessionStore {
                      (id, title, pinned, origin, active_skill, created_at, updated_at)
                  VALUES (?1, '', 0, ?3, ?4, ?2, ?2)
                  ON CONFLICT(id) DO UPDATE
-                     SET updated_at=?2, active_skill=?4",
+                     SET updated_at=?2, active_skill=?4, archived_at=NULL",
                 &[
                     id.into(),
                     now.clone().into(),
@@ -403,14 +469,39 @@ impl SessionStore {
     ///
     /// Deliberately not part of `save`: `save` rewrites the whole message table,
     /// which is exactly what must *not* happen at the start of a turn.
-    pub fn touch(&self, id: &str, origin: &str) -> Result<()> {
+    ///
+    /// Sending to an archived session revives it, the same as `save` does, so
+    /// it is back in the live list the moment the turn starts. `full_auto` is
+    /// the session's current flag; writing it here is what persists a toggle
+    /// flipped before the first turn, when there was no row to update yet.
+    pub fn touch(&self, id: &str, origin: &str, full_auto: bool) -> Result<()> {
         let now = now_rfc3339();
         self.conn.borrow().execute(
             "INSERT INTO sessions
-                 (id, title, pinned, origin, active_skill, created_at, updated_at)
-             VALUES (?1, '', 0, ?3, NULL, ?2, ?2)
-             ON CONFLICT(id) DO UPDATE SET updated_at=?2",
-            &[id.into(), now.into(), origin.into()],
+                 (id, title, pinned, origin, active_skill, created_at, updated_at, full_auto)
+             VALUES (?1, '', 0, ?3, NULL, ?2, ?2, ?4)
+             ON CONFLICT(id) DO UPDATE
+                 SET updated_at=?2, archived_at=NULL, full_auto=?4",
+            &[id.into(), now.into(), origin.into(), (full_auto as i64).into()],
+        )
+    }
+
+    /// Whether the session was left in full-auto; `false` for a session the
+    /// store has never seen.
+    pub fn full_auto(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare("SELECT full_auto FROM sessions WHERE id=?1")?;
+        stmt.bind(&[id.into()])?;
+        Ok(stmt.row(|r| r.int(0) != 0)?.unwrap_or(false))
+    }
+
+    /// Persist the full-auto flag so it survives a reload. A session with no
+    /// row yet (flag flipped before the first turn) is not created here;
+    /// [`SessionStore::touch`] writes the flag when the first turn creates it.
+    pub fn set_full_auto(&self, id: &str, full_auto: bool) -> Result<()> {
+        self.conn.borrow().execute(
+            "UPDATE sessions SET full_auto=?2 WHERE id=?1",
+            &[id.into(), (full_auto as i64).into()],
         )
     }
 
@@ -450,7 +541,12 @@ impl SessionStore {
     /// summary stays findable. Archived snippets carry an `[archived]`
     /// prefix. No dedup is needed — each archive generation holds exactly the
     /// rows that were removed from the live table.
-    pub fn search(&self, query: &str, limit: usize, exclude_id: Option<&str>) -> Result<Vec<SearchHit>> {
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        exclude_id: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
         let raw_terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
         let limit = limit.max(1);
         let conn = self.conn.borrow();
@@ -489,7 +585,10 @@ impl SessionStore {
                 i = i + 2
             ));
         }
-        sql.push_str(&format!(" ORDER BY s.updated_at DESC LIMIT {}", limit as i64));
+        sql.push_str(&format!(
+            " ORDER BY s.updated_at DESC LIMIT {}",
+            limit as i64
+        ));
 
         let mut params: Vec<Value> = Vec::with_capacity(raw_terms.len() + 1);
         params.push(exclude);
@@ -499,7 +598,8 @@ impl SessionStore {
 
         let mut stmt = conn.prepare(&sql)?;
         stmt.bind(&params)?;
-        let sessions = stmt.rows(|r| (r.text_or_empty(0), r.text_or_empty(1), r.text_or_empty(2)))?;
+        let sessions =
+            stmt.rows(|r| (r.text_or_empty(0), r.text_or_empty(1), r.text_or_empty(2)))?;
 
         // Per matched session: count matching messages (live + archived) and
         // excerpt the most recent ones (conclusions cluster near the end of a
@@ -583,17 +683,25 @@ impl SessionStore {
     /// messages index once per session and was noticeably slow on gateway
     /// hardware; a browser is not faster at this.
     pub fn list(&self) -> Result<Vec<SessionSummary>> {
+        self.list_scoped(SessionScope::Active)
+    }
+
+    /// List sessions in `scope` (see [`SessionScope`]); everything else as
+    /// [`SessionStore::list`].
+    pub fn list_scoped(&self, scope: SessionScope) -> Result<Vec<SessionSummary>> {
         let conn = self.conn.borrow();
-        let mut stmt = conn.prepare(
+        let sql = format!(
             "SELECT s.id, s.title, s.pinned, s.origin, s.created_at, s.updated_at,
-                    COALESCE(c.cnt, 0) AS cnt
+                    COALESCE(c.cnt, 0) AS cnt, s.archived_at, s.category
              FROM sessions s
              LEFT JOIN (SELECT session_id, COUNT(*) AS cnt FROM messages
                         WHERE role!='system' GROUP BY session_id) c
                     ON c.session_id = s.id
-             WHERE s.origin != 'task'
+             WHERE s.origin != 'task' {}
              ORDER BY s.pinned DESC, s.updated_at DESC",
-        )?;
+            scope.sql_filter()
+        );
+        let mut stmt = conn.prepare(&sql)?;
         stmt.rows(|r| SessionSummary {
             id: r.text_or_empty(0),
             title: r.text_or_empty(1),
@@ -603,6 +711,23 @@ impl SessionStore {
             created_at: r.text_or_empty(4),
             updated_at: r.text_or_empty(5),
             message_count: r.int(6),
+            archived_at: r.text(7),
+            category: r.text(8).filter(|c| !c.is_empty()),
+        })
+    }
+
+    /// Pin state, archive stamp and category of one session; `None` when the
+    /// id names nothing.
+    pub fn flags(&self, id: &str) -> Result<Option<SessionFlags>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn.prepare(
+            "SELECT pinned, archived_at, category FROM sessions WHERE id=?1",
+        )?;
+        stmt.bind(&[id.into()])?;
+        stmt.row(|r| SessionFlags {
+            pinned: r.int(0) != 0,
+            archived_at: r.text(1),
+            category: r.text(2).filter(|c| !c.is_empty()),
         })
     }
 
@@ -652,11 +777,51 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Archive (`true`) or restore (`false`) a session. Archiving also
+    /// un-pins it — a pinned row in the archive would be contradictory — and
+    /// stamps `archived_at`; any later save (a new turn) clears the stamp
+    /// again, see [`SessionStore::save`].
+    pub fn set_archived(&self, id: &str, archived: bool) -> Result<()> {
+        let conn = self.conn.borrow();
+        if archived {
+            conn.execute(
+                "UPDATE sessions SET archived_at=?2, pinned=0 WHERE id=?1",
+                &[id.into(), now_rfc3339().into()],
+            )
+        } else {
+            conn.execute(
+                "UPDATE sessions SET archived_at=NULL WHERE id=?1",
+                &[id.into()],
+            )
+        }
+    }
+
+    /// Set (or clear, with `None` / blank) the session's category. The value
+    /// is trimmed; callers enforce [`MAX_CATEGORY_CHARS`].
+    pub fn set_category(&self, id: &str, category: Option<&str>) -> Result<()> {
+        let cat = category.map(str::trim).filter(|c| !c.is_empty());
+        self.conn.borrow().execute(
+            "UPDATE sessions SET category=?2 WHERE id=?1",
+            &[id.into(), cat.map(|c| c.to_string()).into()],
+        )
+    }
+
     pub fn set_title(&self, id: &str, title: &str) -> Result<()> {
         self.conn.borrow().execute(
             "UPDATE sessions SET title=?2 WHERE id=?1",
             &[id.into(), title.into()],
         )
+    }
+
+    /// [`SessionStore::set_title`] under the name the engine calls it by: the
+    /// sub-agent driver titles a child transcript right after its first
+    /// `save_async`. Upstream queues both on one writer thread and relies on
+    /// that ordering; here both run inline, so the UPDATE trivially lands
+    /// behind the INSERT. Same fire-and-forget shape as `save_async`.
+    pub fn set_title_async(&self, id: &str, title: &str) {
+        if let Err(e) = self.set_title(id, title) {
+            log::warn!("could not title session {id}: {e}");
+        }
     }
 
     /// Current title. An empty string means unnamed, which is what decides

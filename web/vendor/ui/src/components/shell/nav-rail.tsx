@@ -146,7 +146,7 @@ export function NavRail({
   onOpenSettings,
   onToggleCollapse,
 }: NavRailProps) {
-  const name = brand || t("vinxAgent")
+  const name = brand || t("defaultBrand")
   const initial = name.charAt(0).toUpperCase() || "A"
   const [aboutOpen, setAboutOpen] = useState(false)
   const aboutRef = useRef<HTMLDivElement>(null)

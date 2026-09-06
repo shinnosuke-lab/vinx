@@ -1,16 +1,18 @@
 /**
- * The page half of camera(1): one webcam frame, PNG-encoded, dropped into the
- * guest's /data where the script is polling for it.
+ * The page half of camera(1): one webcam frame, PNG-encoded, dropped into
+ * the guest's /data — since Phase 3 behind media.camera.capture, whose
+ * result names the file and its size (no more guest-side polling).
  *
- * getUserMedia is the permission gate — the browser prompts on first use, and
- * a denial simply means no file appears and the guest script times out with
- * its own message. The stream lives only for the single frame.
+ * getUserMedia is the permission gate — the browser prompts on first use,
+ * and a denial rejects, which the method surfaces as UNAVAILABLE. The
+ * stream lives only for the single frame.
  */
 
 import type { VinxVm } from './vm';
 import { storeShareFile } from './share-store';
 
-export async function captureFrame(vm: VinxVm, name: string): Promise<void> {
+/** Resolves with the PNG's byte size once it sits in /data/<name>. */
+export async function captureFrame(vm: VinxVm, name: string): Promise<number> {
 	const stream = await navigator.mediaDevices.getUserMedia({ video: true });
 	try {
 		const video = document.createElement('video');
@@ -39,10 +41,12 @@ export async function captureFrame(vm: VinxVm, name: string): Promise<void> {
 		const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
 		if (!blob) throw new Error('PNG encoding failed');
 		const bytes = new Uint8Array(await blob.arrayBuffer());
-		// 9p first so the guest's poll sees it, then the mirror so it
-		// survives a reload like any other /data file.
+		// 9p first so the guest sees it, then the mirror so it survives a
+		// reload like any other /data file — owner tabs only: an ephemeral
+		// machine must not write this machine's archive.
 		await vm.putFile(name, bytes);
-		await storeShareFile(name, bytes).catch(() => {});
+		if (await vm.isOwner()) await storeShareFile(name, bytes).catch(() => {});
+		return bytes.byteLength;
 	} finally {
 		for (const track of stream.getTracks()) track.stop();
 	}

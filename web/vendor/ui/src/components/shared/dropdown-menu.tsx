@@ -46,7 +46,9 @@ export function DropdownMenu({
     <div
       ref={contentRef}
       style={{ position: "fixed", top: pos.top, left: pos.left, zIndex: 9999 }}
-      className="w-40 rounded-md border border-border bg-card p-1 shadow-md animate-in fade-in-0 zoom-in-95"
+      data-side="bottom"
+      data-align="end"
+      className="acc-pop w-40 rounded-md border border-border bg-card p-1 shadow-md"
     >
       {children}
     </div>

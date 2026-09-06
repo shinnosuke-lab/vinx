@@ -1,7 +1,7 @@
 # The console's opening screen: the mascot beside the name in big type, then
 # what this machine can do that a stock busybox cannot. Named 00- so it sorts
 # (and prints) ahead of the other profile.d snippets. Interactive shells only
-# -- run_shell (agentd) runs plain `sh` and never sources this.
+# -- run_shell (rund's proc.run) runs plain `sh` and never sources this.
 #
 # The lynx is the page logo itself (/usr/share/vinx/logo.png, 384px), sent as
 # a real PNG over iTerm2's inline-image protocol (OSC 1337) -- the page's
@@ -26,21 +26,28 @@ case "$-" in
 			: > /run/.banner-shown
 			printf '\033[H\033[2J\033[3J'
 		}
+		# One breathing row above the art, so the image does not sit flush
+		# against the window's title bar.
+		printf '\n'
 		printf '  \033]1337;File=size=%s;inline=1;height=10:%s\a' \
 			"$(wc -c < /usr/share/vinx/logo.png)" \
 			"$(base64 /usr/share/vinx/logo.png | tr -d '\n')"
 		# Cursor is now on the image's last row (10 of 10). Up 7 puts the
-		# name on image rows 3-7; column 26 clears the 20-cell image box
-		# plus the same 3-space gutter the character art kept.
+		# name on image rows 3-7; column 30 clears the image box with a
+		# gutter that matches the art's own left margin (eyeballed at the
+		# console's 11px type against the circle's widest rows — the name
+		# sits level with the circle's middle, where the arc reaches
+		# furthest right).
 		printf '\033[7A'
-		_f() { printf '\033[26G%b\033[B' "$1"; }
+		_f() { printf '\033[30G%b\033[B' "$1"; }
 		_f '\033[38;2;178;94;26m _    _______   ___  __\033[0m'
 		_f '\033[38;2;205;117;29m| |  / /  _/ | / / |/ /\033[0m'
 		_f '\033[38;2;219;135;41m| | / // //  |/ /|   /\033[0m'
 		_f '\033[38;2;233;152;53m| |/ // // /|  //   |\033[0m'
 		_f '\033[38;2;240;180;110m|___/___/_/ |_//_/|_|\033[0m'
-		# Back below the image (rows 8-10), one blank line, banner text.
-		printf '\n\n\n\n'
+		# Back below the image (rows 8-10), two blank lines, banner text —
+		# the round art needs the extra row to read as separate from it.
+		printf '\n\n\n\n\n'
 		printf '  \033[1;38;2;245;236;220mvinx linux\033[0;38;2;170;158;145m -- a real i686 machine, entirely in your browser tab\033[0m\n'
 		printf '  \033[38;2;92;80;70m─────────────────────────────────────────────────────────────────\033[0m\n'
 		# A command line: cyan for what you type, soft white for what it does.
@@ -60,6 +67,8 @@ case "$-" in
 		_k 'nes ROM.nes' 'a NES console -- the screen window pops open, sound and all'
 		_k 'nes host / join' '2P netplay over the LAN -- the joiner needs no ROM'
 		_k 'bridge start' "a room code; friends 'bridge join' it -- 'bridge say' to chat"
+		_k 'app new NAME' 'scaffold an app -- --web/--tty/--fb open windows on the page'
+		_k 'rpc watch|serve' 'live events, or turn a script into a callable method'
 		_k 'alpine' 'apk, a real package manager (needs the relay network)'
 		_k 'vim FILE' 'a real vim -- and tcc, make, lua, micropython, qjs'
 		_k 'sqlite3, jq' 'data on the shell; curl for the (relay) network'

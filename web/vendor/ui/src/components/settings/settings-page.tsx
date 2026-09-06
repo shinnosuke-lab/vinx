@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   Settings,
   Sparkles,
+  Bot,
   Palette,
   HardDrive,
   ShieldAlert,
@@ -20,11 +21,15 @@ import {
   X,
   Archive,
   Upload,
+  Eye,
+  EyeOff,
+  Copy,
+  Check,
   type LucideIcon,
 } from "lucide-react"
 import { createChatClient, type RuntimeCacheStat, type SafeCommands, type SafePaths } from "@agentchat/client"
 import { CopyButton } from "@agentchat/components/chat/tools/shared"
-import { cn } from "@agentchat/lib/utils"
+import { cn, copyToClipboard } from "@agentchat/lib/utils"
 import { t, tf } from "@agentchat/lib/i18n"
 import { Spinner } from "@agentchat/components/shared/spinner"
 import { Skeleton } from "@agentchat/components/ui/skeleton"
@@ -180,6 +185,22 @@ const sections: SectionDef[] = [
         helper: "hlpReasoningEffort",
         placeholder: "low / high / max",
       },
+    ],
+  },
+  // Provider-independent agent settings (their own card, after the provider).
+  // vinx: upstream also has `default_work_dir` here; the browser engine has no
+  // working directory to default, so that field is left out.
+  {
+    id: "behavior",
+    label: "secAgentBehavior",
+    icon: Bot,
+    fields: [
+      {
+        key: "default_full_auto",
+        label: "fldDefaultFullAuto",
+        kind: "toggle",
+        helper: "hlpDefaultFullAuto",
+      },
       {
         key: "subagent_reasoning_effort",
         label: "fldSubagentReasoningEffort",
@@ -201,6 +222,108 @@ const sections: SectionDef[] = [
     ],
   },
 ]
+
+/** Icon-sized action button used inside/next to inputs (show, copy, …). */
+function InlineIconButton({
+  onClick,
+  title,
+  disabled,
+  children,
+}: {
+  onClick: () => void
+  title: string
+  disabled?: boolean
+  children: ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+      disabled={disabled}
+      className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-[4px] text-muted-foreground/70 transition-colors hover:bg-muted/60 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+    >
+      {children}
+    </button>
+  )
+}
+
+/**
+ * Secret field for keys and tokens. The value in the form is only ever what
+ * the user typed THIS session (`GET /api/config` redacts stored secrets), so:
+ *  - the placeholder tells whether a secret is stored (`stored`),
+ *  - show/hide and copy act on the in-form value only; copy is disabled while
+ *    the field is blank, with a tooltip explaining why.
+ *
+ * vinx: upstream keys this off the Sand identity's token fingerprint; here the
+ * config endpoint answers a plain `api_key_set` flag, so the placeholder says
+ * "stored" without a suffix.
+ */
+function SecretInput({
+  id,
+  value,
+  onChange,
+  stored,
+  className,
+}: {
+  id: string
+  value: string
+  onChange: (v: string) => void
+  /** Whether a secret is stored server-side (never sent to the browser). */
+  stored: boolean
+  className?: string
+}) {
+  const [visible, setVisible] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const hasValue = value.length > 0
+  const placeholder = stored ? t("secretStored") : t("secretNotStored")
+  const handleCopy = async () => {
+    if (!hasValue) return
+    await copyToClipboard(value)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-1">
+        <input
+          id={id}
+          type={visible ? "text" : "password"}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          spellCheck={false}
+          autoComplete="off"
+          className={cn(inputClassName, "min-w-0 flex-1 font-mono placeholder:font-sans", className)}
+        />
+        <InlineIconButton
+          onClick={() => setVisible((v) => !v)}
+          title={visible ? t("secretHide") : t("secretShow")}
+          disabled={!hasValue}
+        >
+          {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+        </InlineIconButton>
+        <Tooltip delayDuration={150}>
+          <TooltipTrigger asChild>
+            {/* span wrapper: a disabled button does not fire hover events. */}
+            <span className="inline-flex">
+              <InlineIconButton onClick={handleCopy} title={t("secretCopy")} disabled={!hasValue}>
+                {copied ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
+              </InlineIconButton>
+            </span>
+          </TooltipTrigger>
+          {!hasValue && (
+            <TooltipContent side="top" className="max-w-xs text-xs leading-relaxed">
+              {t("secretCopyStoredHint")}
+            </TooltipContent>
+          )}
+        </Tooltip>
+      </div>
+      {hasValue && <p className="text-[11px] text-primary/80">{t("secretNew")}</p>}
+    </div>
+  )
+}
 
 /** Runtime cache categories rendered in the management card (fixed order). All
  *  are clearable caches; published deliverables (`public`) are intentionally
@@ -669,18 +792,35 @@ export function SettingsPage({ basePath = "", brand, accent }: SettingsPageProps
       )
     }
 
-    // Numeric fields stay text inputs (no native spinner arrows); parsed on save.
-    const type = field.kind === "password" ? "password" : "text"
     const value = cfg?.[field.key]
+
+    if (field.kind === "password") {
+      // `GET /api/config` blanks the secret and answers `<key>_set` instead,
+      // so the field can say whether one is stored without showing it.
+      const stored = cfg?.[`${field.key}_set`] === true
+      return (
+        <FormRow key={field.key} label={label} htmlFor={field.key} required={field.required} tooltip={tooltip} error={error}>
+          <SecretInput
+            id={field.key}
+            value={value == null ? "" : String(value)}
+            onChange={(v) => set(field.key, v)}
+            stored={stored}
+            className={cn(error && "border-destructive")}
+          />
+        </FormRow>
+      )
+    }
+
+    // Numeric fields stay text inputs (no native spinner arrows); parsed on save.
     return (
       <FormRow key={field.key} label={label} htmlFor={field.key} required={field.required} tooltip={tooltip} error={error}>
         <input
           id={field.key}
-          type={type}
+          type="text"
           inputMode={field.kind === "number" ? "decimal" : undefined}
           value={value == null ? "" : String(value)}
           onChange={(e) => set(field.key, e.target.value)}
-          placeholder={field.kind === "password" ? "••••••••" : field.placeholder}
+          placeholder={field.placeholder}
           className={cn(inputClassName, field.kind === "mono" && "font-mono", error && "border-destructive")}
         />
       </FormRow>

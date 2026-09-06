@@ -8,7 +8,7 @@
  * shell line, copied as one, and the result is split into the output and the
  * error the VM reported (see runtime/src/device-vm.ts for the `{ok, output,
  * error?, exit_code?, duration_ms?}` shape). Long outputs collapse to their
- * first lines — agentd allows 64 KiB and nobody wants that in a panel.
+ * first lines — run_shell carries up to 64 KiB and nobody wants that in a panel.
  *
  * Wired in through `<CopilotApp toolRenderers>`, the extension point upstream
  * built for host-specific tools — the vendored UI stays verbatim. The smaller
@@ -18,6 +18,7 @@
 import { useState } from 'react';
 import { copyToClipboard, type ToolRenderProps } from '@vinx/agent-chat';
 
+import { bootStatusLine, useVmStatus } from './vm-status';
 import './run-shell-tool.css';
 
 export function tryParse(text?: string): Record<string, unknown> | null {
@@ -99,6 +100,24 @@ export function FoldedPre({ text, className }: { text: string; className: string
 	);
 }
 
+/**
+ * The "still running" line under a tool card, honest about what the wait
+ * is: a call made while the machine boots (or after a failed boot, which
+ * the adapter retries) waits for the boot first, and "running on the VM…"
+ * over a twenty-second boot read as a hung command. Booting shows the
+ * boot's own status line and percent; failed shows the reason; otherwise
+ * the tool's own note.
+ */
+export function RunningNote({ note }: { note: string }) {
+	const vm = useVmStatus();
+	const line = vm.state === 'booting' || vm.state === 'failed' ? bootStatusLine(vm) : '';
+	return (
+		<div className={`rp-note${vm.state === 'failed' ? ' rp-note-err' : ''}`} data-vm-state={vm.state}>
+			{line || note}
+		</div>
+	);
+}
+
 export function RunShellTool({ args, result, isRunning }: ToolRenderProps) {
 	const parsed = tryParse(args);
 	// While the call is still streaming in, `args` is a JSON prefix that does
@@ -160,7 +179,7 @@ export function RunShellTool({ args, result, isRunning }: ToolRenderProps) {
 			    failure) still has to be seen to be debugged. */}
 			{result && !res && <pre className="rp-out">{result}</pre>}
 
-			{isRunning && !result && <div className="rp-note">running on the VM…</div>}
+			{isRunning && !result && <RunningNote note="running on the VM…" />}
 		</div>
 	);
 }

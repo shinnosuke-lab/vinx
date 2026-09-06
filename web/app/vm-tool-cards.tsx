@@ -9,7 +9,7 @@
 
 import type { ToolRenderProps } from '@vinx/agent-chat';
 
-import { CopyBtn, FoldedPre, outcomeMeta, tryParse } from './run-shell-tool';
+import { CopyBtn, FoldedPre, outcomeMeta, RunningNote, tryParse } from './run-shell-tool';
 import './run-shell-tool.css';
 
 function asString(v: unknown): string | null {
@@ -52,7 +52,7 @@ function QuietCard({
 				</div>
 				{body && <FoldedPre className={bodyClass} text={body} />}
 				{error && <pre className="rp-err">{error}</pre>}
-				{isRunning && !res && <div className="rp-note">{runningNote}</div>}
+				{isRunning && !res && <RunningNote note={runningNote} />}
 			</div>
 		</div>
 	);

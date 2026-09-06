@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "kind": "window",
+  "ui": { "type": "tty" },
+  "exec": "./run",
+  "title": "Laser Typer",
+  "description": "打字射击：字母从天而降，按下对应的键把它们击落。终端里的小游戏，有音效和高分榜。Typing shooter — letters fall, hit their keys before they land."
+}

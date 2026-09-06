@@ -11,8 +11,18 @@
  */
 
 import init, { AgentHost, openHost } from '../pkg/agent_web_core.js';
-import type { Frame, Ready, Reply, Request, ToWorker, VmCall } from './protocol';
-import { isInit, isVmResult, PROTOCOL_VERSION } from './protocol';
+import type {
+	Download,
+	Frame,
+	InstallApp,
+	Ready,
+	Reply,
+	Request,
+	ToWorker,
+	VmCall,
+	WebAppSource,
+} from './protocol';
+import { isInit, isInstallAppResult, isVmResult, PROTOCOL_VERSION } from './protocol';
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -23,8 +33,15 @@ let host: AgentHost | null = null;
  */
 let booted: Promise<void> | null = null;
 
-function post(message: Reply | Frame | Ready | VmCall) {
-	self.postMessage(message);
+function post(message: Reply | Frame | Ready | VmCall | Download | InstallApp) {
+	// A download carries its bytes: hand the buffer over instead of copying it.
+	// So do an app's parts — the engine copied them out of wasm memory already.
+	if ('download' in message) self.postMessage(message, [message.bytes.buffer]);
+	else if ('installApp' in message) {
+		const { html, css, js } = message.app;
+		const buffers = [html, css, js].filter((p): p is Uint8Array => !!p).map((p) => p.buffer);
+		self.postMessage(message, buffers);
+	} else self.postMessage(message);
 }
 
 /**
@@ -85,6 +102,37 @@ function sink(stream: string, frame: string) {
 	post({ stream, frame });
 }
 
+/**
+ * The page's half of the workspace `download_file`: the engine has the bytes,
+ * only the main thread can click an `<a download>`. Installed on every host
+ * shape — persistent or in-memory, a draft is a draft.
+ */
+function downloader(filename: string, bytes: Uint8Array) {
+	post({ download: true, filename, bytes });
+}
+
+/**
+ * The page's half of the workspace `install_app`: the engine has the parts,
+ * the main thread has the machine's mirror and the Apps page. Unlike a
+ * download this one waits for the answer — the model must hear whether the
+ * app is on the page, and in the machine's own words when it is not. Same
+ * request/reply shape as the VM bounce above.
+ */
+const installPending = new Map<number, (r: { ok: boolean; text: string }) => void>();
+let installNextId = 1;
+
+function installer(app: WebAppSource): Promise<string> {
+	const installId = installNextId++;
+	const answer = new Promise<{ ok: boolean; text: string }>((resolve) => {
+		installPending.set(installId, resolve);
+	});
+	post({ installApp: true, installId, app });
+	return answer.then(({ ok, text }) => {
+		if (ok) return text;
+		throw new Error(text);
+	});
+}
+
 async function boot(namespace?: string) {
 	try {
 		await init();
@@ -98,10 +146,14 @@ async function boot(namespace?: string) {
 	// the whole application.
 	try {
 		host = await openHost(sink, namespace);
+		host.setDownloader(downloader);
+		host.setAppInstaller(installer);
 		post({ ready: true, protocol: PROTOCOL_VERSION });
 	} catch (e) {
 		try {
 			host = new AgentHost(sink);
+			host.setDownloader(downloader);
+			host.setAppInstaller(installer);
 			post({ ready: true, protocol: PROTOCOL_VERSION, ephemeral: true });
 		} catch (fatal) {
 			post({
@@ -127,6 +179,8 @@ function dispatch(h: AgentHost, method: Request['method'], p: any): unknown {
 			return h.configure(p.baseUrl, p.apiKey, p.model);
 		case 'installTools':
 			return h.installTools(p.payload, p.endpoint);
+		case 'uninstallTools':
+			return h.uninstallTools(p.names);
 		case 'attach':
 			return h.attach(p.stream, p.session, p.follow === true);
 		case 'detach':
@@ -158,6 +212,8 @@ function dispatch(h: AgentHost, method: Request['method'], p: any): unknown {
 			return h.queueRemove(p.session, Number(p.id) || 0);
 		case 'queueEdit':
 			return h.queueEdit(p.session, Number(p.id) || 0, p.message ?? '');
+		case 'queuePromote':
+			return h.queuePromote(p.session, Number(p.id) || 0);
 		case 'cancelTask':
 			return h.cancelTask(p.session, p.taskId ?? '');
 		case 'sessionArchive':
@@ -174,6 +230,8 @@ function dispatch(h: AgentHost, method: Request['method'], p: any): unknown {
 			const bytes = h.readUpload(p.id);
 			return bytes ? { bytes, mime: h.uploadMime(p.id) } : null;
 		}
+		case 'readWorkspaceFile':
+			return h.readWorkspaceFile(p.path) ?? null;
 		case 'skills':
 			return JSON.parse(h.skills());
 		case 'skillText':
@@ -213,13 +271,21 @@ function dispatch(h: AgentHost, method: Request['method'], p: any): unknown {
 		case 'turns':
 			return h.turns();
 		case 'sessions':
-			return JSON.parse(h.sessions());
+			return JSON.parse(h.sessions(p.scope));
 		case 'session':
 			return JSON.parse(h.session(p.session));
 		case 'search':
 			return JSON.parse(h.search(p.query ?? '', p.limit ?? 20, p.exclude));
 		case 'updateSession':
-			return h.updateSession(p.session, p.title, p.pinned);
+			// `category: null` (clear) travels as '' — wasm-bindgen's Option<String>
+			// has no third state.
+			return h.updateSession(
+				p.session,
+				p.title,
+				p.pinned,
+				p.archived,
+				p.category === null ? '' : p.category,
+			);
 		case 'deleteSession':
 			return h.deleteSession(p.session);
 		default: {
@@ -244,6 +310,14 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
 		if (settle) {
 			vmPending.delete(e.data.vmId);
 			settle({ status: e.data.status, body: e.data.body });
+		}
+		return;
+	}
+	if (isInstallAppResult(e.data)) {
+		const settle = installPending.get(e.data.installId);
+		if (settle) {
+			installPending.delete(e.data.installId);
+			settle({ ok: e.data.ok, text: e.data.text });
 		}
 		return;
 	}

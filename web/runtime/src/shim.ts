@@ -35,9 +35,11 @@ export interface ShimOptions {
 	config?: ConfigStore;
 	/**
 	 * Device tools already registered with the engine, reported at
-	 * `/api/tools` so the UI lists what the agent can actually do.
+	 * `/api/tools` so the UI lists what the agent can actually do. A
+	 * function is read on every request — for a device that comes and goes
+	 * (the in-page machine, whose tools follow its power state).
 	 */
-	tools?: unknown[];
+	tools?: unknown[] | (() => unknown[]);
 	/**
 	 * Reported by `/api/chat/meta`. The UI shows it and uses it to decide which
 	 * optional features to offer.
@@ -73,6 +75,67 @@ export interface ShimOptions {
 	 * Fire-and-forget: the upload has already succeeded.
 	 */
 	onUpload?: (name: string, mime: string, bytes: Uint8Array) => void;
+	/**
+	 * The in-page VM's app system (rund + the guest `app` CLI), bridged so
+	 * the UI's Apps page manages the machine's `.vapp`s: `kind=app`
+	 * releases list them, start/stop/delete drive rund, and the import
+	 * paths land a package in /data and run `app install`. Unset, the Apps
+	 * page keeps its empty state (upstream's "no services here" truth).
+	 */
+	vmApps?: VmAppsBridge;
+	/**
+	 * An apps repository (apps-hub) — an `index.json` and the packages it
+	 * names. Entries are filtered to `env` containing "vinx": the hub
+	 * serves every runtime, and a gateway package is uninstallable here.
+	 * Unset, `/api/apps/market` answers 404 and the UI hides the tab.
+	 */
+	appsRepo?: string;
+}
+
+/** What the page hands the shim to reach the machine's app system. */
+export interface VmAppsBridge {
+	/** rund's app.list, already parsed to its entries. */
+	list(): Promise<VmAppEntry[]>;
+	/** Run the guest `app` CLI with pre-validated arguments; resolves to
+	 * the combined output, throws (with the output as the message) on a
+	 * non-zero exit. */
+	cli(args: string): Promise<string>;
+	/** Land bytes at a /data-relative path in the live guest. */
+	putFile(path: string, bytes: Uint8Array): Promise<void>;
+	/**
+	 * `app run ID`, the Apps page's "open" for a window app. Optional: a
+	 * page that can open a pure web app WITHOUT the machine (from the
+	 * package in its mirror) does it here; the shim's default is the CLI.
+	 * Throws MachineOffError-shaped errors like the others.
+	 */
+	run?(id: string): Promise<void>;
+	/**
+	 * `app enable ID` / `app disable ID` — the autostart list. Optional: a
+	 * page that keeps the machine's mirror edits it there for a pure web
+	 * app while the machine is off (its "boot" is the page loading, and the
+	 * page reads the list then); the shim's default is the CLI, which is
+	 * what a running machine gets either way. Throws like the others.
+	 */
+	setEnabled?(id: string, on: boolean): Promise<void>;
+}
+
+export interface VmAppEntry {
+	id: string;
+	/** rund's state (running/stopped/…), or `off` for a package known
+	 * only from the mirror of a powered-off machine. */
+	state: string;
+	enabled: boolean;
+	size?: number;
+	kind?: string;
+	/** A pure web app: kind window, ui web, no exec — a window on the
+	 * desktop and no process (the install's `.web` marker). Enabled, it
+	 * opens when the page loads, not when the machine boots. */
+	web?: boolean;
+	/** A pure web app's window is open on this desktop right now. */
+	windowOpen?: boolean;
+	/** The manifest's title and description (the install's sidecars). */
+	title?: string;
+	description?: string;
 }
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
@@ -158,6 +221,8 @@ export function createHandler(
 	// here to be passed out again.
 	const passthrough = options.passthrough ?? globalThis.fetch.bind(globalThis);
 	const market = new SkillsMarket(options.skillsRepo, passthrough);
+	const vmApps = options.vmApps;
+	const appsMarket = new VinxAppsMarket(options.appsRepo, passthrough);
 
 	return async function handle(request: Request, path: string): Promise<Response> {
 		const tail = route(path);
@@ -214,8 +279,18 @@ export function createHandler(
 				// settings panel has to be visible without a reload. An empty
 				// one is left out entirely — the badge hangs on the field being
 				// truthy, and `model: ""` would render an empty chip.
-				const model = config.load().model?.trim();
-				return json({ ...meta, ...(model ? { model } : {}), protocol: 2 });
+				const current = config.load();
+				const model = current.model?.trim();
+				// `config.default_full_auto`: the UI seeds a fresh chat's
+				// FULL-AUTO badge from it (a live session's own frames take
+				// over once it exists). Read live for the same reason as the
+				// model: a settings save must show without a reload.
+				return json({
+					...meta,
+					...(model ? { model } : {}),
+					config: { default_full_auto: current.default_full_auto === true },
+					protocol: 2,
+				});
 			}
 			if (tail === 'chat/upload' && request.method === 'POST') {
 				return upload(client, request, options.onUpload);
@@ -288,6 +363,13 @@ export function createHandler(
 				);
 				return ok ? json({ ok: true }) : json({ error: 'no such queued message' }, 404);
 			}
+			// "Send now" for a parked message: to the queue front, and the
+			// running turn (if any) winds down so it starts next.
+			if (tail === 'chat/queue/promote' && request.method === 'POST') {
+				const body = await request.json();
+				const ok = await client.queuePromote(body.session_id, Number(body.id) || 0);
+				return ok ? json({ ok: true }) : json({ ok: false, error: 'not_found' }, 404);
+			}
 			// Cancel ONE running sub-agent; the rest of the turn keeps going.
 			// 404 when the task already finished — the UI clears its row from
 			// the next `subagent` frame either way.
@@ -324,7 +406,17 @@ export function createHandler(
 			// ── sessions ──
 			if (tail === 'sessions' && request.method === 'GET') {
 				const q = url.searchParams.get('q');
-				return json(q?.trim() ? await client.search(q.trim()) : await client.sessions());
+				// `scope`: active (default) | archived | all — only the sessions
+				// page asks for more than the default, every picker stays
+				// archive-free.
+				const scope = url.searchParams.get('scope')?.trim() || undefined;
+				if (scope && !['active', 'archived', 'all'].includes(scope)) {
+					return json(
+						{ error: 'invalid_scope', message: 'scope must be one of: active, archived, all' },
+						400,
+					);
+				}
+				return json(q?.trim() ? await client.search(q.trim()) : await client.sessions(scope));
 			}
 			if (tail.startsWith('sessions/')) {
 				const rest = tail.slice('sessions/'.length);
@@ -349,7 +441,22 @@ export function createHandler(
 				}
 				if (request.method === 'PATCH') {
 					const patch = await request.json();
-					await client.updateSession(id, patch.title, patch.pinned);
+					if (typeof patch.category === 'string' && patch.category.trim().length > 64) {
+						return json(
+							{ error: 'invalid_category', message: 'category must be at most 64 characters' },
+							400,
+						);
+					}
+					await client.updateSession(id, {
+						title: typeof patch.title === 'string' ? patch.title : undefined,
+						pinned: typeof patch.pinned === 'boolean' ? patch.pinned : undefined,
+						archived: typeof patch.archived === 'boolean' ? patch.archived : undefined,
+						// Tri-state: absent = unchanged, null/'' = clear, else the label.
+						category:
+							patch.category === null || typeof patch.category === 'string'
+								? patch.category
+								: undefined,
+					});
 					return json({ ok: true });
 				}
 				if (request.method === 'DELETE') {
@@ -402,7 +509,7 @@ export function createHandler(
 			// Answered with empty rather than 404 on purpose: a 404 makes the UI
 			// show a broken-backend state, while an empty list makes it hide the
 			// feature, which is the truth until those parts are built.
-			if (tail === 'tools') return json({ ok: true, tools });
+			if (tail === 'tools') return json({ ok: true, tools: typeof tools === 'function' ? tools() : tools });
 
 			// ── themes ──
 			//
@@ -425,19 +532,58 @@ export function createHandler(
 
 			// ── what this agent has published ──
 			//
-			// Themes are the only kind: a page has no systemd services to run
-			// and no public directory to publish into. Answered rather than
-			// 404'd for every other kind, so those pages draw an empty state
-			// instead of a broken backend.
+			// Themes come from the engine; apps come from the machine — the
+			// Apps page's `kind=app` releases are the VM's installed `.vapp`s
+			// (rund's app.list), bridged when the page handed us the machine.
+			// Every other kind answers empty rather than 404, so those pages
+			// draw an empty state instead of a broken backend.
 			if (tail === 'releases' && request.method === 'GET') {
 				const kind = url.searchParams.get('kind');
-				return json(kind === 'theme' ? await client.savedThemes() : { releases: [] });
+				if (kind === 'theme') return json(await client.savedThemes());
+				if (kind === 'app' && vmApps) return vmAppList(vmApps);
+				return json({ releases: [] });
 			}
-			// The apps repository, answered the way the UI reads as "there is
-			// none": a page has nowhere to install a service. Said explicitly
-			// rather than left to fall through, so it is not logged as a route
-			// somebody forgot.
-			if (tail.startsWith('apps/market')) return json({ error: 'no apps repository' }, 404);
+			// The machine's apps: start/stop/enable/disable/uninstall drive
+			// rund through the guest `app` CLI, which owns the manifest and
+			// teardown logic (enable/disable edit the boot-autostart list,
+			// nothing about a running instance). The id is validated here
+			// because it is spliced into a shell line.
+			if (tail.startsWith('releases/app/') && vmApps) {
+				const rest = tail.slice('releases/app/'.length);
+				if (request.method === 'POST') {
+					const m = /^(.+)\/(start|stop|enable|disable|run)$/.exec(rest);
+					if (m?.[2] === 'run') return vmAppRun(vmApps, decodeURIComponent(m[1]));
+					if (m) return vmAppCli(vmApps, m[2], decodeURIComponent(m[1]));
+				}
+				if (request.method === 'DELETE') return vmAppCli(vmApps, 'remove', decodeURIComponent(rest));
+			}
+			// The apps repository (apps-hub): 404 until a repo is configured
+			// AND it lists something this runtime can install — the UI reads
+			// 404 as "no repository" and hides the tab.
+			if (tail.startsWith('apps/market')) return appsMarket.handle(vmApps, tail, request);
+			// Import a package: the dropped/picked file is a `.vapp` (the
+			// same tar.gz `app pack` makes). The original file name rides an
+			// x-file-name header (the guest derives the app id from it); the
+			// URL path downloads first and names the app after the file.
+			if (tail === 'apps/install' && request.method === 'POST' && vmApps) {
+				return vmAppInstall(
+					vmApps,
+					new Uint8Array(await request.arrayBuffer()),
+					vappName(request.headers.get('x-file-name')),
+				);
+			}
+			if (tail === 'apps/install-url' && request.method === 'POST' && vmApps) {
+				const body = await request.json().catch(() => ({}));
+				const packageUrl = typeof body.url === 'string' ? body.url : '';
+				if (!/^https?:\/\//i.test(packageUrl)) return json({ error: 'not an http(s) URL' }, 400);
+				const res = await passthrough(packageUrl);
+				if (!res.ok) return json({ error: `could not download (HTTP ${res.status})` }, 502);
+				return vmAppInstall(
+					vmApps,
+					new Uint8Array(await res.arrayBuffer()),
+					vappName(packageUrl.split('/').pop() ?? null),
+				);
+			}
 
 			if (tail.startsWith('releases/theme/') && request.method === 'DELETE') {
 				return answer(await client.deleteTheme(decodeURIComponent(tail.slice('releases/theme/'.length))));
@@ -814,9 +960,234 @@ class SkillsMarket {
 	}
 }
 
+// ── the machine's apps, dressed as releases ──
+
+/** The guest's own id grammar (usr/bin/app check_id); enforced here because
+ * the id is spliced into a shell command line. */
+const VM_APP_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/** The wished-for app id out of an uploaded file's name: percent-decoded,
+ * `.vapp` stripped, a trailing dotted version dropped (the hub names its
+ * packages `<name>.<version>.vapp`, and dots are not id characters),
+ * lowercased. Anything that still misses the id grammar comes back
+ * undefined and the install falls back to a timestamp name. */
+function vappName(raw: string | null): string | undefined {
+	if (!raw) return undefined;
+	let s = raw.split(/[?#]/)[0]; /* a URL's query/fragment is not the name */
+	try {
+		s = decodeURIComponent(s);
+	} catch {
+		/* the verbatim header, then */
+	}
+	const name = s
+		.replace(/\.vapp$/i, '')
+		.replace(/(\.\d+)+$/, '')
+		.toLowerCase();
+	return VM_APP_ID.test(name) ? name : undefined;
+}
+
+/** rund's state vocabulary folded into the UI's status dot: running is
+ * active; crashed and failed are failed; everything between (starting,
+ * stopping, stopped) reads as inactive. */
+function vmAppStatus(state: string): string {
+	if (state === 'running') return 'active';
+	if (state === 'failed' || state === 'crashed') return 'failed';
+	return 'inactive';
+}
+
+/** `GET /api/releases?kind=app`: app.list mapped to ReleaseRecords. The UI
+ * compares `enabled` as a string, and `oneshot` (a command app: runs to
+ * completion, no supervision) makes it skip batch start/stop. */
+async function vmAppList(vm: VmAppsBridge): Promise<Response> {
+	const apps = await vm.list();
+	return json({
+		releases: apps.map((a) => ({
+			kind: 'app',
+			name: a.id,
+			// A window app's "running" is its window being open: rund never
+			// sees one (the window IS the app), so the desktop's word wins.
+			status: a.kind === 'window' && a.windowOpen ? 'active' : vmAppStatus(a.state),
+			enabled: a.enabled ? 'enabled' : 'disabled',
+			size: a.size ?? 0,
+			oneshot: a.kind === 'command',
+			// Vinx: the manifest kind, for the page to draw the card by
+			// (a window opens, a command runs once, a service starts), and
+			// the words the manifest gave it.
+			app_kind: a.kind,
+			// A pure web app (no process): its autostart is the page loading.
+			web: a.web === true,
+			title: a.title,
+			description: a.description,
+		})),
+	});
+}
+
+/** Start, stop or remove one app through the guest CLI (it owns manifest
+ * parsing and teardown). A CLI failure comes back as the toast's text.
+ * enable/disable go through the bridge's own edit when it has one — a
+ * pure web app's autostart list is the page's to keep while the machine
+ * is off. */
+async function vmAppCli(vm: VmAppsBridge, verb: string, raw: string): Promise<Response> {
+	if (!VM_APP_ID.test(raw)) return json({ error: `not an app id: ${raw}` }, 400);
+	try {
+		if ((verb === 'enable' || verb === 'disable') && vm.setEnabled) await vm.setEnabled(raw, verb === 'enable');
+		else await vm.cli(`${verb} ${raw}`);
+		return json({ ok: true });
+	} catch (e) {
+		return vmAppFailure(e);
+	}
+}
+
+/** A machine-side failure as the Apps page's toast: 503 with a stable code
+ * for a machine the person left powered off (the page words it; the shim
+ * has no language), 500 with the guest's own words for anything else. */
+function vmAppFailure(e: unknown): Response {
+	if (e instanceof Error && e.name === 'MachineOffError') {
+		return json({ error: e.message, code: 'MACHINE_OFF' }, 503);
+	}
+	return json({ error: e instanceof Error ? e.message : String(e) }, 500);
+}
+
+/** `app run ID` — the Apps page opening a window app. The page's own
+ * opener when it has one (a pure web app needs no machine); else the guest
+ * CLI in the background, the window arriving through window.create. */
+async function vmAppRun(vm: VmAppsBridge, raw: string): Promise<Response> {
+	if (!VM_APP_ID.test(raw)) return json({ error: `not an app id: ${raw}` }, 400);
+	try {
+		// The window kind's verb (apps-page). A backend window app is rund's
+		// to spawn — `app start` (on a PTY for a tty app, §6.9) — and the
+		// desktop grows the window on the stream. `app run` is the console's
+		// verb: with no controlling terminal it refuses a tty app, exit 2,
+		// which the old `>/dev/null 2>&1 &` here turned into a silent no-op.
+		if (vm.run) await vm.run(raw);
+		else await vm.cli(`start ${raw}`);
+		return json({ ok: true });
+	} catch (e) {
+		return vmAppFailure(e);
+	}
+}
+
+/** Land a `.vapp` in the guest and `app install` it. The guest derives the
+ * app id from the FILE NAME (`basename FILE .vapp`), so the upload parks
+ * under the wished-for name when the caller knows one — the market entry's,
+ * or the dropped file's own — and under a timestamp only as the nameless
+ * fallback (the flat manifest carries no name of its own to recover). The
+ * park is /data/.vinx/tmp, the boot-swept namespace: no cleanup here. */
+async function vmAppInstall(vm: VmAppsBridge, bytes: Uint8Array, name?: string): Promise<Response> {
+	if (!bytes.byteLength) return json({ error: 'an empty package' }, 400);
+	const wished = name && VM_APP_ID.test(name) ? name : `app-upload-${Date.now()}`;
+	const tmp = `.vinx/tmp/${wished}.vapp`;
+	try {
+		await vm.putFile(tmp, bytes);
+		const out = await vm.cli(`install /data/${tmp}`);
+		const m = /installed \/data\/apps\/([a-z0-9_-]+)\.vapp/.exec(out);
+		return json({ name: m?.[1] ?? '', upgraded: false, receipt: '' });
+	} catch (e) {
+		return vmAppFailure(e);
+	}
+}
+
+/**
+ * The apps repository (apps-hub): one index serves every runtime, and this
+ * client keeps only the entries whose `env` names "vinx" — a gateway's
+ * Container package cannot run in a browser VM, and the hub's own answer
+ * to that split is the open `env` vocabulary (unknown-mismatch refuses).
+ * Shaped after SkillsMarket above; packages are sha256-checked when the
+ * index carries a digest.
+ */
+class VinxAppsMarket {
+	private cached: { at: number; index: any } | null = null;
+	private repo: string | undefined;
+
+	constructor(
+		repo: string | undefined,
+		private get: typeof fetch,
+	) {
+		const address = repo?.trim().replace(/\/+$/, '') ?? '';
+		const usable = /^https?:\/\/[^/]+/i.test(address);
+		if (address && !usable) {
+			console.warn(`[agent-web] ignoring apps repository, not an absolute http(s) URL: ${address}`);
+		}
+		this.repo = usable ? address : undefined;
+	}
+
+	async handle(vm: VmAppsBridge | undefined, tail: string, request: Request): Promise<Response> {
+		// 404 reads as "no repository" and hides the tab — also the right
+		// answer when there is no machine to install into.
+		if (!this.repo || !vm) return json({ error: 'no apps repository' }, 404);
+		const rest = tail.slice('apps/market'.length).replace(/^\//, '');
+		if (!rest && request.method === 'GET') return this.listing(vm);
+		if (rest === 'install' && request.method === 'POST') return this.install(vm, request);
+		return json({ error: `no route for ${request.method} ${tail}` }, 404);
+	}
+
+	private async listing(vm: VmAppsBridge): Promise<Response> {
+		const index = await this.index();
+		if (index instanceof Response) return index;
+		// An index with nothing for this runtime hides the tab too: a market
+		// of zero cards is worse than none.
+		if (!index.apps.length) return json({ error: 'no apps for this runtime' }, 404);
+
+		const installed = new Set((await vm.list()).map((a) => a.id));
+		const apps = index.apps.map((entry: any) => ({
+			...entry,
+			installed_version: installed.has(entry?.name) ? (entry?.version ?? '') : null,
+			// A .vapp carries no version of its own to compare against.
+			update_available: false,
+		}));
+		return json({ repo: this.repo, generated_at: index.generated_at ?? null, apps });
+	}
+
+	private async install(vm: VmAppsBridge, request: Request): Promise<Response> {
+		const { name } = await request.json();
+		const index = await this.index();
+		if (index instanceof Response) return index;
+		const entry = index.apps.find((a: any) => a?.name === name);
+		if (!entry?.url) return json({ error: `'${name}' is not in the repository` }, 404);
+
+		const res = await this.get(new URL(entry.url, `${this.repo}/`).href);
+		if (!res.ok) return json({ error: `could not download '${name}' (HTTP ${res.status})` }, 502);
+		const bytes = new Uint8Array(await res.arrayBuffer());
+		if (entry.sha256) {
+			const digest = await crypto.subtle.digest('SHA-256', bytes.slice().buffer);
+			const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+			if (hex !== String(entry.sha256).toLowerCase()) {
+				return json({ error: `'${name}' does not match its sha256 — refusing to install` }, 502);
+			}
+		}
+		// The entry's name IS the app id: the guest derives it from the
+		// file name, so the download parks under it (hub package files
+		// carry a version suffix the id grammar refuses).
+		return vmAppInstall(vm, bytes, String(entry.name));
+	}
+
+	/** The index, filtered to this runtime's entries; cached for 60s. */
+	private async index(): Promise<{ generated_at?: string; apps: any[] } | Response> {
+		const now = Date.now();
+		if (this.cached && now - this.cached.at < 60_000) return this.cached.index;
+
+		const res = await this.get(`${this.repo}/index.json`);
+		if (!res.ok) return json({ error: `repository unreachable (HTTP ${res.status})` }, 502);
+		const raw = await res.json();
+		const apps = (Array.isArray(raw?.apps) ? raw.apps : []).filter(
+			(a: any) => Array.isArray(a?.env) && a.env.includes('vinx'),
+		);
+		const index = { generated_at: raw?.generated_at, apps };
+		this.cached = { at: now, index };
+		return index;
+	}
+}
+
 /** `POST /api/chat`: start a turn and answer with the ack the client expects. */
 async function chat(client: AgentClient, body: any, started?: () => void): Promise<Response> {
 	const session = body.session_id || newSessionId();
+	// The fresh-chat composer's full-auto toggle for a session THIS call
+	// creates: applied before the turn starts so the choice is in place for
+	// its first tool call. Ignored for existing sessions, which flip it
+	// through `chat/auto`.
+	if (!body.session_id && body.full_auto === true) {
+		await client.setAuto(session, true);
+	}
 	// The model rides on the message because the picker is a per-turn choice,
 	// not a setting: dropping it here would leave a picker that visibly does
 	// nothing, which is worse than not offering one.

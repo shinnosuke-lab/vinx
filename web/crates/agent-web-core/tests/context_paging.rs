@@ -57,11 +57,23 @@ fn old_results_become_addressable_placeholders() {
 
     let first = msgs[3].content.as_deref().unwrap();
     assert!(first.starts_with(COMPACTED_PREFIX), "elided: {first}");
-    assert!(first.contains("call_1"), "the swap address is the point: {first}");
-    assert!(first.contains("read_file"), "tool name orients the model: {first}");
+    assert!(
+        first.contains("call_1"),
+        "the swap address is the point: {first}"
+    );
+    assert!(
+        first.contains("read_file"),
+        "tool name orients the model: {first}"
+    );
     // "ONE" + space + 300 x's = 304 chars.
-    assert!(first.contains("304 chars"), "size hints at what recall buys: {first}");
-    assert!(first.contains("recall_result"), "the fault handler is named: {first}");
+    assert!(
+        first.contains("304 chars"),
+        "size hints at what recall buys: {first}"
+    );
+    assert!(
+        first.contains("recall_result"),
+        "the fault handler is named: {first}"
+    );
 
     let second = msgs[5].content.as_deref().unwrap();
     assert!(second.contains("call_2") && second.contains("run_shell"));
@@ -87,7 +99,11 @@ fn short_results_are_not_worth_eliding() {
         Some("ok"),
         "a placeholder longer than the content saves nothing"
     );
-    assert!(msgs[4].content.as_deref().unwrap().starts_with(COMPACTED_PREFIX));
+    assert!(msgs[4]
+        .content
+        .as_deref()
+        .unwrap()
+        .starts_with(COMPACTED_PREFIX));
 }
 
 #[wasm_bindgen_test]
@@ -108,7 +124,11 @@ fn the_view_is_pruned_but_the_canonical_history_is_not() {
 
     // Over the threshold: a pruned copy comes back, the original keeps its bytes.
     let view = build_request_view(&msgs, 10).expect("over threshold prunes");
-    assert!(view[3].content.as_deref().unwrap().starts_with(COMPACTED_PREFIX));
+    assert!(view[3]
+        .content
+        .as_deref()
+        .unwrap()
+        .starts_with(COMPACTED_PREFIX));
     assert!(
         msgs[3].content.as_deref().unwrap().contains("ONE"),
         "Level-1 must never mutate the canonical history"
@@ -126,7 +146,10 @@ fn recall_faults_elided_content_back_in() {
     match recall_tool_result(&msgs, Some(&view), "call_1") {
         RecallOutcome::Recalled { tool, content } => {
             assert_eq!(tool, "read_file");
-            assert!(content.contains("ONE"), "the original bytes, not the placeholder");
+            assert!(
+                content.contains("ONE"),
+                "the original bytes, not the placeholder"
+            );
         }
         other => panic!("expected Recalled, got {other:?}"),
     }
@@ -163,7 +186,10 @@ fn recall_misses_an_unknown_id() {
 #[wasm_bindgen_test]
 fn tool_names_resolve_from_the_issuing_assistant_message() {
     let msgs = history();
-    assert_eq!(tool_name_for_call(&msgs, "call_2").as_deref(), Some("run_shell"));
+    assert_eq!(
+        tool_name_for_call(&msgs, "call_2").as_deref(),
+        Some("run_shell")
+    );
     assert_eq!(tool_name_for_call(&msgs, "call_999"), None);
 }
 
@@ -171,7 +197,11 @@ fn tool_names_resolve_from_the_issuing_assistant_message() {
 fn the_fault_handler_is_advertised_with_its_address_parameter() {
     let def = recall_result_definition();
     assert_eq!(def.function.name, "recall_result");
-    assert!(def.function.parameters.required.contains(&"call_id".to_string()));
+    assert!(def
+        .function
+        .parameters
+        .required
+        .contains(&"call_id".to_string()));
     assert!(
         def.function.description.contains(COMPACTED_PREFIX),
         "the description must teach the model what a placeholder looks like"
@@ -337,7 +367,11 @@ fn a_single_task_state_is_never_stubbed() {
 fn the_registers_tool_is_advertised_with_its_contract() {
     let def = update_task_state_definition();
     assert_eq!(def.function.name, "update_task_state");
-    assert!(def.function.parameters.required.contains(&"state".to_string()));
+    assert!(def
+        .function
+        .parameters
+        .required
+        .contains(&"state".to_string()));
     assert!(
         def.function.description.contains("verbatim"),
         "the survival guarantee is the reason to use the tool at all"

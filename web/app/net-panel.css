@@ -7,9 +7,11 @@
  * variables or its `.dark` class. Instead every rule reads a local `--np-*`
  * palette: light by default, switched to the dark set by `:has()` when either
  *   - the chat UI is in dark mode (`.acc-root.dark` somewhere in the page), or
- *   - this is the terminal page (`.np-chip` only ever renders in the terminal
- *     footer, `.console.shell` is the terminal's shell document hosting the
- *     panes — both permanently dark).
+ *   - this is a terminal document (`.console.shell` is the shell hosting the
+ *     panes, `.console.bare` a pane iframe — both permanently dark).
+ * The chat page's machine console renders an `.np-chip` of its own, inside a
+ * dark panel on a possibly light page — it scopes the dark set onto its own
+ * subtree (see vm-console.css) instead of flipping :root.
  */
 
 :root {
@@ -30,7 +32,7 @@
 }
 
 :root:has(.acc-root.dark),
-:root:has(.np-chip),
+:root:has(.console.bare),
 :root:has(.console.shell) {
 	/* Dark: warm charcoal, one notch brighter copper (theme.css `.dark`). */
 	--np-panel: hsl(25 12% 13%);
@@ -54,42 +56,175 @@
 	color: var(--accent, var(--np-primary));
 }
 .np-chip.np-relay-down,
-.np-fab.np-relay-down {
+.np-fab-seg.np-relay-down {
 	color: var(--np-err);
 	background: hsl(0 55% 45% / 0.12);
 }
-.np-fab.np-relay-down {
-	border-color: var(--np-err);
-}
 
-/* The chat page's floating network control: the mascot badge plus a status
- * glyph (LAN topology / globe) instead of words. */
-.np-fab {
+/* The chat page's machine capsule: one pill, four segments — power,
+ * terminal, screen, network status glyph. The pill wears the single
+ * border; the segments split it with hairlines and hover alone. */
+/* The machine's corner: the capsule, and beside it the machine's word about
+ * a boot in progress or one that failed. The dock holds the fixed position
+ * the pill used to; the pill keeps its look. Click-through between the
+ * two, so the note never shadows the page. */
+.np-fab-dock {
 	position: fixed;
 	right: 16px;
 	bottom: 16px;
 	z-index: 2147483000;
-	display: inline-flex;
+	display: flex;
 	align-items: center;
-	gap: 6px;
+	gap: 8px;
+	pointer-events: none;
+}
+.np-fab-dock > * {
+	pointer-events: auto;
+}
+.np-fab {
+	display: inline-flex;
+	align-items: stretch;
 	border: 1px solid var(--np-border);
 	background: var(--np-panel);
 	color: var(--np-primary);
 	line-height: 1;
-	padding: 6px 10px;
 	border-radius: 999px;
-	cursor: pointer;
+	overflow: hidden;
 	box-shadow: 0 4px 16px hsl(24 30% 10% / 0.15);
+}
+/* The boot note: one line of status, and under it the boot's one monotonic
+ * number as a hairline bar (vm.ts's BootProgress; the terminal page draws
+ * the same number on its veil). Copper while booting, red when failed,
+ * with the retry and console buttons the failure calls for. */
+.np-boot-note {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	max-width: min(60vw, 420px);
+	padding: 6px 12px;
+	border: 1px solid var(--np-border);
+	border-radius: 999px;
+	background: var(--np-panel);
+	color: var(--np-fg);
+	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	font-size: 12px;
+	line-height: 1.3;
+	box-shadow: 0 4px 16px hsl(24 30% 10% / 0.15);
+	position: relative;
+	overflow: hidden;
+}
+.np-boot-text {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.np-boot-track {
+	position: absolute;
+	left: 12px;
+	right: 12px;
+	bottom: 2px;
+	height: 2px;
+	border-radius: 1px;
+	background: var(--np-border);
+	overflow: hidden;
+}
+.np-boot-fill {
+	display: block;
+	height: 100%;
+	background: var(--np-primary);
+	transition: width 0.3s ease-out;
+}
+/* Before the first progress event lands there is no number yet: a short
+ * sweep says "alive" without claiming a percentage. */
+.np-boot-scan {
+	width: 30%;
+	animation: np-boot-sweep 1.2s ease-in-out infinite alternate;
+}
+@keyframes np-boot-sweep {
+	from {
+		transform: translateX(-100%);
+	}
+	to {
+		transform: translateX(333%);
+	}
+}
+.np-boot-failed {
+	border-color: var(--np-err);
+	color: var(--np-err);
+}
+.np-boot-act {
+	flex: none;
+	border: 1px solid currentColor;
+	border-radius: 999px;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	font-size: 11px;
+	padding: 2px 8px;
+	cursor: pointer;
+}
+.np-boot-act:hover {
+	background: var(--np-hover-wash);
+}
+/* The first-visit question (machine-power.ts) in the dialog's own dress:
+ * the two answers as option cards, what "remembered" means beneath them. */
+.np-ask .np-ask-body {
+	margin: 0 0 12px;
+	line-height: 1.5;
+}
+.np-ask .np-opt + .np-opt {
+	margin-top: 8px;
+}
+.np-ask .np-ask-note {
+	margin: 12px 0 0;
+	line-height: 1.5;
+	font-size: 11.5px;
 }
 .np-fab:hover {
 	border-color: var(--np-primary);
+}
+.np-fab-seg {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	padding: 6px 9px;
+	cursor: pointer;
+}
+.np-fab-seg + .np-fab-seg {
+	border-left: 1px solid var(--np-border);
+}
+.np-fab-seg:hover {
 	background: var(--np-primary-wash);
 }
-.np-fab-logo {
-	width: 18px;
-	height: 18px;
-	border-radius: 50%;
-	display: block;
+/* The power segment wears the machine's state: lit copper while it runs
+ * (or boots), quiet grey when it is off — and red after a boot that
+ * failed, which must not look like a machine somebody switched off. */
+.np-fab-power {
+	color: var(--np-muted);
+}
+.np-fab-power[data-state='ready'],
+.np-fab-power[data-state='booting'] {
+	color: var(--np-primary);
+}
+.np-fab-power[data-state='failed'] {
+	color: var(--np-err);
+}
+/* While the machine boots, the terminal segment breathes: the click is
+ * accepted (one window opens at ready), the pulse says "coming". */
+.np-fab-term[data-state='booting'] svg {
+	animation: np-fab-breathe 1.2s ease-in-out infinite;
+}
+@keyframes np-fab-breathe {
+	0%,
+	100% {
+		opacity: 1;
+	}
+	50% {
+		opacity: 0.35;
+	}
 }
 .np-fab svg {
 	display: block;
@@ -433,6 +568,32 @@
 .np-save:hover {
 	background: var(--np-primary-hover);
 	border-color: var(--np-primary-hover);
+}
+/* A destructive primary (the power-off confirm): the same button, dressed
+ * in the error red instead of copper. */
+.np-danger,
+.np-danger:hover {
+	background: var(--np-err, hsl(0 55% 45%));
+	border-color: var(--np-err, hsl(0 55% 45%));
+}
+.np-danger:hover {
+	filter: brightness(1.1);
+}
+
+/* The power-off confirm: the network panel's dress, one size smaller —
+ * a question, not a settings surface. */
+.np-poweroff {
+	width: 320px;
+}
+.np-poweroff-note {
+	margin: 10px 0 0;
+	font-size: 12.5px;
+	line-height: 1.5;
+	color: var(--np-muted);
+}
+.np-poweroff-next {
+	margin-top: 6px;
+	font-size: 11.5px;
 }
 
 /* The bridge's signalling choice (room code vs manual): the same card

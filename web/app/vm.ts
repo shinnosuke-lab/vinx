@@ -6,19 +6,24 @@
  *
  *   ttyS0  the person's console. Raw bytes both ways; the terminal page
  *          attaches xterm.js to `onConsole` / `sendConsole`.
- *   ttyS1  agentd, the command channel behind the `run_shell` tool. A line
- *          protocol (`RUN` out, `DONE` back, payloads base64) documented in
- *          linux/external/board/vinx/rootfs-overlay/usr/sbin/agentd.
+ *   ttyS1  the stream mux (§6.9): PTY window byte streams, SB1 frames,
+ *          rpcd on the guest end and StreamMux (app/stream-mux.ts) here.
+ *          Control (stream.opened/closed/credit) rides ttyS3. (agentd
+ *          lived here until Phase 3.)
  *   ttyS2  a real serial device, when the person plugs one in: `attachSerial`
  *          pumps bytes between a Web Serial port and the guest's third UART.
- *   ttyS3  hostcall, the guest-initiated mirror of ttyS1: the js(1) and
- *          fetch(1) CLIs send `CALL` lines and this page answers `DONE` —
- *          protocol and executors in app/hostcall.ts.
+ *   ttyS3  the control plane (system-v2 §6): VX1/VXA frames carrying a
+ *          JSON-RPC subset, both directions. rpcd owns the guest end; this
+ *          page's end is an RpcLink (app/rpc.ts) serving the page's methods
+ *          (hostcall.ts: debug.js, http.fetch, the desktop capabilities).
+ *          `runShell` rides it as proc.run (§15 Phase 2): rund executes,
+ *          big results come back as §6.8 output refs this side reads over
+ *          9p.
  *
- * One request at a time on ttyS1 — agentd is a `while read` loop — so
- * `runShell` queues. The console is not queued behind anything: keystrokes go
- * straight to the UART. ttyS3 needs no queue here: the guest side serialises
- * callers with a lock, and replies are id-matched anyway.
+ * runShell concurrency lives inside RpcLink and rund: many pending ids over
+ * one stop-and-wait sender, eight jobs at once on the machine (OVERLOADED
+ * past that). The console is not queued behind anything: keystrokes go
+ * straight to the UART.
  *
  * The VM is optional equipment: `boot()` failing (images not built, wasm
  * refused) leaves the page a chat client, the same stance mount() takes for a
@@ -32,22 +37,53 @@
 // here keeps the field typed without pulling the module into this chunk.
 import type { V86 as V86Type } from 'v86';
 
-import type { ShellDevice } from '../runtime/src/device-vm';
-import { answerHostcall, buildDoneLine, parseCallLine } from './hostcall';
+import type { DataEntry, ShellDevice } from '../runtime/src/device-vm';
+import { appFrameUrl } from './app-frame-url';
+import { bleBroker } from './ble';
+import { bridgeControl } from './bridge-ctl';
+import { captureFrame } from './camera';
+import { triggerDownload } from './downloads';
+import { pageMethods } from './hostcall';
+import { rememberedPower } from './machine-power';
+import { fileOpener, mimeFor, urlOpener, type OpenRequest } from './opener';
+import { withOriginLock } from './origin-broker';
 import { machineId } from './pane-id';
+import { RpcCallError, RpcLink } from './rpc';
 import { attachSharePersistence } from './share-store';
-import { dropSnapshot, loadSnapshot, saveSnapshot } from './vm-snapshot';
+import { StreamMux } from './stream-mux';
+import { windowManager } from './window-manager';
 
 export type VmState = 'off' | 'booting' | 'ready' | 'failed';
+
+/**
+ * A need for the machine met by a machine the person left off
+ * (machine-power.ts). Thrown by every implicit route into the VM — file
+ * writes, the control link, run_shell — so the caller can say so instead
+ * of booting behind the person's back. The message is the one line worth
+ * showing; `name` is for callers that want to react rather than display.
+ */
+export class MachineOffError extends Error {
+	override readonly name = 'MachineOffError';
+	constructor() {
+		super('the machine is powered off — the power key on the machine capsule (bottom right) boots it');
+	}
+}
 export type RelayHealth = 'connecting' | 'ok' | 'down' | null;
 
+/** Fired (on window, once, at boot) when this document lost the machine-name
+ * claim to another tab and is running as an ephemeral machine: it restores
+ * /data from the mirror like any boot, but nothing it writes goes back —
+ * its files live and die with the tab. The current answer also lives in
+ * `document.documentElement.dataset.vmIdentity` ('owner' | 'ephemeral'),
+ * for UIs that mount after boot and for tests. */
+export const VM_EPHEMERAL_EVENT = 'vinx:vm-ephemeral';
+
 /** Where a boot currently is, for a UI that wants to say more than
- * "booting": image download, kernel+userland execution, or snapshot
- * restore. `fraction` spans the whole boot, 0..1, and never moves
- * backwards — even across a failed restore falling back to a cold boot.
- * 'ready' still arrives via onState. */
+ * "booting": image download, then kernel+userland execution. `fraction`
+ * spans the whole boot, 0..1, and never moves backwards. 'ready' still
+ * arrives via onState. */
 export interface BootProgress {
-	phase: 'download' | 'kernel' | 'restore';
+	phase: 'download' | 'kernel';
 	fraction: number;
 }
 
@@ -108,36 +144,152 @@ export interface VmOptions {
 
 export interface RunResult {
 	exit_code: number;
-	/** stdout+stderr combined, as agentd captured it (64 KiB cap). */
+	/** stdout+stderr combined. Inline up to 64 KiB (the ceiling agentd used
+	 * to cut at silently); past it, the head plus an explicit truncation
+	 * marker naming the §6.8 output ref that holds the rest. */
 	output: string;
 }
 
-interface QueuedRun {
-	command: string;
-	timeoutS: number;
-	resolve: (r: RunResult) => void;
-	reject: (e: Error) => void;
+/** One port's arrival tally — enough to compute throughput and pacing
+ * without hauling per-byte timestamp arrays across an evaluate boundary. */
+export interface ProbeTally {
+	count: number;
+	/** performance.now() of the first byte since record(). */
+	firstAt: number;
+	lastAt: number;
+	/** Inter-byte pauses ≥ 1 ms: how often delivery stalled, and the worst. */
+	gaps: number;
+	maxGapMs: number;
+	/** The most recent ~2 KiB as text (printable ASCII and newlines, the
+	 * same filter the protocol parsers apply), for content assertions. */
+	tail: string;
 }
 
-/** How long past the guest-side timeout to wait before declaring agentd gone. */
+export interface ModemEvent {
+	line: 'dtr' | 'rts';
+	value: boolean;
+	at: number;
+}
+
+/** What waitCount answers: the tally when the target was crossed, stamped
+ * inside the byte listener itself (no polling noise on the RTT numbers). */
+export interface ProbeWaited {
+	count: number;
+	at: number;
+	timedOut?: boolean;
+}
+
+/** A PTY window stream came or went (rpcd's stream.opened/closed over
+ * ttyS3); the byte lane itself is ttyS1 (VinxVm.streamMux). `unmanaged`
+ * marks a stream with no app behind it (proc.pty's shell window): closing
+ * its window closes the stream, not an app. */
+export type StreamEvent =
+	| {
+			kind: 'opened';
+			id: number;
+			app: string;
+			cols: number;
+			rows: number;
+			window: number;
+			unmanaged: boolean;
+	  }
+	| { kind: 'closed'; id: number };
+
+/** The serial measurement instruments — see VinxVm.serialProbe(). */
+export interface SerialProbe {
+	/** Raw bytes page→guest: a number[] goes as-is, a string as UTF-8.
+	 * Returns the milliseconds the synchronous send loop held the thread. */
+	send(port: number, data: string | number[]): number;
+	/** `size` copies of one byte page→guest, built here so an evaluate does
+	 * not serialize a six-figure array to say "64 KiB of x". */
+	sendPattern(port: number, size: number, byte?: number): number;
+	/** Start (or restart) tallying guest→page bytes on a port. */
+	record(port: number): void;
+	/** The running tally; a snapshot, safe to serialize. */
+	recorded(port: number): ProbeTally;
+	/** Detach the port's tally listener; the final numbers. */
+	stopRecord(port: number): ProbeTally;
+	/** Resolves when the port's tally reaches `count` (record() first). */
+	waitCount(port: number, count: number, timeoutMs?: number): Promise<ProbeWaited>;
+	/** Start logging DTR/RTS transitions the guest's driver emits. */
+	watchModem(port: number): void;
+	modemEvents(port: number): ModemEvent[];
+	setCts(port: number, value: boolean): void;
+	setDsr(port: number, value: boolean): void;
+	setDcd(port: number, value: boolean): void;
+	setRing(port: number, value: boolean): void;
+	/** The emulated UART's own registers and its unbounded input queue. */
+	uartState(port: number): { backlog: number; ier: number; mcr: number; msr: number } | null;
+}
+
+/** How long past the guest-side timeout to wait before declaring the far
+ * end gone (the transport allowance on top of the command's own budget). */
 const CHANNEL_GRACE_MS = 10_000;
 /**
- * Booting means kernel + userland + agentd's READY, all emulated. Uncontended
- * this is ~1-2s; the generous ceiling covers a first boot that races a busy
- * engine worker (which starves the main-thread emulator) on a slow machine.
- * Pages pre-boot at load to keep that race off the critical path anyway.
+ * Booting means kernel + userland + the control plane answering, all
+ * emulated. Uncontended this is ~1-2s; the generous ceiling covers a first
+ * boot that races a busy engine worker (which starves the main-thread
+ * emulator) on a slow machine. Pages pre-boot at load to keep that race off
+ * the critical path anyway.
  */
 const BOOT_TIMEOUT_MS = 180_000;
 
+/** Inline `command` budget before runShell stages a §6.8 scriptRef: a
+ * control frame carries 4 KiB including the JSON envelope (§6.3), and
+ * js(1) draws its staging line at the same 3000 for the same reason. */
+const RUN_INLINE_MAX = 3000;
+/** How much of a proc.run output ref comes back inline: agentd's old
+ * `head -c 65536` ceiling, kept so the engine-visible contract does not
+ * shrink — what changed is the explicit marker past it, where agentd cut
+ * silently. */
+const RUN_OUTPUT_CAP = 65536;
+
+/** proc.run's reply (§6.8), the fields this adapter consumes. */
+interface ProcRunReply {
+	exitCode?: number;
+	timedOut?: boolean;
+	stdout?: string;
+	stdoutB64?: string;
+	truncated?: boolean;
+	output?: { path?: string; size?: number };
+	droppedBytes?: number;
+}
+
+/**
+ * The slice of v86's 9p filesystem the page drives directly (§8.2: /data is
+ * the page's own host9p — enumeration and unlink owe no guest round trip).
+ * None of this is in v86.d.ts; the structural cast is the same reach as
+ * startScreenRefresh and patchUart3Loopback, checked against the vendored
+ * build's lib/filesystem.js.
+ */
+interface Fs9pWalk {
+	/** -1 when the path does not resolve. */
+	id: number;
+	/** The would-be parent (-1 when even that is missing). */
+	parentid: number;
+	/** The missing component on the miss paths — undefined on a full hit
+	 * (v86 indexes one past the walk there); never trust it for Unlink. */
+	name?: string;
+}
+interface Fs9pInode {
+	size: number;
+	/** Seconds since the epoch — the unit `date -r +%s` printed. */
+	mtime: number;
+	mode: number;
+}
+interface Fs9pApi {
+	SearchPath(path: string): Fs9pWalk;
+	GetInode(idx: number): Fs9pInode;
+	GetChildren(parentid: number): string[];
+	CreateDirectory(name: string, parentid: number): number;
+	/** 0 on success; -39 (ENOTEMPTY) for a non-empty directory. */
+	Unlink(parentid: number, name: string): number;
+	GetRecursiveList(dirid: number, list: { parentid: number; name: string }[]): void;
+	IsDirectory(idx: number): boolean;
+}
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-
-function toBase64(text: string): string {
-	const bytes = encoder.encode(text);
-	let bin = '';
-	for (const b of bytes) bin += String.fromCharCode(b);
-	return btoa(bin);
-}
 
 function fromBase64(b64: string): string {
 	const bin = atob(b64);
@@ -183,29 +335,21 @@ export class VinxVm implements ShellDevice {
 	private consoleBuffer: number[] = [];
 	private consoleFlushQueued = false;
 
-	// ── ttyS1, agentd ──
-	private channelLine = '';
-	private channelReady: Promise<void>;
-	private channelReadySettle!: () => void;
-	private queue: QueuedRun[] = [];
-	private inFlight: {
-		id: number;
-		run: QueuedRun;
-		timer: ReturnType<typeof setTimeout>;
-	} | null = null;
-	/** Random base, not 1: a restored snapshot may hold a stale DONE from a
-	 * command the *previous* page had in flight at save time, and small ids
-	 * restart from the same place every load. */
-	private nextRunId = 1 + Math.floor(Math.random() * 1_000_000);
-
 	// ── ttyS2, the pass-through serial port ──
 	private serialWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
 	private serialBuffer: number[] = [];
 	private serialFlushQueued = false;
 	private serialDetach: (() => Promise<void>) | null = null;
 
-	// ── ttyS3, hostcall ──
-	private hostcallLine = '';
+	// ── ttyS3, the control link ──
+	private rpc: RpcLink | null = null;
+
+	// ── ttyS1, the stream mux (§6.9: PTY window byte streams) ──
+	private mux: StreamMux | null = null;
+	private streamListeners = new Set<(ev: StreamEvent) => void>();
+
+	// ── guest events (§6.7: rpc.event notifications this page watches) ──
+	private guestEventListeners = new Set<(topic: string, data: unknown) => void>();
 
 	// ── the VGA head ──
 	/**
@@ -216,6 +360,50 @@ export class VinxVm implements ShellDevice {
 	 * painting either way.
 	 */
 	private screenDiv: HTMLElement | null = null;
+
+	/** Desktop window surfaces, by the pages that render them — the
+	 * window.focus method (§10.7) resolves through these. */
+	private windowFocusHandlers = new Set<(id: string) => boolean>();
+	/** Toast sinks for notify.show's fallback (the terminal's corner note). */
+	private noteHandlers = new Set<(text: string) => void>();
+	/** Where a popup-blocked open parks for its retry click (the open chip). */
+	private openParkers = new Set<(req: OpenRequest) => void>();
+	/** Who hears the 9p write doorbell (share-store's early snapshot). */
+	private dataWriteListeners = new Set<() => void>();
+
+	/** Closing a window that fronts an app stops the app (§15 Phase 5's
+	 * close semantics, wired page-side). app.stop is idempotent and sets
+	 * rund's manual-stop latch, so the sweep does not resurrect what the
+	 * person just dismissed; for a pure web app (no backend) it is a no-op.
+	 * Since Phase 6 the close and every rise-to-top are also *events*
+	 * (§10.7 window.closed/window.focused): an rpc.emit up the link, fanned
+	 * out by rpcd to whoever subscribed (a console `rpc watch window`). */
+	private wireWindowCloses(): void {
+		windowManager().onClosed((id, appId) => {
+			this.rpc?.notify('rpc.emit', {
+				topic: 'window.closed',
+				data: appId ? { id, app: appId } : { id },
+			});
+			if (appId) {
+				void this.rpcCall('app.stop', { id: appId }, { deadlineMs: 15_000 }).catch(() => {});
+				return;
+			}
+			// An unmanaged terminal window (proc.pty's shell): no app to
+			// stop — closing the stream is the close. rpcd drops the PTY
+			// master, the shell gets HUP, rund reaps it. A failure here
+			// leaks a shell, which is worth a loud line.
+			if (id.startsWith('tty-')) {
+				const streamId = Number(id.slice(4));
+				if (Number.isFinite(streamId))
+					void this.rpcCall('stream.close', { id: streamId }, { deadlineMs: 10_000 }).catch(
+						(e) => console.error('vinx: stream.close failed for', id, e),
+					);
+			}
+		});
+		windowManager().onFocused((id) => {
+			this.rpc?.notify('rpc.emit', { topic: 'window.focused', data: { id } });
+		});
+	}
 
 	constructor(options: VmOptions = {}) {
 		// Anchored on this module's own URL, not the document's: the chat page
@@ -237,14 +425,24 @@ export class VinxVm implements ShellDevice {
 			memoryMb: options.memoryMb ?? 128,
 			networkRelay: options.networkRelay ?? 'inbrowser',
 		};
-		this.channelReady = new Promise((resolve) => {
-			this.channelReadySettle = resolve;
-		});
 		// Created eagerly so a screen panel opened before boot() still has an
 		// element to adopt; v86 fills it in when the emulator starts.
 		if (typeof document !== 'undefined') {
 			this.screenDiv = document.createElement('div');
 			this.screenDiv.className = 'vga-screen';
+			this.wireWindowCloses();
+		}
+		// Best-effort teardown signal for rpcd (§6.6): drop DCD as the page
+		// leaves. pagehide is not guaranteed to run — the next page's hello
+		// is the authoritative reset — this only accelerates it.
+		if (typeof window !== 'undefined') {
+			window.addEventListener('pagehide', () => {
+				try {
+					this.emulator?.serial_set_carrier_detect(3, false);
+				} catch {
+					/* the emulator may already be gone */
+				}
+			});
 		}
 	}
 
@@ -290,14 +488,17 @@ export class VinxVm implements ShellDevice {
 	}
 
 	/** The one gate every progress signal passes: clamps to 0..1, never
-	 * lets the number move backwards (a restore that falls back to a cold
-	 * boot re-reports cached downloads from zero), and mirrors it onto the
-	 * document for tests and status displays. */
+	 * lets the number move backwards, and mirrors it onto the document for
+	 * tests and status displays. */
 	private emitProgress(phase: BootProgress['phase'], fraction: number) {
 		const f = Math.max(this.bootFraction, Math.min(1, fraction));
 		this.bootFraction = f;
-		if (typeof document !== 'undefined')
+		if (typeof document !== 'undefined') {
 			document.documentElement.dataset.vmBootProgress = f.toFixed(3);
+			// The phase too, for a reader that has only the document (the
+			// vendored Apps page, see vm-status.ts).
+			document.documentElement.dataset.vmBootPhase = phase;
+		}
 		for (const l of this.progressListeners) l({ phase, fraction: f });
 	}
 
@@ -340,42 +541,47 @@ export class VinxVm implements ShellDevice {
 	/**
 	 * Start the VM. Idempotent: every caller gets the same boot.
 	 *
-	 * Resolves when agentd has said READY on ttyS1, which is after rcS — by
-	 * then the console shell on ttyS0 is up too.
+	 * Resolves when the control plane answers — the ttyS3 session is up and
+	 * rund behind it ran a probe — which is after rcS; by then the console
+	 * shell on ttyS0 is up too.
 	 */
 	boot(): Promise<void> {
 		if (!this.booting) this.booting = this.start();
 		return this.booting;
 	}
 
-	/** Whether this boot may use the snapshot cache. Relay-backed networks
-	 * stay out: a restored guest would keep a DHCP lease and connection
-	 * state the relay has long forgotten, and "fast boot into a broken
-	 * network" is worse than a cold boot. The in-browser hub is stateless
-	 * on the wire, fetch replays per-request, and no-network has nothing
-	 * to go stale. Dev never snapshots: __APP_VERSION__ does not change
-	 * between local rootfs rebuilds, so a stale snapshot would keep waking
-	 * yesterday's image and a freshly built rootfs would never boot. */
-	private snapshotable(): boolean {
-		if (import.meta.env.DEV) return false;
-		return ['inbrowser', 'fetch', ''].includes(this.options.networkRelay);
+	/**
+	 * The one gate for an IMPLICIT need of the machine — a file write, the
+	 * control link, run_shell: anything that is not the person pressing a
+	 * power key. Booting or ready, wait for it. Off (or failed), what the
+	 * person last left the machine as decides (machine-power.ts): left 'on'
+	 * — which here means a boot failed, since every power-off writes 'off' —
+	 * that is standing permission and the machine boots again; anything
+	 * else refuses with MachineOffError, and the caller says so. This is
+	 * what keeps "the machine boots when I say" true against every route in
+	 * — before it, dropping a file into the chat booted a machine its owner
+	 * had just declined. The explicit gestures call boot() directly.
+	 */
+	private whenUp(): Promise<void> {
+		if (this.state === 'booting' || this.state === 'ready') return this.boot();
+		if (rememberedPower() === 'on') return this.boot();
+		return Promise.reject(new MachineOffError());
 	}
 
 	/**
 	 * Claim this machine's name, origin-wide, for the life of this document.
 	 *
-	 * Snapshots are keyed by machineId(), and two browser tabs both play
-	 * pane 1: restoring the same image in both would put two NICs with the
-	 * same MAC — and the same MAC-derived 10.0.2.x address — on one
-	 * in-browser hub, and "open another terminal tab to network two VMs"
-	 * (the boot banner's own promise) would stop working. So only the tab
-	 * holding the lock may restore or save; a loser cold-boots into a fresh
-	 * random MAC, exactly what made two tabs interoperable before snapshots.
+	 * The /data mirror is keyed by machineId(), and two browser tabs can
+	 * both play pane 1: both sweeping their own /data into the one bucket
+	 * would interleave writes and propagate one tab's deletions over the
+	 * other's files. So only the tab holding the lock writes the mirror
+	 * (see share-store); a loser boots and restores /data all the same,
+	 * but runs as an ephemeral machine whose writes stay in RAM.
 	 *
 	 * The lock is never released by code — the browser drops it when the
 	 * document dies (reload included), which is precisely the lifetime of
 	 * the machine. No Web Locks (an http:// LAN origin is not a secure
-	 * context) means no arbiter, and the old restore-always behaviour.
+	 * context) means no arbiter, and the old everyone-writes behaviour.
 	 */
 	private claimIdentity(): Promise<boolean> {
 		this.identityClaim ??=
@@ -393,12 +599,12 @@ export class VinxVm implements ShellDevice {
 		return this.identityClaim;
 	}
 
-	/** What a snapshot must match to be trusted: the app version (agentd
-	 * protocol, rootfs contents), the exact network option and the memory
-	 * size — v86 requires identical construction, and the cmdline's
-	 * vinx.net token bakes the mode into the guest. */
-	private snapshotStamp(): string {
-		return `${__APP_VERSION__}|${this.options.networkRelay}|${this.options.memoryMb}`;
+	/** Whether this document holds the machine's name (see claimIdentity) and
+	 * with it the right to write the /data mirror. Settled during boot; the
+	 * mirror writers (share-store, drag-and-drop, camera) ask before every
+	 * private write. */
+	isOwner(): Promise<boolean> {
+		return this.claimIdentity();
 	}
 
 	/** The reason the machine is in 'failed', or null outside that state. */
@@ -410,8 +616,14 @@ export class VinxVm implements ShellDevice {
 		this.setState('booting');
 		this.sawKernelOutput = false;
 		this.lastBootError = null;
-		// A retry after 'failed' is a fresh boot: the bar starts over.
+		// A retry after 'failed' is a fresh boot: the bar starts over (the
+		// document mirror too, or a status reading it would open on the
+		// last boot's final number).
 		this.bootFraction = 0;
+		if (typeof document !== 'undefined') {
+			delete document.documentElement.dataset.vmBootProgress;
+			delete document.documentElement.dataset.vmBootPhase;
+		}
 		this.downloadedBytes.clear();
 		this.milestoneHit = 0;
 		this.milestoneLine = '';
@@ -421,28 +633,34 @@ export class VinxVm implements ShellDevice {
 				import('v86'),
 				import('v86/build/v86.wasm?url'),
 			]);
-			let how: 'cold' | 'restored' = 'cold';
-			if (this.snapshotable() && (await this.claimIdentity())) {
-				const saved = await loadSnapshot(machineId(), this.snapshotStamp());
-				if (saved) {
-					this.emitProgress('restore', 0.05);
-					if (await this.tryRestore(V86, v86WasmUrl, saved)) how = 'restored';
-					// A snapshot that failed once will fail every time —
-					// forget it rather than stall every boot on it.
-					else await dropSnapshot(machineId());
-				}
+			// Whether this document owns the machine's name, said out loud: a
+			// second tab of the same page loses the claim and silently ran as
+			// a machine that persists nothing. The dataset mirrors the answer
+			// for tests and for pages that mount later; the event pokes UIs
+			// already listening (the machine console's "ephemeral" badge).
+			const owner = await this.claimIdentity();
+			// Powered off while the image was still loading: build nothing.
+			if (this.state !== 'booting') throw new Error('the VM was shut down');
+			if (typeof document !== 'undefined') {
+				document.documentElement.dataset.vmIdentity = owner ? 'owner' : 'ephemeral';
+				if (!owner) window.dispatchEvent(new Event(VM_EPHEMERAL_EVENT));
 			}
-			if (how === 'cold') {
-				this.construct(V86, v86WasmUrl, null);
-				await this.channelUp();
-			}
-			// Observability for tests and the curious: which path booted us.
-			if (typeof document !== 'undefined') document.documentElement.dataset.vmBoot = how;
-			// READY is the finish line, whatever legs led to it.
-			this.emitProgress(how === 'restored' ? 'restore' : 'kernel', 1);
+			this.construct(V86, v86WasmUrl);
+			// The control plane answering is the finish line (§18): agentd's
+			// READY stopped gating the boot when run_shell left ttyS1.
+			// controlUp waits for rpcd to hold the tty, opens the session,
+			// and probes rund behind it.
+			await this.controlUp();
+			this.emitProgress('kernel', 1);
 			this.setState('ready');
-			if (how === 'cold') this.scheduleSnapshotSave();
 		} catch (e) {
+			// Powered off mid-boot (destroy() nulled the emulator and set
+			// 'off' already): the person changed their mind, which is not a
+			// failure and must not read as one — no red key, no reason kept.
+			if (this.state === 'off' && !this.emulator) {
+				this.booting = null;
+				throw e instanceof Error ? e : new Error(String(e));
+			}
 			// Recorded before setState so a listener reacting to 'failed' can
 			// already read the reason.
 			this.lastBootError = e instanceof Error ? e.message : String(e);
@@ -458,16 +676,8 @@ export class VinxVm implements ShellDevice {
 		}
 	}
 
-	/** Build the emulator and wire every listener. Identical construction on
-	 * both paths (v86 requires it for state restore); the restore path adds
-	 * `initial_state`, which wins over the freshly loaded kernel image once
-	 * applied — those image fetches come out of the HTTP cache that the
-	 * cold boot which saved the snapshot already filled. */
-	private construct(
-		V86: (typeof import('v86'))['V86'],
-		v86WasmUrl: string,
-		initialState: ArrayBuffer | null,
-	): void {
+	/** Build the emulator and wire every listener. */
+	private construct(V86: (typeof import('v86'))['V86'], v86WasmUrl: string): void {
 		const base = this.options.assetsBase;
 		const emulator = new V86({
 			wasm_path: v86WasmUrl,
@@ -482,7 +692,7 @@ export class VinxVm implements ShellDevice {
 			// The images carry the page's version as a cache-buster: their
 			// filenames are not content-hashed like the JS bundles, and a
 			// stale cached rootfs under a new page would speak yesterday's
-			// agentd protocol. One query string keeps them in step.
+			// control-plane dialect. One query string keeps them in step.
 			// rootfs.img is a gzipped cpio under a neutral name: a .gz
 			// extension makes static servers (vite's sirv among them) add
 			// Content-Encoding: gzip, the browser then decompresses in
@@ -518,8 +728,9 @@ export class VinxVm implements ShellDevice {
 				'rootfstype=ramfs ' +
 				'snd_sb16.isapnp=0 snd_sb16.port=0x220 snd_sb16.irq=5 snd_sb16.dma8=1 snd_sb16.dma16=5 ' +
 				`vinx.net=${netMode(this.options.networkRelay)}`,
-			// ttyS1 for agentd; ttyS2 for the Web Serial pass-through
-			// (attachSerial); ttyS3 for hostcall. ttyS0 always exists.
+			// ttyS1 idle (the future stream mux's); ttyS2 for the Web Serial
+			// pass-through (attachSerial); ttyS3 for the control plane.
+			// ttyS0 always exists.
 			uart1: true,
 			uart2: true,
 			uart3: true,
@@ -539,21 +750,13 @@ export class VinxVm implements ShellDevice {
 			// uploads and of reload-persistence (share-store.ts).
 			filesystem: {},
 			autostart: true,
-			// The snapshot, when there is one: applied after the images load,
-			// it wins over the fresh kernel. The MAC must ride along — the
-			// guest derived its hub address from it at boot and will not
-			// redo DHCP for a card it never saw disappear; snapshots are
-			// per-machine (see vm-snapshot.ts), so no two panes share one.
-			...(initialState
-				? { initial_state: { buffer: initialState }, preserve_mac_from_state_image: true }
-				: {}),
 		});
 		this.emulator = emulator;
 
 		emulator.add_listener('download-progress', (p) => {
 			// One monotonic number out of v86's two progress emitters (see
 			// BOOT_DOWNLOADS): identify the file by name, weight by bytes.
-			if (this.state !== 'booting' || initialState) return;
+			if (this.state !== 'booting') return;
 			const name = String(p.file_name ?? '');
 			const idx = BOOT_DOWNLOADS.findIndex((d) => d.re.test(name));
 			if (idx < 0) return;
@@ -577,24 +780,16 @@ export class VinxVm implements ShellDevice {
 			// emulated boot running.
 			if (!this.sawKernelOutput) {
 				this.sawKernelOutput = true;
-				if (this.state === 'booting' && !initialState) this.emitProgress('kernel', DOWNLOAD_SHARE);
+				if (this.state === 'booting') this.emitProgress('kernel', DOWNLOAD_SHARE);
 			}
-			// The boot milestones ride the same byte stream (cold boots
-			// only: a restored guest went through rcS in another life).
-			if (
-				this.state === 'booting' &&
-				!initialState &&
-				this.milestoneHit < KERNEL_MILESTONES.length
-			)
+			// The boot milestones ride the same byte stream.
+			if (this.state === 'booting' && this.milestoneHit < KERNEL_MILESTONES.length)
 				this.trackMilestone(byte);
 			this.consoleBuffer.push(byte);
 			if (!this.consoleFlushQueued) {
 				this.consoleFlushQueued = true;
 				queueMicrotask(() => this.flushConsole());
 			}
-		});
-		emulator.add_listener('serial1-output-byte', (byte: number) => {
-			this.onChannelByte(byte);
 		});
 		emulator.add_listener('serial2-output-byte', (byte: number) => {
 			// Nothing attached: the guest is talking to a dangling wire,
@@ -606,113 +801,252 @@ export class VinxVm implements ShellDevice {
 				queueMicrotask(() => this.flushSerial());
 			}
 		});
+		// The /data doorbell (§12.1): v86 announces every guest-side 9p
+		// TWRITE. A dirty flag only — the event names just a basename, and
+		// mkdir/unlink/truncate never ring — so listeners treat it as "scan
+		// soon", not as a locator; the periodic sweep still owns the truth.
+		// Page-side writes (putFile, the boot restore) bypass the 9p
+		// protocol layer and stay silent: the bell cannot answer itself.
+		emulator.add_listener('9p-write-end', () => {
+			for (const cb of this.dataWriteListeners) cb();
+		});
+		// The control link: RpcLink speaks the frames, this wires its bytes
+		// to the fourth UART. Methods live in hostcall.ts; the /data back end
+		// is the same 9p pair putFile/readFile use, with the /data prefix
+		// stripped (9p paths are relative to the mount).
+		this.rpc = new RpcLink({
+			sendBytes: (bytes) => this.emulator?.serial_send_bytes(3, bytes),
+			methods: pageMethods(
+				{
+					read: (path) => this.readFile(path.replace(/^\/data\//, '')),
+					write: (path, bytes) => this.putFile(path.replace(/^\/data\//, ''), bytes),
+				},
+				{
+					focusWindow: (id) => this.focusWindow(id),
+					windows: {
+						list: () => windowManager().list(),
+						create: (spec) => {
+							// §18: no untrusted mode without the shell. It ships
+							// beside the page (see app-frame-url.ts), so this
+							// trips only outside a document.
+							if (!appFrameUrl()) {
+								throw new Error(
+									'the app shell is not available here; refusing to run an untrusted app without it',
+								);
+							}
+							windowManager().create(spec);
+						},
+						close: (id) => windowManager().close(id),
+						focus: (id) => windowManager().focus(id),
+						move: (id, x, y) => windowManager().move(id, x, y),
+						resize: (id, w, h) => windowManager().resize(id, w, h),
+					},
+					notify: (text) => this.desktopNotify(text),
+					speak: (text) => {
+						if (typeof speechSynthesis === 'undefined') return false;
+						speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+						return true;
+					},
+					// One webcam per origin (§3.0): the broker turns a
+					// sibling machine's capture into RESOURCE_BUSY and a
+					// hidden document's into REQUIRES_FOREGROUND.
+					captureCamera: (name) => withOriginLock('camera', () => captureFrame(this, name)),
+					openUrl: (url) => this.openOnDesktop(urlOpener(url)),
+					openFile: (name, bytes) => {
+						// The opaque-type branch downloads directly: an
+						// <a download> needs no popup permission, and the
+						// caller hears which way it went.
+						if (mimeFor(name) === 'application/octet-stream') {
+							triggerDownload(name, bytes);
+							return 'downloaded';
+						}
+						return this.openOnDesktop(fileOpener(name, bytes));
+					},
+					download: (name, bytes) => {
+						triggerDownload(name, bytes);
+						return true;
+					},
+					ble: bleBroker,
+					bridge: bridgeControl,
+				},
+			),
+			implementation: 'vinx-desktop/1.0',
+			onSessionUp: () => {
+				// Streams are session-scoped: rpcd closed every PTY master
+				// when the old session died, so the page-side channels are
+				// corpses too (and half a frame of old ttyS1 bytes is noise),
+				// and so are the terminal windows showing them.
+				this.mux?.closeAll();
+				windowManager().dropAllStreams();
+				// Subscriptions are session state on rpcd's side too: say
+				// again what this page watches. app.* is the window
+				// annotator's feed (a backend dying marks its window).
+				this.rpc?.notify('rpc.watch', { topics: ['app'] });
+			},
+			onNotify: (method, params) => this.onGuestNotify(method, params),
+			log: (line) => console.info(line),
+		});
 		emulator.add_listener('serial3-output-byte', (byte: number) => {
-			this.onHostcallByte(byte);
+			this.rpc?.onByte(byte);
 		});
 		// Without this, the guest has no /dev/ttyS3 at all — see the method.
 		this.patchUart3Loopback();
+		// The stream lane (§6.9): raw PTY bytes over ttyS1, multiplexed.
+		// Control (opened/closed/credit) rides ttyS3 through onGuestNotify.
+		this.mux = new StreamMux({
+			sendBytes: (bytes) => this.emulator?.serial_send_bytes(1, bytes),
+		});
+		emulator.add_listener('serial1-output-byte', (byte: number) => {
+			this.mux?.onByte(byte);
+		});
 	}
 
-	/**
-	 * Wake a saved machine instead of booting one. The restored guest said
-	 * READY ages ago and will not say it again, so liveness is proven with
-	 * one round-trip over ttyS1 — a probe that also does the housekeeping a
-	 * wake-up needs: the guest's clock still shows save time, and /data
-	 * still holds the files of that moment, which must yield to the mirror
-	 * restore (share-store) that runs at 'ready', exactly as it does after
-	 * a cold boot. Any failure tears the emulator down and reports false;
-	 * the caller cold-boots.
-	 */
-	private async tryRestore(
-		V86: (typeof import('v86'))['V86'],
-		v86WasmUrl: string,
-		state: ArrayBuffer,
-	): Promise<boolean> {
-		try {
-			this.construct(V86, v86WasmUrl, state);
-			// Serial bytes sent before the devices exist fall on the floor.
-			// 'emulator-loaded' fires once v86 has applied the state image and
-			// called run() — only after that can agentd hear the probe.
-			await new Promise<void>((resolve, reject) => {
-				const timer = setTimeout(
-					() => reject(new Error('the restored emulator never started')),
-					30_000,
-				);
-				this.emulator?.add_listener('emulator-loaded', () => {
-					clearTimeout(timer);
-					resolve();
-				});
-			});
-			// The state image is applied and running; the liveness probe is
-			// all that separates this from ready.
-			this.emitProgress('restore', 0.6);
-			const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
-			const probe = await this.enqueueRun(
-				`date -u -s '${now}' >/dev/null 2>&1; ` +
-					'find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null; echo awake',
-				20,
-			);
-			if (probe.exit_code !== 0 || !probe.output.includes('awake')) return this.abandonRestore();
-			// The console shell of the saved session is still logged in and
-			// silent; a bare newline makes it print a prompt so the fresh
-			// xterm is not a blank stare.
-			this.sendConsole('\r');
-			return true;
-		} catch {
-			return this.abandonRestore();
+	/** Guest→page notifications that are not the link's own (rpc.cancel). */
+	private onGuestNotify(method: string, params: Record<string, unknown>) {
+		if (method === 'stream.credit') {
+			const id = typeof params.id === 'number' ? params.id : -1;
+			const bytes = typeof params.bytes === 'number' ? params.bytes : 0;
+			this.mux?.credit(id, bytes);
+			return;
 		}
-	}
-
-	private abandonRestore(): false {
-		this.emulator?.destroy();
-		this.emulator = null;
-		if (this.inFlight) {
-			clearTimeout(this.inFlight.timer);
-			this.inFlight.run.reject(new Error('the snapshot did not wake up'));
-			this.inFlight = null;
-		}
-		for (const run of this.queue.splice(0)) run.reject(new Error('the snapshot did not wake up'));
-		this.channelLine = '';
-		this.hostcallLine = '';
-		return false;
-	}
-
-	/**
-	 * Save this boot for next time, once things go quiet: ~10 s after ready
-	 * the mirror restore and the login banner are long done, and the machine
-	 * is a freshly booted idle system — which is exactly the state worth
-	 * replaying. /data content rides along in the state image but is wiped
-	 * again on restore (see tryRestore), so the mirror stays the one source
-	 * of truth. Best-effort: a failed save costs the next boot nothing but
-	 * the time a cold boot always cost.
-	 */
-	private scheduleSnapshotSave() {
-		if (!this.snapshotable() || typeof indexedDB === 'undefined') return;
-		setTimeout(async () => {
-			if (this.state !== 'ready' || !this.emulator) return;
-			// A tab that lost the identity claim must not save either: it
-			// would overwrite the winner's snapshot with its own MAC.
-			if (!(await this.claimIdentity())) return;
+		if (method === 'stream.opened') {
+			const id = typeof params.id === 'number' ? params.id : -1;
+			if (id < 0) return;
+			const ev: StreamEvent = {
+				kind: 'opened',
+				id,
+				app: typeof params.app === 'string' ? params.app : '?',
+				cols: typeof params.cols === 'number' ? params.cols : 80,
+				rows: typeof params.rows === 'number' ? params.rows : 24,
+				window: typeof params.window === 'number' ? params.window : 8 * 1024,
+				unmanaged: params.unmanaged === true,
+			};
+			// The stream is a terminal window (§6.9): put it on the desktop.
 			try {
-				const state = await this.emulator.save_state();
-				await saveSnapshot(machineId(), this.snapshotStamp(), state);
-			} catch {
-				/* see above: best-effort */
+				windowManager().openStream({
+					streamId: ev.id,
+					app: ev.app,
+					cols: ev.cols,
+					rows: ev.rows,
+					window: ev.window,
+					unmanaged: ev.unmanaged,
+				});
+			} catch (e) {
+				// The window cap; the stream stays open (the app runs
+				// headless) until someone closes it or the app exits.
+				console.warn('vinx: no window for stream', ev.id, e);
 			}
-		}, 10_000);
+			for (const cb of this.streamListeners) cb(ev);
+			return;
+		}
+		if (method === 'stream.closed') {
+			const id = typeof params.id === 'number' ? params.id : -1;
+			if (id < 0) return;
+			this.mux?.close(id);
+			// The app died (or the stream was torn down): the window leaves
+			// silently — no onClosed, there is nothing left to app.stop.
+			windowManager().dropStream(id);
+			for (const cb of this.streamListeners) cb({ kind: 'closed', id });
+			return;
+		}
+		if (method === 'rpc.event') {
+			const topic = typeof params.topic === 'string' ? params.topic : null;
+			if (topic === null) return;
+			if (topic === 'app.exited') {
+				// The window annotator (§10.7): a dead backend says so in
+				// its window's title. Closing stays the person's call.
+				const d = (params.data ?? {}) as { id?: unknown; code?: unknown };
+				if (typeof d.id === 'string')
+					windowManager().markExited(d.id, typeof d.code === 'number' ? d.code : null);
+			}
+			for (const cb of this.guestEventListeners) cb(topic, params.data);
+			return;
+		}
 	}
 
-	private async channelUp(): Promise<void> {
-		let timer: ReturnType<typeof setTimeout>;
-		await Promise.race([
-			this.channelReady,
-			new Promise<never>((_, reject) => {
-				timer = setTimeout(
-					() => reject(new Error('the VM did not finish booting (no READY from agentd)')),
-					BOOT_TIMEOUT_MS,
-				);
-			}),
-		]).finally(() => clearTimeout(timer));
+	/** Guest events this page subscribed to (rpc.watch in onSessionUp);
+	 * rpc.gap rides through like any topic. Returns the unsubscribe. */
+	onGuestEvent(cb: (topic: string, data: unknown) => void): () => void {
+		this.guestEventListeners.add(cb);
+		return () => this.guestEventListeners.delete(cb);
+	}
+
+	/** PTY window streams coming and going; returns the unsubscribe. */
+	onStreamEvent(cb: (ev: StreamEvent) => void): () => void {
+		this.streamListeners.add(cb);
+		return () => this.streamListeners.delete(cb);
+	}
+
+	/** The ttyS1 stream lane; null before boot. A terminal window opens its
+	 * channel here (mux.open) when a stream.opened event names it. */
+	get streamMux(): StreamMux | null {
+		return this.mux;
+	}
+
+	/** DTR on the guest's ttyS3, read off the emulated UART's MCR (the same
+	 * reach as patchUart3Loopback). The kernel raises DTR|RTS when a process
+	 * opens the port, only rpcd ever opens ttyS3 (the ownership invariant),
+	 * and close never drops the line (baseline M4) — so DTR high reads as
+	 * "rpcd holds the tty". */
+	private uart3Held(): boolean {
+		const uart = (
+			this.emulator as unknown as {
+				v86?: { cpu?: { devices?: { uart3?: { modem_control?: number } } } };
+			} | null
+		)?.v86?.cpu?.devices?.uart3;
+		return ((uart?.modem_control ?? 0) & 0x01) !== 0;
+	}
+
+	/**
+	 * Boot's finish line: the ttyS3 session is up and rund answers a probe.
+	 * The session alone is not enough — rpcd answers hello before rund's
+	 * rpc.serve lands (they are independently respawned daemons, §6.10), and
+	 * a caller right at that boundary would get an honest UNAVAILABLE. The
+	 * E2E suite gates the same way; gating the boot here spares every caller
+	 * the retry.
+	 */
+	private async controlUp(): Promise<void> {
+		const deadline = Date.now() + BOOT_TIMEOUT_MS;
+		// Not a byte before rpcd holds the tty: the open-time FIFO reset
+		// discards everything queued earlier (baseline M1a, recorded as a
+		// startup-order constraint in its §5), and a hello sprayed into the
+		// boot window comes back mangled through the pre-raw line discipline
+		// as parser noise. DTR is the "held" signal; if it never rises the
+		// spray-and-retry path below still recovers, just noisily.
+		const dtrBy = Date.now() + 30_000;
+		while (!this.uart3Held() && Date.now() < dtrBy) {
+			if (!this.rpc) throw new Error('the VM was shut down');
+			await new Promise((pause) => setTimeout(pause, 100));
+		}
+		// Open the control session. The DCD pulse is the attach signal §6.6
+		// describes (teardown acceleration for whatever session a respawned
+		// rpcd might think it still has); the hello that follows is the
+		// authoritative reset either way, and its retry loop rides over
+		// rpcd still coming up.
+		this.emulator?.serial_set_carrier_detect(3, false);
+		this.emulator?.serial_set_carrier_detect(3, true);
+		this.rpc?.attach();
+		for (;;) {
+			const rpc = this.rpc;
+			if (!rpc) throw new Error('the VM was shut down');
+			if (rpc.state === 'up') break;
+			if (Date.now() > deadline)
+				throw new Error('the VM did not finish booting (no control-plane session on ttyS3)');
+			await new Promise((pause) => setTimeout(pause, 100));
+		}
+		for (;;) {
+			const rpc = this.rpc;
+			if (!rpc) throw new Error('the VM was shut down');
+			try {
+				await rpc.call('proc.run', { command: 'true', timeoutMs: 10_000 }, { deadlineMs: 15_000 });
+				return;
+			} catch (e) {
+				if (!(e instanceof RpcCallError)) throw e;
+				if (Date.now() > deadline)
+					throw new Error(`the VM did not finish booting (proc.run never answered: ${e.name})`);
+				await new Promise((pause) => setTimeout(pause, 250));
+			}
+		}
 	}
 
 	// ── ttyS0 ──
@@ -727,7 +1061,7 @@ export class VinxVm implements ShellDevice {
 	sendConsole(data: string) {
 		// Not `serial0_send`: that walks UTF-16 code units and feeds each
 		// low byte to the UART, mangling anything beyond ASCII (U+4E2D would
-		// arrive as 0x2D). Encode to UTF-8 like the ttyS1 channel does.
+		// arrive as 0x2D). Encode to UTF-8 first.
 		this.emulator?.serial_send_bytes(0, encoder.encode(data));
 	}
 
@@ -796,7 +1130,7 @@ export class VinxVm implements ShellDevice {
 
 	/**
 	 * Tell the guest the console's size. A serial line carries no TIOCSWINSZ,
-	 * so this is an `stty` run over the command channel; fire-and-forget
+	 * so this is an `stty` run through runShell (proc.run); fire-and-forget
 	 * because a lost resize is a cosmetic problem.
 	 */
 	setConsoleSize(cols: number, rows: number) {
@@ -815,6 +1149,74 @@ export class VinxVm implements ShellDevice {
 	 */
 	getScreen(): HTMLElement | null {
 		return this.screenDiv;
+	}
+
+	/**
+	 * Register a desktop window surface for the guest's `window.focus`
+	 * (§10.7): the handler shows/raises its window and answers whether the
+	 * id was its to show. The screen panel registers as 'screen'. Returns
+	 * the unregister.
+	 */
+	onWindowFocus(handler: (id: string) => boolean): () => void {
+		this.windowFocusHandlers.add(handler);
+		return () => this.windowFocusHandlers.delete(handler);
+	}
+
+	/** Resolve a window.focus call through the registered surfaces. */
+	focusWindow(id: string): boolean {
+		let shown = false;
+		for (const handler of this.windowFocusHandlers) shown = handler(id) || shown;
+		return shown;
+	}
+
+	/** Register a toast sink for notify.show's fallback (the terminal's
+	 * corner note registers here). Returns the unregister. */
+	onDesktopNote(handler: (text: string) => void): () => void {
+		this.noteHandlers.add(handler);
+		return () => this.noteHandlers.delete(handler);
+	}
+
+	/** notify.show's carrier: a system notification where already granted
+	 * (no requestPermission — outside a gesture the browser would just
+	 * deny), else any registered toast. Null when neither surface exists,
+	 * and the method says so instead of dropping the text. */
+	desktopNotify(text: string): 'notification' | 'note' | null {
+		if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+			new Notification('vinx', { body: text });
+			return 'notification';
+		}
+		let noted = false;
+		for (const handler of this.noteHandlers) {
+			handler(text);
+			noted = true;
+		}
+		return noted ? 'note' : null;
+	}
+
+	/** Register a parking spot for a popup-blocked open (the terminal's
+	 * open chip: its click is the gesture the blocker respects). */
+	onOpenParked(handler: (req: OpenRequest) => void): () => void {
+		this.openParkers.add(handler);
+		return () => this.openParkers.delete(handler);
+	}
+
+	/** The /data doorbell: fires after any guest-side 9p write (a dirty
+	 * flag, no path — see the construct() listener). Returns the
+	 * unregister. share-store debounces this into an early snapshot. */
+	onDataWritten(handler: () => void): () => void {
+		this.dataWriteListeners.add(handler);
+		return () => this.dataWriteListeners.delete(handler);
+	}
+
+	/** Try an open now; a blocked one parks on any registered chip. */
+	private openOnDesktop(req: OpenRequest): 'opened' | 'parked' | null {
+		if (req.open()) return 'opened';
+		let parked = false;
+		for (const handler of this.openParkers) {
+			handler(req);
+			parked = true;
+		}
+		return parked ? 'parked' : null;
 	}
 
 	/**
@@ -1039,6 +1441,200 @@ export class VinxVm implements ShellDevice {
 		return { dac: peaks[0], master: peaks[1] };
 	}
 
+	// ── the serial probe, measurement gear ──
+
+	/**
+	 * Instruments over the emulated UARTs for the Phase 0 protocol
+	 * measurements (docs/protocol-baseline.zh-CN.md): raw sends, arrival
+	 * tallies stamped with performance.now(), modem lines both ways, and a
+	 * window into the UART's unbounded input queue. Test gear in the
+	 * vinxImages/vinxAudioRms stance — terminal.tsx puts it on window,
+	 * app/test/serial-bench.mjs drives it, production code never calls it.
+	 *
+	 * Recording rides the same bus events vm.ts already listens on (the bus
+	 * fans one event out to every listener), so tallying a port does not
+	 * disturb the control link's parsing. Sends inject bytes the guest
+	 * cannot tell from protocol traffic — the bench keeps its payloads
+	 * outside frame shapes so both sides' parsers drop them as noise.
+	 */
+	serialProbe(): SerialProbe {
+		const emulator = () => {
+			if (!this.emulator) throw new Error('the serial probe needs a booted VM');
+			return this.emulator;
+		};
+		// `serial${n}-output-byte` is a template string, not one of the
+		// literal keys add_listener's generic wants; the payload type is the
+		// same number for all four ports.
+		const outputEvent = (port: number) => `serial${port}-output-byte` as 'serial0-output-byte';
+
+		const tallies = new Map<number, ProbeTally>();
+		const byteListeners = new Map<number, (byte: number) => void>();
+		const waiters = new Map<
+			number,
+			{ count: number; timer: ReturnType<typeof setTimeout>; resolve: (r: ProbeWaited) => void }[]
+		>();
+		const modemLogs = new Map<number, ModemEvent[]>();
+		const modemListeners = new Map<number, ((value: boolean) => void)[]>();
+
+		const snapshot = (port: number): ProbeTally => {
+			const t = tallies.get(port);
+			return t
+				? { ...t }
+				: { count: 0, firstAt: 0, lastAt: 0, gaps: 0, maxGapMs: 0, tail: '' };
+		};
+		const settleWaiters = (port: number, r: ProbeWaited) => {
+			for (const w of waiters.get(port) ?? []) {
+				clearTimeout(w.timer);
+				w.resolve(r);
+			}
+			waiters.delete(port);
+		};
+		const stopRecord = (port: number): ProbeTally => {
+			const listener = byteListeners.get(port);
+			if (listener) {
+				emulator().remove_listener(outputEvent(port), listener);
+				byteListeners.delete(port);
+			}
+			const finalTally = snapshot(port);
+			settleWaiters(port, { count: finalTally.count, at: finalTally.lastAt, timedOut: true });
+			return finalTally;
+		};
+
+		return {
+			send: (port, data) => {
+				const bytes =
+					typeof data === 'string' ? encoder.encode(data) : Uint8Array.from(data);
+				const started = performance.now();
+				emulator().serial_send_bytes(port, bytes);
+				return performance.now() - started;
+			},
+			sendPattern: (port, size, byte = 0x78) => {
+				const bytes = new Uint8Array(size).fill(byte & 0xff);
+				const started = performance.now();
+				emulator().serial_send_bytes(port, bytes);
+				return performance.now() - started;
+			},
+			record: (port) => {
+				stopRecord(port);
+				const tally: ProbeTally = {
+					count: 0,
+					firstAt: 0,
+					lastAt: 0,
+					gaps: 0,
+					maxGapMs: 0,
+					tail: '',
+				};
+				tallies.set(port, tally);
+				const listener = (byte: number) => {
+					const at = performance.now();
+					if (tally.count === 0) {
+						tally.firstAt = at;
+					} else {
+						const gap = at - tally.lastAt;
+						if (gap >= 1) {
+							tally.gaps++;
+							if (gap > tally.maxGapMs) tally.maxGapMs = gap;
+						}
+					}
+					tally.lastAt = at;
+					tally.count++;
+					if (byte === 0x0a || (byte >= 0x20 && byte <= 0x7e)) {
+						tally.tail += String.fromCharCode(byte);
+						if (tally.tail.length > 4096) tally.tail = tally.tail.slice(-2048);
+					}
+					const queue = waiters.get(port);
+					if (queue?.length) {
+						for (let i = queue.length - 1; i >= 0; i--) {
+							if (tally.count >= queue[i].count) {
+								clearTimeout(queue[i].timer);
+								queue[i].resolve({ count: tally.count, at });
+								queue.splice(i, 1);
+							}
+						}
+					}
+				};
+				byteListeners.set(port, listener);
+				emulator().add_listener(outputEvent(port), listener);
+			},
+			recorded: snapshot,
+			stopRecord,
+			waitCount: (port, count, timeoutMs = 30_000) => {
+				return new Promise<ProbeWaited>((resolve) => {
+					const tally = tallies.get(port);
+					if (!byteListeners.has(port)) {
+						// No recorder, so nothing will ever resolve this.
+						resolve({ count: tally?.count ?? 0, at: -1, timedOut: true });
+						return;
+					}
+					if (tally && tally.count >= count) {
+						resolve({ count: tally.count, at: tally.lastAt });
+						return;
+					}
+					const queue = waiters.get(port) ?? [];
+					waiters.set(port, queue);
+					const entry = {
+						count,
+						resolve,
+						timer: setTimeout(() => {
+							const i = queue.indexOf(entry);
+							if (i >= 0) queue.splice(i, 1);
+							resolve({ count: tallies.get(port)?.count ?? 0, at: -1, timedOut: true });
+						}, timeoutMs),
+					};
+					queue.push(entry);
+				});
+			},
+			watchModem: (port) => {
+				if (modemListeners.has(port)) return;
+				const log: ModemEvent[] = [];
+				modemLogs.set(port, log);
+				const on = (line: ModemEvent['line']) => (value: boolean) => {
+					log.push({ line, value, at: performance.now() });
+				};
+				const dtr = on('dtr');
+				const rts = on('rts');
+				// Stays a member call: v86's add_listener reaches this.bus.
+				const emu = emulator() as unknown as {
+					add_listener(name: string, fn: (v: boolean) => void): void;
+				};
+				emu.add_listener(`serial${port}-data-terminal-ready-output`, dtr);
+				emu.add_listener(`serial${port}-request-to-send-output`, rts);
+				modemListeners.set(port, [dtr, rts]);
+			},
+			modemEvents: (port) => [...(modemLogs.get(port) ?? [])],
+			setCts: (port, value) => emulator().serial_set_clear_to_send(port, value),
+			setDsr: (port, value) => emulator().serial_set_data_set_ready(port, value),
+			setDcd: (port, value) => emulator().serial_set_carrier_detect(port, value),
+			setRing: (port, value) => emulator().serial_set_ring_indicator(port, value),
+			uartState: (port) => {
+				const uart = (
+					this.emulator as unknown as {
+						v86?: {
+							cpu?: {
+								devices?: Record<
+									string,
+									{
+										input?: unknown[];
+										ier?: number;
+										modem_control?: number;
+										modem_status?: number;
+									}
+								>;
+							};
+						};
+					} | null
+				)?.v86?.cpu?.devices?.[`uart${port}`];
+				if (!uart) return null;
+				return {
+					backlog: Array.isArray(uart.input) ? uart.input.length : 0,
+					ier: uart.ier ?? 0,
+					mcr: uart.modem_control ?? 0,
+					msr: uart.modem_status ?? 0,
+				};
+			},
+		};
+	}
+
 	// ── ttyS2, the pass-through serial port ──
 
 	/**
@@ -1058,7 +1654,7 @@ export class VinxVm implements ShellDevice {
 		baudRate: number,
 		onClose?: () => void,
 	): Promise<() => Promise<void>> {
-		await this.boot();
+		await this.whenUp();
 		await this.serialDetach?.();
 		await port.open({ baudRate });
 		const writer = port.writable!.getWriter();
@@ -1111,96 +1707,236 @@ export class VinxVm implements ShellDevice {
 	/**
 	 * Put a file into the persistent directory (guest: `/data/<name>`). Paths
 	 * are relative to the 9p root: a bare name for the private tier, or the
-	 * one sanctioned nested path, `share/local/<name>` — whose directories
-	 * must already exist in the guest (share-store's ensureLocalDir); v86's
-	 * create_file walks the tree, it does not mkdir. Boots the VM first if
-	 * needed.
+	 * sanctioned nested paths — `share/local/<name>` (share-store's
+	 * ensureLocalDir) and `.vinx/tmp/<name>` (the control plane's resource
+	 * namespace, created by inittab at boot) — whose directories must already
+	 * exist in the guest; v86's create_file walks the tree, it does not
+	 * mkdir. Boots the VM first if needed.
 	 */
 	async putFile(name: string, bytes: Uint8Array): Promise<void> {
-		await this.boot();
-		await this.emulator!.create_file(name.replace(/^\/+/, ''), bytes);
+		await this.whenUp();
+		const rel = name.replace(/^\/+/, '');
+		// v86's create_file always makes a NEW inode (the parent's mode & 0644,
+		// regular): a file that already existed is replaced, and its mode with
+		// it. Rewriting a script — write_file over the `run` that `app new`
+		// made executable — stripped the exec bit and `app check` then failed
+		// on ENTRY_NOT_EXEC, the file the model had just edited in front of
+		// it. Carry the old mode over, the way `cp` onto an existing file
+		// would (the bytes change, the permissions do not).
+		const fs = this.fs9p();
+		const before = fs ? fs.SearchPath(rel) : null;
+		const mode = before && before.id !== -1 ? fs!.GetInode(before.id).mode : null;
+		await this.emulator!.create_file(rel, bytes);
+		if (mode !== null && fs) {
+			const after = fs.SearchPath(rel);
+			if (after.id !== -1) fs.GetInode(after.id).mode = mode;
+		}
 	}
 
-	/** Read a file back from the shared directory; rejects if it is missing. */
+	/** Read a file back from the shared directory; rejects if it is missing.
+	 * An existing empty file reads as empty bytes — v86's read_file rejects
+	 * with FileNotFoundError for that too (get_data has no buffer for an
+	 * inode nothing was ever written to and returns null), and a snapshot
+	 * that took "not found" at its word would keep a stale copy of a file
+	 * the guest emptied (`app disable` of the last enabled app writes a
+	 * 0-byte /data/apps/enabled) for good. */
 	async readFile(name: string): Promise<Uint8Array> {
-		await this.boot();
-		return await this.emulator!.read_file(name.replace(/^\/+/, ''));
+		await this.whenUp();
+		const rel = name.replace(/^\/+/, '');
+		try {
+			return await this.emulator!.read_file(rel);
+		} catch (e) {
+			const fs = this.fs9p();
+			const walk = fs?.SearchPath(rel);
+			if (fs && walk && walk.id !== -1 && !fs.IsDirectory(walk.id) && fs.GetInode(walk.id).size === 0) {
+				return new Uint8Array(0);
+			}
+			throw e;
+		}
 	}
-
-	// ── ttyS1 ──
 
 	/**
-	 * Run a command in the VM: `sh -c` as root, stdout+stderr combined.
-	 *
-	 * Queued: agentd answers one request at a time, and interleaving two would
-	 * interleave their DONE lines. Rejects when the VM is not up or the
-	 * channel goes quiet past the guest-side timeout.
+	 * List a /data directory from the page-side inodes — the page's own
+	 * filesystem needs no guest round trip (§8.2). `name` is 9p-root
+	 * relative; '' is /data itself. Rejects when the name is not a
+	 * directory.
 	 */
-	async runShell(command: string, timeoutS = 30): Promise<RunResult> {
-		// No fast-fail on a prior 'failed': boot() resets its cached promise on
-		// failure, so awaiting it here re-attempts (and re-throws if it fails
-		// again) rather than being stuck until a reload.
-		await this.boot();
-		return this.enqueueRun(command, timeoutS);
-	}
-
-	/** The queue entry itself, without the boot() gate — the restore probe
-	 * runs while start() is still the pending boot promise, and awaiting
-	 * boot() from inside it would deadlock. */
-	private enqueueRun(command: string, timeoutS: number): Promise<RunResult> {
-		return new Promise<RunResult>((resolve, reject) => {
-			this.queue.push({ command, timeoutS, resolve, reject });
-			this.pump();
+	async listData(name: string): Promise<DataEntry[]> {
+		await this.whenUp();
+		const fs = this.fs9p();
+		if (!fs) throw new Error('the VM was shut down');
+		const rel = name.replace(/^\/+/, '').replace(/\/+$/, '');
+		let dirId = 0;
+		if (rel !== '') {
+			const walk = fs.SearchPath(rel);
+			if (walk.id === -1) throw new Error(`no such directory in /data: ${rel}`);
+			dirId = walk.id;
+		}
+		if (!fs.IsDirectory(dirId)) throw new Error(`not a directory: /data/${rel}`);
+		return fs.GetChildren(dirId).map((child) => {
+			const walk = fs.SearchPath(rel === '' ? child : `${rel}/${child}`);
+			const inode = fs.GetInode(walk.id);
+			return {
+				name: child,
+				size: inode.size,
+				mtime: inode.mtime,
+				mode: inode.mode,
+				dir: fs.IsDirectory(walk.id),
+			};
 		});
 	}
 
-	private pump() {
-		if (this.inFlight || !this.queue.length || !this.emulator) return;
-		const run = this.queue.shift()!;
-		const id = this.nextRunId++;
-		const timer = setTimeout(
-			() => {
-				// agentd itself KILLs at timeoutS; reaching this means the
-				// channel is gone, not just the command slow.
-				if (this.inFlight?.id === id) {
-					this.inFlight = null;
-					run.reject(new Error('the VM stopped answering on the command channel'));
-					this.pump();
-				}
-			},
-			run.timeoutS * 1000 + CHANNEL_GRACE_MS,
-		);
-		this.inFlight = { id, run, timer };
-		// The payload's character count travels ahead of it: a long line that
-		// loses its tail on the way used to decode cleanly whenever the cut
-		// fell on a base64 boundary, and the guest ran half a command without
-		// either side noticing. agentd now refuses a payload whose length
-		// disagrees — see the protocol notes in the overlay's agentd.
-		const payload = toBase64(run.command);
-		const line = `RUN ${id} ${Math.max(1, Math.ceil(run.timeoutS))} ${payload.length} ${payload}\n`;
-		this.emulator.serial_send_bytes(1, encoder.encode(line));
-	}
-
-	private onChannelByte(byte: number) {
-		if (byte === 0x0a) {
-			const line = this.channelLine;
-			this.channelLine = '';
-			this.onChannelLine(line);
-			return;
+	/** `mkdir -p` inside /data, page-side: create_file walks but never
+	 * mkdirs, so nested writes need the parents made here first. */
+	async ensureDir(name: string): Promise<void> {
+		await this.whenUp();
+		const fs = this.fs9p();
+		if (!fs) throw new Error('the VM was shut down');
+		const segs = name
+			.replace(/^\/+/, '')
+			.split('/')
+			.filter((s) => s !== '' && s !== '.');
+		if (segs.some((s) => s === '..')) throw new Error(`a /data path may not climb: ${name}`);
+		let parent = 0;
+		let at = '';
+		for (const seg of segs) {
+			at = at ? `${at}/${seg}` : seg;
+			const walk = fs.SearchPath(at);
+			if (walk.id === -1) parent = fs.CreateDirectory(seg, parent);
+			else if (!fs.IsDirectory(walk.id)) throw new Error(`not a directory: /data/${at}`);
+			else parent = walk.id;
 		}
-		// The protocol is pure ASCII (verbs, digits, base64), so anything else
-		// is line noise and dropped here. This is not hypothetical: v86's
-		// second UART emits a stray 0xFF as the guest brings the port up, and
-		// left in place it glued itself onto "READY agentd" and made the
-		// startsWith check miss the one line boot() waits for.
-		if (byte < 0x20 || byte > 0x7e) return;
-		this.channelLine += String.fromCharCode(byte);
-		// A runaway line without newlines would grow forever; agentd never
-		// legitimately sends one longer than ~90k (64 KiB base64-encoded).
-		if (this.channelLine.length > 200_000) this.channelLine = '';
 	}
 
-	// ── ttyS3, hostcall ──
+	/**
+	 * Set or clear the execute bits on a /data file, page-side: GetInode
+	 * hands back the live inode object, and the guest reads mode through 9p
+	 * getattr from exactly that object — the chmod round trip share-store's
+	 * restore used to make is not owed. Quietly does nothing for a missing
+	 * name (a stale exec-list entry must not fail a whole restore batch).
+	 */
+	setExecData(name: string, exec: boolean): void {
+		const fs = this.fs9p();
+		if (!fs) return;
+		const walk = fs.SearchPath(name.replace(/^\/+/, ''));
+		if (walk.id === -1) return;
+		const inode = fs.GetInode(walk.id);
+		inode.mode = exec ? inode.mode | 0o111 : inode.mode & ~0o111;
+	}
+
+	/** Best-effort page-side unlink in /data (staging relays, spent output
+	 * refs). A no-op before boot or for a name that is not there. */
+	deleteData(name: string): void {
+		const fs = this.fs9p();
+		if (!fs) return;
+		const rel = name.replace(/^\/+/, '');
+		const walk = fs.SearchPath(rel);
+		if (walk.id === -1 || walk.parentid === -1) return;
+		const base = rel.split('/').pop();
+		if (base) fs.Unlink(walk.parentid, base);
+	}
+
+	// ── run_shell, the proc.run adapter (§15 Phase 2) ──
+
+	/**
+	 * Run a command in the VM: `sh -c` as root, stdout+stderr combined,
+	 * starting in /data. Rides proc.run on the ttyS3 control plane: rund
+	 * executes (eight jobs at once; OVERLOADED past that), a long command is
+	 * staged as a §6.8 scriptRef because a control frame carries 4 KiB, and
+	 * a big result comes back as an output ref this side reads over 9p —
+	 * whole up to the old 64 KiB ceiling, an explicit truncation marker past
+	 * it. Rejects when the call could not run at all (link down, params
+	 * refused): the command may never have started, which is a tool failure,
+	 * not an exit code.
+	 */
+	async runShell(command: string, timeoutS = 30): Promise<RunResult> {
+		// whenUp: waits out a boot, re-boots a machine remembered 'on' (a
+		// prior 'failed' is re-attempted, not cached — boot() resets on
+		// failure), and refuses with MachineOffError for one left off.
+		await this.whenUp();
+		const rpc = this.rpc;
+		if (!rpc) throw new Error('the VM was shut down');
+		const timeoutMs = Math.max(1, Math.ceil(timeoutS)) * 1000;
+		const opts = { deadlineMs: timeoutMs + CHANNEL_GRACE_MS };
+		const bytes = encoder.encode(command);
+		let staged: string | null = null;
+		try {
+			let reply: unknown;
+			if (bytes.length > RUN_INLINE_MAX) {
+				staged = `.vinx/tmp/run-${Math.random().toString(16).slice(2, 10)}.sh`;
+				await this.putFile(staged, bytes);
+				reply = await rpc.call(
+					'proc.run',
+					{ scriptRef: { path: `/data/${staged}`, size: bytes.length }, timeoutMs },
+					opts,
+				);
+			} else {
+				reply = await rpc.call('proc.run', { command, timeoutMs }, opts);
+			}
+			return await this.collectRun(reply as ProcRunReply);
+		} catch (e) {
+			if (e instanceof RpcCallError) {
+				// Surface the §6.4 name and hint rather than inventing an
+				// exit code for a command that may never have started.
+				throw new Error(
+					`run_shell could not complete: ${e.name}: ${e.message}${e.hint ? ` (${e.hint})` : ''}`,
+				);
+			}
+			throw e;
+		} finally {
+			if (staged) this.deleteData(staged);
+		}
+	}
+
+	/**
+	 * Fold a proc.run reply into the adapter's {exit_code, output} shape.
+	 * An output ref is this caller's to spend (§6.8 owner): read back over
+	 * 9p and deleted when it fits the old inline ceiling, else the head is
+	 * inlined and the marker names the ref — which stays for read_file,
+	 * until the boot sweep reclaims the namespace.
+	 */
+	private async collectRun(reply: ProcRunReply): Promise<RunResult> {
+		const exit_code = typeof reply.exitCode === 'number' ? reply.exitCode : 125;
+		let output = typeof reply.stdout === 'string' ? reply.stdout : '';
+		if (typeof reply.stdoutB64 === 'string') {
+			try {
+				output = fromBase64(reply.stdoutB64);
+			} catch {
+				output = '(rund sent undecodable output)';
+			}
+		}
+		const ref = reply.truncated ? reply.output : undefined;
+		if (ref && typeof ref.path === 'string') {
+			const rel = ref.path.replace(/^\/data\//, '');
+			try {
+				const bytes = await this.readFile(rel);
+				if (bytes.length <= RUN_OUTPUT_CAP) {
+					output = decoder.decode(bytes);
+					this.deleteData(rel);
+				} else {
+					// The byte cut can split a UTF-8 sequence; the lossy decode
+					// (U+FFFD) is the same behaviour agentd's head -c had.
+					output =
+						decoder.decode(bytes.subarray(0, RUN_OUTPUT_CAP)) +
+						`\n[output truncated after ${RUN_OUTPUT_CAP} bytes: ${ref.size ?? bytes.length} bytes total` +
+						(reply.droppedBytes ? ` (${reply.droppedBytes} more were dropped)` : '') +
+						`; the full output is at ${ref.path} — read_file can fetch it, until this machine reboots]`;
+				}
+			} catch {
+				// The ref could not be read back (a 9p hiccup); the inline
+				// head rund sent still stands, marked for what it is.
+				output += `\n[output truncated: ${ref.size ?? '?'} bytes total at ${ref.path}]`;
+			}
+		}
+		return { exit_code, output };
+	}
+
+	/** v86's 9p filesystem object (see Fs9pApi); null before construct. */
+	private fs9p(): Fs9pApi | null {
+		return (this.emulator as unknown as { fs9p?: Fs9pApi } | null)?.fs9p ?? null;
+	}
+
+	// ── ttyS3, the control plane's UART ──
 
 	/**
 	 * Teach v86's fourth UART the loopback trick Linux demands of COM4.
@@ -1260,110 +1996,57 @@ export class VinxVm implements ShellDevice {
 		tryPatch();
 	}
 
-	private onHostcallByte(byte: number) {
-		if (byte === 0x0a) {
-			const line = this.hostcallLine;
-			this.hostcallLine = '';
-			void this.onHostcallLine(line);
-			return;
-		}
-		// The same defence onChannelByte earned the hard way: v86's UARTs
-		// emit a stray 0xFF as the guest brings the port up, and the protocol
-		// is pure ASCII anyway.
-		if (byte < 0x20 || byte > 0x7e) return;
-		this.hostcallLine += String.fromCharCode(byte);
-		if (this.hostcallLine.length > 200_000) this.hostcallLine = '';
+	/** The control link, for tests and future adapters; null before boot. */
+	get rpcLink(): RpcLink | null {
+		return this.rpc;
 	}
 
 	/**
-	 * One CALL, one DONE — on *every* path. The guest CLI blocks on its read
-	 * with only a coarse timeout as backstop; an unanswered failure here
-	 * would leave it staring at the wire for that whole timeout.
+	 * Call a guest-side method over the control link (proc.run in Phase 1).
+	 * Rejects with RpcCallError — code and name are the stable contract —
+	 * or with MachineOffError when the machine is off and the person left it
+	 * that way (whenUp, machine-power.ts).
 	 */
-	private async onHostcallLine(line: string) {
-		const call = parseCallLine(line);
-		if (!call) return; // boot noise, or something that never named an id
-		let reply: Record<string, unknown>;
-		if (call.error) {
-			reply = { ok: false, error: `hostcall: ${call.error}` };
-		} else {
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			try {
-				let payload = call.payload;
-				// A too-big request arrived as {req: <file>}: the real payload
-				// waits in /data, written by the CLI, deleted by the CLI.
-				const req = (payload as { req?: unknown } | null)?.req;
-				if (typeof req === 'string') {
-					if (!/^\.hostcall-[\w.-]+$/.test(req)) {
-						throw new Error(`hostcall: not a request relay name: ${req}`);
-					}
-					payload = JSON.parse(decoder.decode(await this.readFile(req)));
-				}
-				// The executors carry their own timeouts; this outer race only
-				// exists so a wedged one still answers the wire.
-				const budgetMs =
-					Math.min(120_000, Math.max(1_000, Number((payload as any)?.timeoutMs) || 30_000)) +
-					10_000;
-				reply = await Promise.race([
-					answerHostcall(call.kind, payload, call.id, (name, bytes) => this.putFile(name, bytes)),
-					new Promise<Record<string, unknown>>((resolve) => {
-						timer = setTimeout(
-							() =>
-								resolve({
-									ok: false,
-									error: 'hostcall: the page timed out answering',
-								}),
-							budgetMs,
-						);
-					}),
-				]);
-			} catch (e) {
-				reply = {
-					ok: false,
-					error: e instanceof Error ? e.message : String(e),
-				};
-			} finally {
-				clearTimeout(timer);
-			}
-		}
-		this.emulator?.serial_send_bytes(3, encoder.encode(buildDoneLine(call.id, reply)));
+	async rpcCall(
+		method: string,
+		params?: Record<string, unknown>,
+		opts?: { deadlineMs?: number; signal?: AbortSignal },
+	): Promise<unknown> {
+		await this.whenUp();
+		if (!this.rpc) throw new Error('the control link never came up');
+		return this.rpc.call(method, params, opts);
 	}
 
-	private onChannelLine(line: string) {
-		if (line.startsWith('READY')) {
-			this.channelReadySettle();
-			return;
-		}
-		if (!line.startsWith('DONE ')) return; // boot noise, or a partial line
-		const [, id, code, b64 = ''] = line.split(' ');
-		const flight = this.inFlight;
-		if (!flight || String(flight.id) !== id) return; // a timed-out ghost
-		clearTimeout(flight.timer);
-		this.inFlight = null;
-		let output = '';
+	/** One in-flight proc.pty at a time: rpcCall waits out the boot, so
+	 * mashing the terminal button on a machine still starting would queue
+	 * one call per click and burst that many shell windows at ready.
+	 * While a call is in flight, further clicks are the same wish already
+	 * granted — dropped, not queued. (rpcd sends stream.opened before the
+	 * proc.pty reply lands, so by the unlock the window is already up and
+	 * a ready machine still opens one window per deliberate click.) */
+	private ptyOpening = false;
+
+	async openShellWindow(): Promise<void> {
+		if (this.ptyOpening) return;
+		this.ptyOpening = true;
 		try {
-			output = b64 ? fromBase64(b64) : '';
-		} catch {
-			output = '(agentd sent undecodable output)';
+			await this.rpcCall('proc.pty', {}, { deadlineMs: 15_000 });
+		} finally {
+			this.ptyOpening = false;
 		}
-		flight.run.resolve({ exit_code: Number(code), output });
-		this.pump();
 	}
 
-	/** Stop the emulator and reject everything queued. */
+	/** Stop the emulator; the link's detach fails everything pending. */
 	destroy() {
+		this.rpc?.detach();
+		this.rpc = null;
+		this.mux?.closeAll();
+		this.mux = null;
 		void this.serialDetach?.();
 		this.emulator?.destroy();
 		this.emulator = null;
 		this.setState('off');
 		this.booting = null;
-		const stranded = this.queue.splice(0);
-		if (this.inFlight) {
-			clearTimeout(this.inFlight.timer);
-			stranded.push(this.inFlight.run);
-			this.inFlight = null;
-		}
-		for (const run of stranded) run.reject(new Error('the VM was shut down'));
 	}
 }
 
@@ -1374,7 +2057,7 @@ export function sharedVm(options?: VmOptions): VinxVm {
 	if (!shared) {
 		shared = new VinxVm(options);
 		// Both pages get the same /data semantics: restored on boot,
-		// snapshotted to IndexedDB while the tab lives.
+		// mirrored to IndexedDB while the tab lives (owner tabs only).
 		attachSharePersistence(shared);
 	}
 	return shared;

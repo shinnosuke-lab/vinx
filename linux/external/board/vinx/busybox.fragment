@@ -1,9 +1,14 @@
 # Applied on top of Buildroot's default busybox config.
 #
-# timeout(1) is what agentd bounds each command's wall-clock with; the default
-# busybox config leaves it out, and without it agentd would need a watchdog
-# subprocess (which leaks a sleep and risks killing a reused PID).
+# timeout(1) bounds wall-clocks all over the guest -- shell one-liners, the
+# E2E suite's parked jobs -- and the default busybox config leaves it out.
+# (It arrived for agentd, which retired in Phase 3; the users stayed.)
 CONFIG_TIMEOUT=y
+
+# tar reads and writes .tar.gz directly (tar xzf/czf/tzf): .vapp packages
+# are plain tar.gz by design (system-v2 §12.4 -- "busybox tar/gzip can
+# handle them"), and app(1)/app-run(8) lean on exactly that.
+CONFIG_FEATURE_SEAMLESS_GZ=y
 
 # nc(1), with listen (-l) and the extras (-p, -e): the natural tool for the
 # inbrowser LAN demo -- run a listener in one terminal tab and connect from
