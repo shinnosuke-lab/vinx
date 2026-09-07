@@ -1,0 +1,46 @@
+name = "vinx-llm-proxy"
+main = "worker.js"
+compatibility_date = "2026-04-07"
+
+# Config that is not secret lives here; the API key does NOT (see README —
+# it is set with `wrangler secret put DEEPSEEK_KEY`).
+[vars]
+# Which browser origins may use this endpoint. Comma-separated, no trailing
+# slash; "*" allows any (only sensible while testing). The published site:
+ALLOWED_ORIGINS = "https://shinnosuke-lab.github.io"
+# The model(s) the proxy will accept; anything else is rewritten to the first.
+# deepseek-v4-flash is DeepSeek's cheapest current model and a stable alias for
+# the latest Flash build.
+MODELS = "deepseek-v4-flash"
+# Hard clamp on a single request's max_tokens, and on the request body size.
+MAX_TOKENS = "4096"
+MAX_BODY_BYTES = "1048576"
+
+# Rate limits (the "balanced" posture). period must be 10 or 60 (platform
+# limit); counting is per Cloudflare location. Tune the numbers freely — they
+# are the whole knob between "usable demo" and "protected wallet".
+#
+#   RL_BURST     — short spike guard, per IP
+#   RL_SUSTAINED — steady rate, per IP
+#   RL_GLOBAL    — a coarse ceiling across everyone, so one location cannot run
+#                  away even if many IPs each stay under their own limit
+[[ratelimits]]
+name = "RL_BURST"
+namespace_id = "2001"
+  [ratelimits.simple]
+  limit = 6
+  period = 10
+
+[[ratelimits]]
+name = "RL_SUSTAINED"
+namespace_id = "2002"
+  [ratelimits.simple]
+  limit = 30
+  period = 60
+
+[[ratelimits]]
+name = "RL_GLOBAL"
+namespace_id = "2003"
+  [ratelimits.simple]
+  limit = 240
+  period = 60

@@ -119,6 +119,9 @@ apps/                     the apps shipped with the page, one directory per
                           image's /usr/bin/nes on the screen
 
 deploy/cloudflare-wisp/   a serverless wisp relay: one Cloudflare Worker
+deploy/cloudflare-llm-proxy/  optional hosted model endpoint: a Cloudflare
+                          Worker holding one DeepSeek key, so the public
+                          demo works without each visitor bringing their own
 
 web/                      the page: agent-core in wasm, its worker, the UI, the VM
   crates/agent-web-core/  Rust: the engine bindings and the browser host
