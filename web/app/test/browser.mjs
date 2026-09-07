@@ -333,7 +333,16 @@ test('the page boots: worker, wasm and UI all come up', async (page) => {
 });
 
 test('a turn streams from the model through the page fetch', async (page) => {
-	await configure(page, 'mock-text');
+	// This is the one test that pins live streaming, so the turn has to be
+	// still open when the attach below lands — and the attach can only be
+	// issued once the send is acknowledged. mock-slow holds its turn open
+	// for 400 ms between two deltas for exactly this; mock-text answers in
+	// one burst, and on a slow host (CI run 34081094544) the turn was over
+	// before the attach, whose stream then replayed session, history, done
+	// with no deltas — correct for a re-attach, see text(), but not what is
+	// being proven here. The first delta may already have gone by when the
+	// attach lands, so the live text is asserted as a tail of the whole.
+	await configure(page, 'mock-slow');
 	const ack = await page.evaluate(() =>
 		fetch('/api/chat', {
 			method: 'POST',
@@ -344,7 +353,11 @@ test('a turn streams from the model through the page fetch', async (page) => {
 	assert.equal(ack.ok, true);
 	const sse = await attach(page, 'stream');
 	assert.ok(events(sse).includes('content'), `no content frames: ${events(sse)}`);
-	assert.equal(text(sse), 'Hello, world');
+	const live = text(sse);
+	assert.ok(
+		live.length > 0 && 'firstsecond'.endsWith(live),
+		`the live deltas do not end the model's text: ${JSON.stringify(live)}`,
+	);
 });
 
 test('the device tool is run_shell, marked unsafe so the model is gated', async (page) => {
