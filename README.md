@@ -13,20 +13,27 @@ chat agent that can run shell commands, plus a `/terminal` console into the
 same machine. The model provider is called straight from the browser; nothing
 you type leaves for a backend of ours, because there is no backend of ours.
 
-```
-┌─ browser tab ────────────────────────────────────────────┐
-│                                                           │
-│  chat page  ─┐                         ┌─ v86 ──────────┐ │
-│              ├─► WASM agent loop ───────► ttyS3: rpcd    │ │
-│  terminal ───┘   (Web Worker)   run_shell│  (control     │ │
-│      │                        rpc call ◄─┤   plane)      │ │
-│      └── xterm.js ────────────────────────► ttyS0: shell │ │
-│                                          │  (busybox)    │ │
-│  settings: model endpoint + key ─┐       └───────────────┘ │
-│                                  │                         │
-└──────────────────────────────────┼─────────────────────────┘
-                                   ▼
-                             LLM provider (CORS)
+```mermaid
+flowchart LR
+    subgraph tab["browser tab"]
+        chat["chat page"]
+        term["terminal page"]
+        xterm["xterm.js"]
+        loop["WASM agent loop<br/>(Web Worker)"]
+        host["page capabilities<br/>(hostcall.ts)"]
+        settings["settings:<br/>model endpoint + key"]
+        subgraph v86["v86 · i686 Linux"]
+            rpcd["ttyS3: rpcd<br/>(control plane)"]
+            shell["ttyS0: shell<br/>(busybox)"]
+        end
+        chat --> loop
+        term --> loop
+        term --> xterm --> shell
+        loop -- "run_shell" --> rpcd
+        rpcd -- "rpc(1): js, fetch, notify,<br/>ble, bridge…" --> host
+        settings -.-> loop
+    end
+    loop -- "chat completions (CORS)" --> llm["LLM provider"]
 ```
 
 Two serial lines carry the traffic. `ttyS0` is the person's console: xterm.js

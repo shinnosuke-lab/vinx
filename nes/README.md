@@ -12,14 +12,12 @@ joiner needs no ROM). The machine itself ships in the image too:
 `linux/external/package/nes` cross-compiles these sources at -O2 into
 `/usr/bin/nes`, comfortably past full NES speed.
 
-```
-┌─ vinx terminal page ───────────────────────────────────────────┐
-│  screen window (click = PS/2 keyboard) ◄── v86 VRAM ◄── KMS    │
-│                                            256x224 dumb buffer │
-│  speakers ◄───────────── v86 SB16 ◄── /dev/dsp ◄── apu.c       │
-│  xterm console  ──────────── ttyS0 ──► timed-hold input        │
-│  agent run_shell ─────────── ttyS3 ──► echo … > /tmp/nes.ctl   │
-└────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    kms["video.c: KMS,<br/>256x224 dumb buffer"] --> vram["v86 VRAM"] --> screen["screen window<br/>(click = PS/2 keyboard)"]
+    apu["apu.c: 2A03 samples"] --> dsp["audio.c: /dev/dsp"] --> sb16["v86 SB16"] --> speakers["speakers"]
+    xterm["xterm console"] --> ttyS0["v86 ttyS0"] --> input["input.c: timed-hold input"]
+    agent["agent run_shell"] --> ttyS3["v86 ttyS3"] --> ctl["echo … > /tmp/nes.ctl"]
 ```
 
 ## Quick start
