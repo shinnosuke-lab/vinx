@@ -435,6 +435,68 @@ corresponds to a named tag; to roll back, re-run the release workflow from an
 older tag. Forks get all of this as-is after enabling Pages (repo Settings →
 Pages → Source: GitHub Actions).
 
+## Built on
+
+Most of vinx is other people's work, arranged in a browser tab. The
+load-bearing pieces by layer, with the licence each project declares
+(versions are the ones pinned today — `web/package.json`,
+`web/crates/agent-web-core/Cargo.toml`, `linux/external/package/*/*.mk`):
+
+- **The page.** [v86](https://github.com/copy/v86) (BSD-2-Clause) is the
+  x86 emulator the Linux runs on. [xterm.js](https://xtermjs.org) (MIT), with
+  its fit, webgl, image, unicode11, web-links and clipboard addons, is the
+  console. [React](https://react.dev) and [Vite](https://vite.dev) (MIT) build
+  the page. [noble](https://paulmillr.com/noble/) hashes, ciphers and curves
+  (MIT) do the crypto: Schnorr signatures and AES-GCM for the Nostr
+  signalling that pairs two bridges, SHA-256 for the host-folder mount. The
+  suites run under [Playwright](https://playwright.dev) (Apache-2.0).
+- **The chat UI** (`web/vendor/ui`, part of the agent-core fork below) stands
+  on [Radix UI](https://www.radix-ui.com) (MIT),
+  [Tailwind CSS](https://tailwindcss.com) (MIT), [lucide](https://lucide.dev)
+  (ISC), [react-markdown](https://github.com/remarkjs/react-markdown) with
+  remark-gfm and rehype-highlight (MIT), [highlight.js](https://highlightjs.org)
+  (BSD-3-Clause), [Mermaid](https://mermaid.js.org) (MIT),
+  [DOMPurify](https://github.com/cure53/DOMPurify) (MPL-2.0 or Apache-2.0),
+  [html2canvas](https://html2canvas.hertzen.com) (MIT), react-devicons (MIT),
+  clsx and tailwind-merge (MIT), class-variance-authority (Apache-2.0).
+- **The agent engine** (`web/crates/agent-web-core`) reaches the browser
+  through [wasm-bindgen](https://github.com/rustwasm/wasm-bindgen), js-sys and
+  wasm-bindgen-futures, and runs on [tokio](https://tokio.rs),
+  [reqwest](https://github.com/seanmonstar/reqwest), serde (with serde_json
+  and serde_yaml), futures, regex, zip (deflate via flate2), wasmtimer,
+  base64, log, async-trait and console_error_panic_hook — each MIT and/or
+  Apache-2.0.
+- **The machine** is a [Buildroot](https://buildroot.org) 2025.02.9 image
+  (GPL-2.0+, the build system only) for i686 on [musl](https://musl.libc.org)
+  (MIT): [Linux](https://kernel.org) (GPL-2.0), [BusyBox](https://busybox.net)
+  (GPL-2.0), [curl](https://curl.se) (curl licence) with
+  [Mbed TLS](https://www.trustedfirmware.org/projects/mbed-tls/) (Apache-2.0)
+  and Mozilla's CA bundle (MPL-2.0), [tcc](https://bellard.org/tcc/) 0.9.27
+  (LGPL-2.1), GNU make (GPL-3.0), [Lua](https://www.lua.org) 5.4 (MIT),
+  [MicroPython](https://micropython.org) with micropython-lib 1.22.2 (MIT,
+  PSF-2.0), [QuickJS](https://bellard.org/quickjs/) (MIT),
+  [SQLite](https://sqlite.org) (public domain), [jq](https://jqlang.github.io/jq/)
+  (MIT), [NASM](https://www.nasm.us) 2.16.03 (BSD-2-Clause),
+  [strace](https://strace.io) (LGPL-2.1), btmon from
+  [BlueZ](https://github.com/bluez/bluez) 5.79 (GPL-2.0+), [Vim](https://www.vim.org)
+  (Vim licence), [LVGL](https://lvgl.io) 9.3.0 (MIT),
+  [termbox2](https://github.com/termbox/termbox2) 2.5.0 (MIT) and ncurses
+  (MIT-X11).
+- **The NES** (`nes/`) is built around [agnes](https://github.com/kgabis/agnes)
+  0.2.0 by Krzysztof Gabis (MIT; vendored under `nes/vendor/` with one local
+  patch, recorded in `VENDOR.txt` there).
+- **The fonts.** `cjk16.bin`, the LVGL font in the image, is the GB2312
+  repertoire of Droid Sans Fallback Full (Apache-2.0) plus ASCII from DejaVu
+  Sans (Bitstream Vera licence);
+  [`linux/external/board/vinx/fonts.md`](linux/external/board/vinx/fonts.md)
+  has the recipe.
+
+Two more are borrowed at run time rather than shipped, and are named where
+they are used: the optional relay (`web/deploy/relay.sh`) runs
+MercuryWorkshop's [wisp-js](https://github.com/MercuryWorkshop/wisp-js) (AGPL-3.0),
+and the guest's `alpine` command downloads Alpine Linux's x86 minirootfs to
+get `apk` and its package feed.
+
 ## Upstream
 
 The agent engine and chat UI under [`web/vendor/`](web/vendor) are a **fork**
