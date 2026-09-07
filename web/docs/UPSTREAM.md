@@ -208,6 +208,20 @@ taken, what is reimplemented for the browser, and why. The short version:
    `mock-overflow-once` (stateless: a live message saying "overflow" gets
    the 400 unless the history already opens with a summary; the summarizer's
    request and everything else stream) and `mock-slow-headers` (3 s to headers).
+8. **Tiered working budget synced with `xcore`** (2026-09-07, small). One
+   cap for every window had 1M models compacting at the same 120k-token view
+   as 200k ones. `context.rs` now derives the default budget from the window
+   through `default_working_budget`: the window itself below 160k, 160k up
+   to a 1M window, `LARGE_WINDOW_BUDGET_TOKENS` (320k) from 1M — a 240k-token
+   compaction line, pruning at 168k back to 96k, 24k of verbatim tail — while
+   an explicit `context_size` still wins; the rationale (the 200k price-tier
+   mark, cache-miss cost, summary granularity) is in the constant's doc.
+   xcore's matching Sand `context=1m` branch in `actix.rs` has no counterpart
+   here. UI: the export menu's alert toggle label was shortened (`alertChime`:
+   "Background tab chime" / "后台提示音" — the old three-line label) and menu
+   item labels no longer wrap, so the menu sizes to its longest label instead
+   of folding text into its `min-w`. Tests: `tests/context_budget.rs` asserts
+   the tiers and the doubled compaction line (22 tests, unchanged count).
 
 If a later upstream change is worth taking, three-way merge it per file
 (`git merge-file`, base = the recorded fork commit, theirs = upstream `main`,

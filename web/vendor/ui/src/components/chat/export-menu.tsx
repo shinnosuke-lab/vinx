@@ -38,7 +38,7 @@ function Item({
       className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-foreground hover:bg-muted"
     >
       <span className="[&_svg]:h-4 [&_svg]:w-4 [&_svg]:text-muted-foreground">{icon}</span>
-      <span className="flex-1">{children}</span>
+      <span className="flex-1 whitespace-nowrap">{children}</span>
       {toggle && <Check className={cn("h-4 w-4 text-primary", !checked && "invisible")} />}
     </button>
   )

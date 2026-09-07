@@ -137,7 +137,7 @@ const EN: Labels = {
   expandAllSteps: 'Expand all',
   collapseAllSteps: 'Collapse all',
   alerts: 'Alerts',
-  alertChime: 'Chime when a background tab needs you',
+  alertChime: 'Background tab chime',
 
   // markdown / code
   code: 'code',
@@ -847,7 +847,7 @@ const ZH: Labels = {
   expandAllSteps: '全部展开',
   collapseAllSteps: '全部折叠',
   alerts: '提醒',
-  alertChime: '后台标签页完成或需确认时响一声',
+  alertChime: '后台提示音',
 
   // markdown / code
   code: '代码',

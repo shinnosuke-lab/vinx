@@ -78,11 +78,16 @@ fn suffix_chars(msgs: &[ChatMessage], start: usize) -> usize {
 
 #[wasm_bindgen_test]
 fn working_budget_is_capped_unless_configured() {
-    // A 1M window does not mean a 1M working set: the default budget caps
-    // it. Smaller windows still narrow the budget.
-    assert_eq!(working_budget_tokens("kimi-k3", 0), DEFAULT_WORKING_BUDGET_TOKENS);
-    assert_eq!(working_budget_tokens("glm-5.2", 0), DEFAULT_WORKING_BUDGET_TOKENS);
+    // A 1M window does not mean a 1M working set: it gets the large-window
+    // budget; everything below is capped at the default. Smaller windows
+    // still narrow the budget.
+    assert_eq!(working_budget_tokens("kimi-k3", 0), LARGE_WINDOW_BUDGET_TOKENS);
+    assert_eq!(working_budget_tokens("glm-5.2", 0), LARGE_WINDOW_BUDGET_TOKENS);
+    assert_eq!(working_budget_tokens("kimi-k2.6", 0), DEFAULT_WORKING_BUDGET_TOKENS);
     assert_eq!(working_budget_tokens("glm-5.1", 0), 160_000.min(200_000));
+    assert_eq!(default_working_budget(128_000), 128_000);
+    assert_eq!(default_working_budget(300_000), DEFAULT_WORKING_BUDGET_TOKENS);
+    assert_eq!(default_working_budget(LARGE_WINDOW_TOKENS), LARGE_WINDOW_BUDGET_TOKENS);
     // An explicit configuration is the user's call, above or below.
     assert_eq!(working_budget_tokens("kimi-k3", 1_000_000), 1_000_000);
     assert_eq!(working_budget_tokens("kimi-k3", 50_000), 50_000);
@@ -90,12 +95,16 @@ fn working_budget_is_capped_unless_configured() {
     // characters (the reserve does not bind at 160k: 160k − 40k = 120k =
     // 0.75 × 160k), pruning at 70% of that, the prune target at 40%.
     let budget = DEFAULT_WORKING_BUDGET_TOKENS as f64 * CHARS_PER_TOKEN_F;
-    assert_eq!(compaction_threshold("kimi-k3", 0), (budget * 0.75) as usize);
+    assert_eq!(compaction_threshold("glm-5.1", 0), (budget * 0.75) as usize);
     assert_eq!(
-        pruning_threshold("kimi-k3", 0),
+        pruning_threshold("glm-5.1", 0),
         ((budget * 0.75) as usize as f64 * 0.70) as usize
     );
-    assert!(prune_target("kimi-k3", 0) < pruning_threshold("kimi-k3", 0));
+    assert!(prune_target("glm-5.1", 0) < pruning_threshold("glm-5.1", 0));
+    // The large-window budget: a 240k-token compaction line, twice the
+    // default (320k − 40k = 280k does not bind either).
+    assert_eq!(compaction_threshold("kimi-k3", 0), 2 * compaction_threshold("glm-5.1", 0));
+    assert_eq!(compaction_threshold("kimi-k3", 0), (240_000.0 * CHARS_PER_TOKEN_F) as usize);
     // Small configured budgets: the 40k reserve binds (128k → 88k), and
     // the 35% floor keeps a tiny budget from going to zero (40k → 14k).
     assert_eq!(

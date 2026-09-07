@@ -112,7 +112,17 @@
       "api_key_set on GET /api/config, the settings page's Behavior card and",
       "SecretInput (vinx applies it to the API key; xcore to Sand tokens).",
       "SKIPPED: backfill_task_titles (no rows to migrate); recall_result",
-      "needed nothing. See docs/UPSTREAM.md, history item 7."
+      "needed nothing. See docs/UPSTREAM.md, history item 7.",
+      "",
+      "2026-09-07 (third batch, small): context.rs gained xcore's tiered",
+      "default working budget -- default_working_budget(window): the window",
+      "itself below 160k, 160k up to a 1M window, LARGE_WINDOW_BUDGET_TOKENS",
+      "(320k) from 1M, so 1M models compact at a 240k-token view instead of",
+      "the 200k models' 120k; an explicit context_size still wins. xcore's",
+      "matching Sand `context=1m` branch has no counterpart here. UI: the",
+      "export menu's alert toggle label shortened (alertChime) and menu item",
+      "labels no longer wrap (the menu sizes to its longest label). See",
+      "docs/UPSTREAM.md, history item 8."
     ]
   },
   "why_a_copy_at_all": [

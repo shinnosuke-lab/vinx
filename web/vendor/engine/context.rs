@@ -242,8 +242,9 @@ const PRUNE_TARGET_RATIO: f64 = 0.40;
 /// a few tool exchanges, or one big file read.
 pub const COMPACTION_TAIL_RATIO: f64 = 0.10;
 
-/// Hard ceiling on the working budget in tokens regardless of the model's
-/// advertised window, unless the user configured a larger size explicitly.
+/// Default working budget in tokens for models whose window is below
+/// [`LARGE_WINDOW_TOKENS`], regardless of the advertised window, unless the
+/// user configured a size explicitly.
 ///
 /// Window size and working-set size are different things: a 1M-token window
 /// means the model CAN read that much, not that every round SHOULD carry it.
@@ -255,6 +256,38 @@ pub const COMPACTION_TAIL_RATIO: f64 = 0.10;
 /// 1M window is what produced 300–770k-token rounds that never compacted.
 /// An explicit `context_size` in the config still wins.
 pub const DEFAULT_WORKING_BUDGET_TOKENS: usize = 160_000;
+
+/// Default working budget for models with a window of at least
+/// [`LARGE_WINDOW_TOKENS`]: twice the default, still a small fraction of the
+/// window.
+///
+/// One cap for every window threw away the one thing a 1M model buys: it
+/// compacted at the same 120k-token view as a 200k model. At 320k the
+/// compaction line is a 240k-token view (pruning at 168k, back down to 96k),
+/// so compactions come about half as often and each keeps 24k tokens of
+/// recent history verbatim. The steady-state prompt (a 96–168k view plus
+/// ~20k of prompt and schemas) still stays mostly under the 200k mark where
+/// providers' long-context price tiers start; a cold cache miss costs nearly
+/// twice what it does on the default budget. Going higher buys fewer
+/// compactions at a growing share of rounds in that tier and a coarser
+/// summary each time (the summarizer's transcript is capped at
+/// [`SUMMARY_TRANSCRIPT_MAX_CHARS`] either way).
+pub const LARGE_WINDOW_BUDGET_TOKENS: usize = 320_000;
+
+/// Window size from which [`LARGE_WINDOW_BUDGET_TOKENS`] applies.
+pub const LARGE_WINDOW_TOKENS: usize = 1_000_000;
+
+/// The default working budget for a model window of `window_tokens`: the
+/// window itself when it is smaller than [`DEFAULT_WORKING_BUDGET_TOKENS`],
+/// that default up to [`LARGE_WINDOW_TOKENS`], and
+/// [`LARGE_WINDOW_BUDGET_TOKENS`] from there.
+pub fn default_working_budget(window_tokens: usize) -> usize {
+    if window_tokens >= LARGE_WINDOW_TOKENS {
+        LARGE_WINDOW_BUDGET_TOKENS
+    } else {
+        window_tokens.min(DEFAULT_WORKING_BUDGET_TOKENS)
+    }
+}
 
 pub(crate) fn model_context_tokens(model: &str) -> usize {
     let m = model.to_lowercase();
@@ -274,12 +307,12 @@ pub(crate) fn model_context_tokens(model: &str) -> usize {
 }
 
 /// The working budget in tokens for a model: the configured size when set,
-/// otherwise the model window capped at [`DEFAULT_WORKING_BUDGET_TOKENS`].
+/// otherwise [`default_working_budget`] of the model's window.
 pub fn working_budget_tokens(model: &str, configured_tokens: usize) -> usize {
     if configured_tokens > 0 {
         configured_tokens
     } else {
-        model_context_tokens(model).min(DEFAULT_WORKING_BUDGET_TOKENS)
+        default_working_budget(model_context_tokens(model))
     }
 }
 
@@ -289,8 +322,9 @@ pub fn working_budget_tokens(model: &str, configured_tokens: usize) -> usize {
 /// In tokens: `max(budget × 0.35, min(budget × 0.75, budget − 40k))`. For
 /// the default 160k budget that is a 120k-token view; with the ~20k of
 /// prompt/schema overhead and the reply on top the request stays inside a
-/// 200k window. For a configured 128k budget the reserve binds (88k); for a
-/// configured 1M it is the ratio (750k).
+/// 200k window. For the 320k budget of a 1M-window model it is a 240k view.
+/// For a configured 128k budget the reserve binds (88k); for a configured 1M
+/// it is the ratio (750k).
 pub fn compaction_threshold(model: &str, configured_tokens: usize) -> usize {
     let tokens = working_budget_tokens(model, configured_tokens) as f64;
     let line = (tokens * COMPACTION_RATIO)
