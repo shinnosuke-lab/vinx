@@ -80,6 +80,15 @@ the code is in [`worker.js`](worker.js).
   `curl -H 'Origin: https://shinnosuke-lab.github.io' …`.
 - **Rate limits** (`RL_BURST`, `RL_SUSTAINED` per IP; `RL_GLOBAL` across all)
   — the platform's Rate Limiting binding, which is free and needs no storage.
+  **Currently switched off** (the blocks in `wrangler.toml` are commented
+  out; without the bindings the Worker skips the check). An agent turn is
+  many requests — every tool call is a fresh completion, a quick tool answers
+  in a second, so one visitor legitimately fires 10-20 in a row — and the
+  first numbers (6 per 10 s per IP) cut those turns off mid-way; the engine
+  does not retry a 429, so the turn simply failed. While the balance is
+  small, the balance is the limit. To turn them back on, uncomment and
+  deploy; the numbers left in the file (30/10 s, 150/60 s, 900/60 s) leave an
+  agent turn alone and still catch a runaway loop.
   Two platform facts shape these: a period must be **10 or 60 seconds**, and
   counting is **per Cloudflare server, approximate** — not even per location.
   Measured on the deployed Worker: nine requests down one connection (so one

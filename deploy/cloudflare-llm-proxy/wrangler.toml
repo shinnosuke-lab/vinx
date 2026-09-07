@@ -16,31 +16,44 @@ MODELS = "deepseek-v4-flash"
 MAX_TOKENS = "4096"
 MAX_BODY_BYTES = "1048576"
 
-# Rate limits (the "balanced" posture). period must be 10 or 60 (platform
-# limit); counting is per Cloudflare location. Tune the numbers freely — they
-# are the whole knob between "usable demo" and "protected wallet".
+# Rate limits — SWITCHED OFF for now. With all three blocks commented out the
+# Worker has no RL_* bindings and skips the checks (worker.js tests for the
+# binding before calling it); the DeepSeek balance is the only ceiling.
+#
+# Why off: an agent turn is not one request. Every tool call the model makes
+# (run_shell, read a file...) is a fresh chat completion, and a quick tool
+# answers in a second, so a single visitor legitimately fires 10-20 requests
+# in a row. The first numbers here (6 per 10 s, 30 per 60 s, per IP) cut
+# those turns off mid-way, and the engine does not retry a 429 — the whole
+# turn fails. Until the balance is worth more than the annoyance, no limits.
+#
+# To switch back on: uncomment, deploy. period must be 10 or 60 (platform);
+# counting is per Cloudflare server, approximate (see README). Numbers that
+# leave an agent turn alone while still catching a runaway loop or a flood:
+# RL_BURST 30/10, RL_SUSTAINED 150/60, RL_GLOBAL 900/60.
 #
 #   RL_BURST     — short spike guard, per IP
 #   RL_SUSTAINED — steady rate, per IP
 #   RL_GLOBAL    — a coarse ceiling across everyone, so one location cannot run
 #                  away even if many IPs each stay under their own limit
-[[ratelimits]]
-name = "RL_BURST"
-namespace_id = "2001"
-  [ratelimits.simple]
-  limit = 6
-  period = 10
-
-[[ratelimits]]
-name = "RL_SUSTAINED"
-namespace_id = "2002"
-  [ratelimits.simple]
-  limit = 30
-  period = 60
-
-[[ratelimits]]
-name = "RL_GLOBAL"
-namespace_id = "2003"
-  [ratelimits.simple]
-  limit = 240
-  period = 60
+#
+# [[ratelimits]]
+# name = "RL_BURST"
+# namespace_id = "2001"
+#   [ratelimits.simple]
+#   limit = 30
+#   period = 10
+#
+# [[ratelimits]]
+# name = "RL_SUSTAINED"
+# namespace_id = "2002"
+#   [ratelimits.simple]
+#   limit = 150
+#   period = 60
+#
+# [[ratelimits]]
+# name = "RL_GLOBAL"
+# namespace_id = "2003"
+#   [ratelimits.simple]
+#   limit = 900
+#   period = 60
