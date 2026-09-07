@@ -3859,11 +3859,25 @@ test('lvdemo compiles in the machine, draws a GUI, and the page mouse clicks it'
 		frame,
 		'(timeout 10 head -c 3 /dev/input/mice > /tmp/mice.bin; echo MICE-$(wc -c < /tmp/mice.bin)) &',
 	);
+	// The sweep repeats until the guest reports a byte count: the reader
+	// runs in a background job that still has to fork, start timeout(1)
+	// and open the device — a good fraction of a second on a loaded CI
+	// runner — and a packet with no reader open is dropped, not queued.
 	const canvas = await frame.waitForSelector('.vga-panel canvas');
 	const cbox = await canvas.boundingBox();
-	await page.mouse.move(cbox.x + 10, cbox.y + 10);
-	await page.mouse.move(cbox.x + cbox.width - 10, cbox.y + cbox.height / 2, { steps: 12 });
-	await frameUntil(frame, (t) => /MICE-3/.test(t), 'a PS/2 packet in the guest', 20_000);
+	const miceDeadline = Date.now() + 20_000;
+	let mice;
+	for (;;) {
+		await page.mouse.move(cbox.x + 10, cbox.y + 10);
+		await page.mouse.move(cbox.x + cbox.width - 10, cbox.y + cbox.height / 2, { steps: 12 });
+		mice = await frameScreen(frame);
+		if (/MICE-\d/.test(mice)) break;
+		if (Date.now() > miceDeadline) {
+			throw new Error(`the console never showed the /dev/input/mice byte count:\n${mice}`);
+		}
+		await new Promise((r) => setTimeout(r, 250));
+	}
+	assert.match(mice, /MICE-3/, `no PS/2 packet reached the guest:\n${mice}`);
 
 	// The GB2312 font ships in the image; the demo loads it from there.
 	await frameType(page, frame, 'echo FONT-$(wc -c < /usr/share/fonts/cjk16.bin)');
@@ -4243,13 +4257,21 @@ test('a hand-carried bridge joins two LANs: ping, roster and say, no relay', asy
 		await frameA.click('.np-backdrop', { position: { x: 5, y: 5 } });
 		await frameB.click('.np-backdrop', { position: { x: 5, y: 5 } });
 
-		// One segment now: A pings B across the bridge.
-		await frameType(pageA, frameA, `ping -c 2 ${ipB}`);
-		await frameUntil(
+		// One segment now: A pings B across the bridge. The status light is
+		// the control plane; the first frames on the data path still have
+		// to ARP across two browser contexts, and on a slow host (a CI
+		// runner) that can outlast one ping's wait. Retry for up to ~30 s
+		// before calling the bridge broken.
+		await frameType(
+			pageA,
 			frameA,
-			(t) => /2 packets received/.test(t),
-			'the ping replies from the far LAN',
-			60_000,
+			`i=0; while [ $i -lt 10 ] && ! ping -c 1 -W 3 ${ipB} >/tmp/ping.out 2>&1; do i=$((i+1)); done; tail -2 /tmp/ping.out; echo "tries=$i"; echo PING-D''ONE`,
+		);
+		const pinged = await frameUntil(frameA, (t) => t.includes('PING-DONE'), 'the ping across the bridge', 60_000);
+		assert.match(
+			pinged,
+			/1 packets received/,
+			`A did not reach B across the bridge; A's screen:\n${pinged}`,
 		);
 
 		// The hand-carried pair is the same room underneath: the guest's
@@ -4404,12 +4426,18 @@ test('a room code bridges three browsers, and bridge say floats across them', as
 
 		// Member-to-member traffic transits the host's learning switch: the
 		// first ping floods, the replies teach it, and it keeps working.
-		await frameType(pageB, frameB, `ping -c 2 ${ipC}`);
-		await frameUntil(
+		// Same retry as the hand-carried pair: the first ARP round trip
+		// across three browser contexts can outlast one ping on a slow host.
+		await frameType(
+			pageB,
 			frameB,
-			(t) => /2 packets received/.test(t),
-			'B pinged C through the host switch',
-			60_000,
+			`i=0; while [ $i -lt 10 ] && ! ping -c 1 -W 3 ${ipC} >/tmp/ping.out 2>&1; do i=$((i+1)); done; tail -2 /tmp/ping.out; echo "tries=$i"; echo PING-D''ONE`,
+		);
+		const pingedC = await frameUntil(frameB, (t) => t.includes('PING-DONE'), 'the ping through the host switch', 60_000);
+		assert.match(
+			pingedC,
+			/1 packets received/,
+			`B did not reach C through the host switch; B's screen:\n${pingedC}`,
 		);
 
 		// Chat is the bridge's own: `bridge say` floats the words across
