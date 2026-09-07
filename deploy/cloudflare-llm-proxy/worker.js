@@ -6,9 +6,13 @@
 // static bundle can hide nothing) and to put three cheap guards in front of
 // an endpoint that spends real money:
 //
-//   1. Origin lock — only the configured site may use it *from a browser*
-//      (an Origin header is trivially forged outside one, so this stops other
-//      people's web apps embedding your endpoint, nothing more).
+//   1. Origin lock — only the configured site may use it, and only from a
+//      browser: a request without an Origin header (curl, scripts, the
+//      crawlers that scan workers.dev for open OpenAI-style proxies) is
+//      refused too. An Origin is trivially forged by anyone who bothers, so
+//      this is a doorstep, not a lock — but the legitimate caller is always a
+//      browser and always sends one, so refusing its absence costs nothing
+//      and turns away everyone who does not bother.
 //   2. Rate limits — per-IP burst + sustained, and a coarse global ceiling,
 //      via the platform's Rate Limiting binding (free, no storage).
 //   3. Request shaping — the model is pinned to an allowlist, `max_tokens` is
@@ -35,11 +39,10 @@ export default {
 		if (request.method === 'OPTIONS') {
 			return new Response(null, { status: allowed ? 204 : 403, headers: cors });
 		}
-		// A browser whose origin is not on the list gets a plain 403 with no
-		// allow-origin header, so fetch() rejects and the page shows nothing of
-		// ours. (curl and other non-browser callers send no Origin and are let
-		// through — the origin lock is a browser-embedding guard, not security.)
-		if (origin && !allowed) {
+		// Not on the list — or no Origin at all, which no browser page of ours
+		// ever omits — gets a plain 403 with no allow-origin header, so a
+		// browser's fetch() rejects and a script gets nothing to work with.
+		if (!allowed) {
 			return json(403, { error: { message: 'origin not allowed', type: 'proxy_forbidden' } }, cors);
 		}
 
@@ -122,7 +125,7 @@ export function allowedModels(env) {
 }
 
 export function isOriginAllowed(origin, env) {
-	if (!origin) return true; // non-browser caller (no Origin header)
+	if (!origin) return false; // no Origin = not a browser page; refuse
 	const list = String(env.ALLOWED_ORIGINS || '')
 		.split(',')
 		.map((s) => s.trim().replace(/\/+$/, ''))

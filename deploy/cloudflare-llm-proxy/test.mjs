@@ -28,7 +28,8 @@ eq('models default', allowedModels({}), ['deepseek-v4-flash']);
 eq('origin allowed', isOriginAllowed('https://shinnosuke-lab.github.io', env), true);
 eq('origin allowed trailing slash', isOriginAllowed('https://shinnosuke-lab.github.io/', env), true);
 eq('origin denied', isOriginAllowed('https://evil.test', env), false);
-eq('no origin = non-browser, allowed', isOriginAllowed('', env), true);
+eq('no origin = not a browser page, refused', isOriginAllowed('', env), false);
+eq('no origin refused even under wildcard', isOriginAllowed('', { ALLOWED_ORIGINS: '*' }), false);
 eq('wildcard', isOriginAllowed('https://anything.test', { ALLOWED_ORIGINS: '*' }), true);
 
 // CORS header only echoes the origin when allowed

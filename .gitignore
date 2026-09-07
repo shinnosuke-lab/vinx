@@ -27,3 +27,6 @@ playwright-report/
 
 # OS noise
 .DS_Store
+
+# wrangler local state (deploy/cloudflare-*/, recreated by every deploy)
+.wrangler/

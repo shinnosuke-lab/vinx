@@ -19,12 +19,32 @@ npx wrangler secret put DEEPSEEK_KEY   # paste the key from platform.deepseek.co
 npx wrangler deploy
 ```
 
-Wrangler prints a URL like `https://vinx-llm-proxy.<account>.workers.dev`. That
-is the model endpoint. Point the page at it in Settings:
+Two things a fresh Cloudflare account runs into, both of which the first
+deploy here did:
+
+- **`wrangler login` needs the dashboard, and `dash.cloudflare.com` sits
+  behind a bot challenge** that can spin forever on a shared proxy exit IP. The
+  way around it is a token: once in the dashboard (try another exit, or a
+  private window), *My Profile → API Tokens → Create Token → "Edit Cloudflare
+  Workers"*, then `export CLOUDFLARE_API_TOKEN=…` and skip `login` entirely —
+  `api.cloudflare.com`, which is all wrangler actually talks to, has no
+  challenge. Non-interactive from then on (`CI=1` answers the prompts).
+- **No `workers.dev` subdomain yet** — `deploy` stops and points at the
+  dashboard again. The API does it without one:
+  `curl -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+  -H 'Content-Type: application/json' -d '{"subdomain":"<name>"}'
+  https://api.cloudflare.com/client/v4/accounts/<account_id>/workers/subdomain`
+  (`wrangler whoami` prints the account id). The subdomain is account-wide
+  and permanent; this repo's is `shinnosuke-lab`.
+
+Wrangler prints a URL like `https://vinx-llm-proxy.<subdomain>.workers.dev`.
+That is the model endpoint — the deployed one is
+`https://vinx-llm-proxy.shinnosuke-lab.workers.dev`. Point the page at it in
+Settings:
 
 | field | value |
 | --- | --- |
-| base_url | `https://vinx-llm-proxy.<account>.workers.dev` |
+| base_url | `https://vinx-llm-proxy.<subdomain>.workers.dev` |
 | model | `deepseek-v4-flash` |
 | api_key | anything non-empty (the page requires one; the proxy ignores it) |
 
@@ -47,16 +67,28 @@ only in the Worker secret, never in the bundle.
 Configured in [`wrangler.toml`](wrangler.toml) (`[vars]` + `[[ratelimits]]`);
 the code is in [`worker.js`](worker.js).
 
-- **Origin lock** (`ALLOWED_ORIGINS`) — a browser whose `Origin` is not on the
-  list gets a 403 with no allow-origin header, so other people's web apps
-  cannot embed your endpoint. An `Origin` header is trivially forged outside a
-  browser, so this is an embedding guard, not authentication — do not mistake
-  it for one. Non-browser callers (no `Origin`) are let through on purpose.
+- **Origin lock** (`ALLOWED_ORIGINS`) — a request whose `Origin` is not on the
+  list, **or that has no `Origin` at all** (curl, scripts, the crawlers that
+  scan workers.dev for open OpenAI-style proxies), gets a 403 with no
+  allow-origin header. The legitimate caller is always a browser page and
+  always sends one, so refusing its absence costs nothing and turns away
+  everyone who does not bother to forge it. Anyone who does bother gets
+  through — an `Origin` is one header — so this is a doorstep, not
+  authentication; the rate limits and the DeepSeek balance are what actually
+  bound the damage. `*` widens the list to any browser origin; it still
+  refuses requests without one. To test from a terminal, send the header:
+  `curl -H 'Origin: https://shinnosuke-lab.github.io' …`.
 - **Rate limits** (`RL_BURST`, `RL_SUSTAINED` per IP; `RL_GLOBAL` across all)
   — the platform's Rate Limiting binding, which is free and needs no storage.
   Two platform facts shape these: a period must be **10 or 60 seconds**, and
-  counting is **per Cloudflare location**, not global — the numbers are a
-  speed bump, not an accountant.
+  counting is **per Cloudflare server, approximate** — not even per location.
+  Measured on the deployed Worker: nine requests down one connection (so one
+  server) were cut off at exactly the seventh, as configured; forty requests
+  fired concurrently over fresh connections spread across the servers of one
+  location and only two were refused. So a real user in one browser, which
+  reuses its connections, is limited as the numbers say; a deliberate flood
+  that opens many connections is only slowed. The numbers are a speed bump,
+  not an accountant.
 - **Request shaping** — the model is pinned to the `MODELS` allowlist,
   `max_tokens` is clamped to `MAX_TOKENS`, `n` is forced to 1, and a body over
   `MAX_BODY_BYTES` is rejected. Messages, `tools`/`tool_choice` (the agent
