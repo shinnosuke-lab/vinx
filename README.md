@@ -3,6 +3,11 @@
 [![ci](https://github.com/shinnosuke-lab/vinx/actions/workflows/ci.yml/badge.svg)](https://github.com/shinnosuke-lab/vinx/actions/workflows/ci.yml)
 [![release](https://github.com/shinnosuke-lab/vinx/actions/workflows/release.yml/badge.svg)](https://github.com/shinnosuke-lab/vinx/actions/workflows/release.yml)
 
+**Live: <https://shinnosuke-lab.github.io/vinx/>** — the latest tagged
+release, served by GitHub Pages; the console is at
+[`/terminal/`](https://shinnosuke-lab.github.io/vinx/terminal/). The page asks
+for a model endpoint and key on first load and keeps them in the browser.
+
 An LLM agent and a Linux machine, both running entirely in a browser tab.
 
 The agent's tool-calling loop is [agent-core](#upstream) compiled to

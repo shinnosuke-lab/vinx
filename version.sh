@@ -38,10 +38,16 @@ DEFAULT_BASE_URL=
 DEFAULT_MODEL=
 DEFAULT_API_KEY=
 
+# Where this code lives. The page's About popover shows it as the "Source"
+# link and points "Check for updates" at its releases page; forks put their
+# own repository here, and empty hides both links.
+REPO_URL=https://github.com/shinnosuke-lab/vinx
+
 echo "========================================"
 echo " NAME:        $NAME"
 echo " VER:         $VER"
 echo " NAME_VER:    $NAME_VER"
+echo " REPO_URL:    ${REPO_URL:-(none: no source link in About)}"
 echo " SKILLS_REPO: ${SKILLS_REPO:-(none: the market tab is hidden)}"
 echo " MODEL:       ${DEFAULT_MODEL:-(none)} at ${DEFAULT_BASE_URL:-(none)}"
 # Counted, not printed: this summary is echoed into every CI log.

@@ -8,3 +8,4 @@ declare const __SKILLS_REPO__: string;
 declare const __APPS_REPO__: string;
 declare const __APP_FRAME_URL__: string;
 declare const __DEFAULTS__: { baseUrl: string; model: string; apiKey: string };
+declare const __REPO_URL__: string;

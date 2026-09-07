@@ -127,6 +127,9 @@ interface AgentMeta {
   kernelVersion?: string
   /** Optional "check for updates" link target shown in the About popover. */
   updateUrl?: string
+  /** Where the code lives (a repository URL); the About popover shows it as
+   *  a link, host and path as the text. Hidden when absent. */
+  sourceUrl?: string
   readonly?: boolean
   history?: boolean
   configEditable?: boolean
@@ -430,6 +433,7 @@ export function CopilotApp({
           kernelVersion={meta?.kernelVersion}
           buildTime={buildTime}
           updateUrl={meta?.updateUrl}
+          sourceUrl={meta?.sourceUrl}
           activeView={view}
           collapsed={collapsed}
           hrefFor={(v) => viewToHash(v, null)}
@@ -474,6 +478,7 @@ export function CopilotApp({
               kernelVersion={meta?.kernelVersion}
               buildTime={buildTime}
               updateUrl={meta?.updateUrl}
+              sourceUrl={meta?.sourceUrl}
               activeView={view}
               collapsed={false}
               hrefFor={(v) => viewToHash(v, null)}

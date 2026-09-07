@@ -35,6 +35,9 @@ interface NavRailProps {
   buildTime?: string
   /** Optional "check for updates" target; the link is hidden when absent. */
   updateUrl?: string
+  /** Optional repository URL, shown as a link in the About popover (text: the
+   *  URL without its scheme); hidden when absent. */
+  sourceUrl?: string
   activeView: ShellView
   collapsed: boolean
   /** URL for a view (e.g. `#/sessions`). When set, nav entries render as real
@@ -134,6 +137,7 @@ export function NavRail({
   kernelVersion,
   buildTime,
   updateUrl,
+  sourceUrl,
   activeView,
   collapsed,
   hrefFor,
@@ -404,6 +408,20 @@ export function NavRail({
               <span className="text-[11px] text-muted-foreground">{t("buildTime")}</span>
               <span className="text-[11px] tabular-nums text-foreground/80">{buildTime ?? "—"}</span>
             </div>
+            {/* Source — where the code lives; the URL minus its scheme is the text */}
+            {sourceUrl && (
+              <div className="flex items-center justify-between gap-3 border-t border-border/40 px-3 py-2">
+                <span className="text-[11px] text-muted-foreground">{t("source")}</span>
+                <a
+                  href={sourceUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="truncate text-[11px] text-foreground/80 underline-offset-2 hover:text-foreground hover:underline"
+                >
+                  {sourceUrl.replace(/^[a-z]+:\/\//i, "").replace(/\/$/, "")}
+                </a>
+              </div>
+            )}
           </div>
         )}
       </div>

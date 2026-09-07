@@ -33,6 +33,7 @@ import { mountVmConsole, openVmConsole, toggleVmScreen } from './vm-console';
 import { rememberedPower } from './vm-status';
 import { readTerminal } from './terminal-buffer';
 import { triggerDownload } from './downloads';
+import { APP_META } from './app-meta';
 // The Linux reference this page carries; installed after mount. Shared with
 // the terminal's assistant panel, which is why it is its own module.
 import { installBundledSkill } from './bundled-skill';
@@ -124,7 +125,7 @@ try {
 		onShared: requestSnapshot,
 		// One history for the page, whichever surface a session started on.
 		namespace: 'vinx',
-		meta: { brand: 'Vinx Agent', version: __APP_VERSION__ },
+		meta: APP_META,
 		// Empty unless a repository was published; see version.sh.
 		skillsRepo: __SKILLS_REPO__,
 		// The Apps page (#/apps) manages this machine's .vapp's — see

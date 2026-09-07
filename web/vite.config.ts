@@ -69,6 +69,10 @@ const defaults = {
 	apiKey: declared('DEFAULT_API_KEY'),
 };
 
+// The repository, for the About popover's "Source" link and the releases page
+// behind "Check for updates". Empty hides both; see version.sh.
+const repoUrl = declared('REPO_URL');
+
 /**
  * One `NAME=value` from version.sh, overridable by the environment.
  *
@@ -125,6 +129,7 @@ export default defineConfig(() => ({
 		__SKILLS_REPO__: JSON.stringify(skillsRepo),
 		__APPS_REPO__: JSON.stringify(appsRepo),
 		__DEFAULTS__: JSON.stringify(defaults),
+		__REPO_URL__: JSON.stringify(repoUrl),
 		// Where the app shell lives (§10.3). Empty — the default — means the
 		// copy shipped beside the page (app/public/app-frame.html, resolved
 		// at runtime by app/app-frame-url.ts). Set to put it on a different

@@ -432,3 +432,12 @@ terminal of the current machine were lies of navigation — that page is a
   ahead of `dev`/`build`); the source of truth is `apps/`. Browser test
   "the page ships an app…" covers the three cases plus a guest leg that
   runs the game in its tty window.
+- **About popover: a "Source" row** (2026-09-07, `vendor/ui/src/CopilotApp.tsx`,
+  `components/shell/nav-rail.tsx`, `lib/i18n.ts` — `source` in both
+  languages). `meta.sourceUrl` renders under the "Built" row as a link whose
+  text is the URL without its scheme; absent, nothing shows, so upstream's
+  popover is unchanged. The page fills it from version.sh's `REPO_URL`
+  (`app/app-meta.ts`, shared by the chat page and the terminal's assistant
+  panel), and points the existing `updateUrl` slot — "Check for updates" —
+  at that repository's releases page, where every tagged build's site
+  tarball and VM images are.

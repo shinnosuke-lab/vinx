@@ -30,6 +30,7 @@ import './terminal-assistant.css';
 
 import { mount } from '../runtime/src/index';
 import { runJs } from './hostcall';
+import { APP_META } from './app-meta';
 import { sharedVm } from './vm';
 import { shareLocalFile, requestSnapshot } from './share-store';
 import { installBundledSkill } from './bundled-skill';
@@ -87,7 +88,7 @@ function ensureEngine(): Promise<void> {
 			// share_local landed a file: mirror-and-announce now, not in 15 s.
 			onShared: requestSnapshot,
 			onTurnStarted: () => leaving?.started(),
-			meta: { brand: 'Vinx Agent', version: __APP_VERSION__ },
+			meta: APP_META,
 			skillsRepo: __SKILLS_REPO__,
 			defaults: __DEFAULTS__,
 		});
