@@ -4,7 +4,7 @@
 # defaults. web/vite.config.ts reads this file as text (it is not executed
 # there), and CI echoes the summary below into its logs.
 NAME=vinx
-VER=0.2.0
+VER=0.2.1
 NAME_VER=$NAME.$VER
 
 # A skills repository: an index.json and the packages it names, served as
@@ -32,10 +32,14 @@ APPS_REPO=${APPS_REPO:-}
 #
 # The bundle is served as plain static files, so anyone who can open the page
 # can read anything baked in here. DEFAULT_API_KEY must therefore stay empty
-# in anything published: the page then opens its settings panel and asks,
-# which is the upstream behaviour.
-DEFAULT_BASE_URL=
-DEFAULT_MODEL=
+# in anything published. The published page instead points at the hosted
+# proxy in deploy/cloudflare-llm-proxy/: the DeepSeek key lives in that
+# Worker's secret, the proxy ignores whatever the page sends as a key, and a
+# base_url plus model is all the runtime needs to count as configured — so a
+# first-time visitor lands in a working chat with no settings to fill in.
+# Empty both to get the upstream behaviour back (the panel opens and asks).
+DEFAULT_BASE_URL=https://vinx-llm-proxy.shinnosuke-lab.workers.dev
+DEFAULT_MODEL=deepseek-v4-flash
 DEFAULT_API_KEY=
 
 # Where this code lives. The page's About popover shows it as the "Source"
@@ -53,6 +57,8 @@ echo " MODEL:       ${DEFAULT_MODEL:-(none)} at ${DEFAULT_BASE_URL:-(none)}"
 # Counted, not printed: this summary is echoed into every CI log.
 if [ -n "$DEFAULT_API_KEY" ]; then
 	echo " API KEY:     set, ${#DEFAULT_API_KEY} chars (not printed)"
+elif [ -n "$DEFAULT_BASE_URL" ]; then
+	echo " API KEY:     (none: the endpoint above holds its own)"
 else
 	echo " API KEY:     (none: the page will ask for one)"
 fi

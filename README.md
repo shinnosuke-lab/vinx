@@ -5,8 +5,11 @@
 
 **Live: <https://shinnosuke-lab.github.io/vinx/>** — the latest tagged
 release, served by GitHub Pages; the console is at
-[`/terminal/`](https://shinnosuke-lab.github.io/vinx/terminal/). The page asks
-for a model endpoint and key on first load and keeps them in the browser.
+[`/terminal/`](https://shinnosuke-lab.github.io/vinx/terminal/). It comes
+with a model: a small hosted proxy in front of DeepSeek
+([`deploy/cloudflare-llm-proxy/`](deploy/cloudflare-llm-proxy/)), rate-limited
+and funded modestly, so the first chat needs no setup. Settings takes any
+OpenAI-compatible endpoint and key instead, kept in the browser.
 
 An LLM agent and a Linux machine, both running entirely in a browser tab.
 
@@ -16,7 +19,12 @@ and a busybox userland — emulated by [v86](https://github.com/copy/v86). There
 is no server: open the page from any static host (or `file://`) and you get a
 chat agent that can run shell commands, plus a `/terminal` console into the
 same machine. The model provider is called straight from the browser; nothing
-you type leaves for a backend of ours, because there is no backend of ours.
+you type leaves for a backend of ours, because there is no backend of ours —
+with one deliberate exception: the published demo's default endpoint is a
+key-holding proxy we run ([`deploy/`](deploy/cloudflare-llm-proxy/)), which
+forwards your messages to DeepSeek and stores nothing itself (DeepSeek's own
+data terms then apply, as they would with your own key). Point Settings at
+your own provider and it is out of the picture.
 
 ```mermaid
 flowchart LR
