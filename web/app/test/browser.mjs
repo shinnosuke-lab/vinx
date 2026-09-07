@@ -1520,10 +1520,58 @@ test('a second machine splits in: isolated files, one LAN', async (page) => {
 	// Still on the terminal shell from the previous test; machine 1 is up.
 	const one = await paneFrame(page);
 	await vmReady(one);
+
+	// Machine 1 talks over the hub the whole time machine 2 boots: 200
+	// broadcast frames a second from a raw socket, so nothing rate-limits
+	// them. A frame that reached a virtio-net whose driver was not up yet
+	// used to go through a garbage descriptor chain — the RX queue's
+	// addresses are still zero, so the device read its ring out of the
+	// guest's low memory — and corrupt the guest, whose driver then marked
+	// the queue broken ("input.0:id 0 is not a head!") and never received
+	// again. VinxVm drops frames until the driver says DRIVER_OK; the flood
+	// keeps machine 2's boot under fire so a regression fails the ping
+	// below instead of passing by luck. (udhcpc's own DISCOVER broadcasts,
+	// one every few seconds, were enough to hit this on the CI runner.)
+	const floodSource = [
+		'#include <sys/socket.h>',
+		'#include <netinet/in.h>',
+		'#include <net/if.h>',
+		'#include <string.h>',
+		'#include <stdlib.h>',
+		'#include <unistd.h>',
+		'struct sll { unsigned short f, p; int i; unsigned short h; unsigned char pk, hl, addr[8]; };',
+		'int main(int c, char **v) {',
+		'  int s = socket(17, 3, htons(3)); struct sll a; memset(&a, 0, sizeof a);',
+		'  a.f = 17; a.i = if_nametoindex("eth0"); a.hl = 6; memset(a.addr, 255, 6);',
+		'  unsigned char f[342]; memset(f, 255, 6); memset(f + 6, 2, 6); f[12] = 8; f[13] = 6;',
+		'  for (int i = 0; i < 24000; i++) { sendto(s, f, sizeof f, 0, (void *)&a, sizeof a); usleep(atoi(v[1])); }',
+		'}',
+	];
+	await frameType(page, one, "cat > /tmp/flood.c <<'EOF'");
+	for (const line of floodSource) {
+		await page.keyboard.type(line);
+		await page.keyboard.press('Enter');
+	}
+	await page.keyboard.type('EOF');
+	await page.keyboard.press('Enter');
+	await frameType(page, one, "tcc -o /tmp/flood /tmp/flood.c && echo FLOODC-D''ONE");
+	await frameUntil(one, (t) => t.includes('FLOODC-DONE'), 'the flood tool build', 60_000);
+	// 24000 frames at 5 ms is two minutes: bounded by the loop as well as by
+	// the kill below, so a failure in between cannot leave machine 1
+	// flooding the hub for the rest of the run.
+	await frameType(
+		page,
+		one,
+		"/tmp/flood 5000 >/dev/null 2>&1 & echo $! > /tmp/flood.pid; clear; echo FLOOD-D''ONE",
+	);
+	await frameUntil(one, (t) => t.includes('FLOOD-DONE'), 'the flood start');
+
 	await page.click('.actions button[title*="Split right"]');
 	try {
 		const two = await paneFrame(page, '2');
 		await vmReady(two);
+		await frameType(page, one, "kill $(cat /tmp/flood.pid); clear; echo QUIET-D''ONE");
+		await frameUntil(one, (t) => t.includes('QUIET-DONE'), 'the flood stop');
 
 		// Separate machines: a file in one does not exist in the other.
 		await frameType(page, one, "touch /tmp/only-in-1; echo T1-D''ONE");
@@ -1547,15 +1595,22 @@ test('a second machine splits in: isolated files, one LAN', async (page) => {
 			`i=0; while [ $i -lt 10 ] && ! ping -c 1 -W 3 10.0.2.${host} >/tmp/ping.out 2>&1; do i=$((i+1)); done; tail -2 /tmp/ping.out; echo "tries=$i"; echo PING-D''ONE`,
 		);
 		const pinged = await frameUntil(one, (t) => t.includes('PING-DONE'), 'the ping');
-		assert.match(
-			pinged,
-			/1 packets received/,
-			`the two machines did not reach each other; machine 1's screen:\n${pinged}`,
-		);
+		if (!/1 packets received/.test(pinged)) {
+			// A broken RX queue is what the kernel reports here; any other
+			// fault on the LAN path shows up as its absence.
+			await frameType(page, two, "dmesg | grep -i 'virtio\\|not a head' | tail -5; echo DMESG-D''ONE");
+			const dmesg = await frameUntil(two, (t) => t.includes('DMESG-DONE'), 'the dmesg');
+			assert.fail(
+				`the two machines did not reach each other; machine 1's screen:\n${pinged}\nmachine 2's virtio dmesg:\n${dmesg}`,
+			);
+		}
 	} finally {
-		// Close machine 2 so later reloads of this page boot one VM, not two —
-		// also when an assertion above failed, or every later test that
+		// Stop the flood if the failure came before the kill above, and
+		// close machine 2 so later reloads of this page boot one VM, not
+		// two — also when an assertion failed, or every later test that
 		// expects a single pane would fail after it.
+		await frameType(page, one, "kill $(cat /tmp/flood.pid) 2>/dev/null; clear; echo CLEAN-D''ONE");
+		await frameUntil(one, (t) => t.includes('CLEAN-DONE'), 'the cleanup');
 		const frame2 = page.locator('.shell-frame', { has: page.locator('iframe[name="pane-2"]') });
 		if (await frame2.count()) {
 			await frame2.locator('.frame-close').click();

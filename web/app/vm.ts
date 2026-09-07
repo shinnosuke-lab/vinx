@@ -676,6 +676,60 @@ export class VinxVm implements ShellDevice {
 		}
 	}
 
+	/**
+	 * Drop hub frames until the guest's NIC driver is up.
+	 *
+	 * v86's virtio-net hands every incoming frame to the RX virtqueue
+	 * without checking that the guest has configured it. Before the driver
+	 * probes (the first seconds of boot, and again for a moment while the
+	 * probe resets the device) the queue's addresses are all zero, so the
+	 * device reads its ring indexes out of the guest's low memory, pops a
+	 * garbage descriptor chain and writes the frame — and its used-ring
+	 * bookkeeping — wherever that chain points. An out-of-range write
+	 * surfaces as a "RangeError: offset is out of bounds" page error; an
+	 * in-range one corrupts the guest, whose driver later finds a used entry
+	 * that is no chain head ("virtio_net virtio1: input.0:id 0 is not a
+	 * head!") and marks its RX queue broken for good. So a machine that
+	 * boots while another machine on the same hub is talking — udhcpc alone
+	 * broadcasts every few seconds — comes up with a dead NIC. Real hardware
+	 * has no reader before the driver either: frames are dropped here until
+	 * the queue is configured and enabled and the driver has said DRIVER_OK.
+	 * Wrapped on the device bus so every backend (hub, bridge, relay) is
+	 * covered; a v86 build that renames these internals just leaves the
+	 * frames ungated, as before.
+	 */
+	private gateFramesOnDriver(): void {
+		type Queue = { enabled?: boolean; is_configured?: () => unknown };
+		type Listener = { fn: (data: unknown) => void; this_value: unknown };
+		type Nic = {
+			id?: number;
+			bus?: { listeners?: Record<string, Listener[]> };
+			virtio?: { device_status?: number; queues?: Queue[] };
+		};
+		const nic = (
+			this.emulator as unknown as {
+				v86?: { cpu?: { devices?: { virtio_net?: Nic } } };
+			} | null
+		)?.v86?.cpu?.devices?.virtio_net;
+		const entries = nic?.bus?.listeners?.[`net${nic.id ?? 0}-receive`];
+		if (!nic || !entries?.length) return;
+		const DRIVER_OK = 4;
+		const driverUp = () => {
+			const rx = nic.virtio?.queues?.[0];
+			return (
+				((nic.virtio?.device_status ?? 0) & DRIVER_OK) !== 0 &&
+				rx?.enabled === true &&
+				!!rx.is_configured?.()
+			);
+		};
+		for (const entry of entries) {
+			const deliver = entry.fn;
+			entry.fn = (data: unknown) => {
+				if (driverUp()) deliver.call(entry.this_value, data);
+			};
+		}
+	}
+
 	/** Build the emulator and wire every listener. */
 	private construct(V86: (typeof import('v86'))['V86'], v86WasmUrl: string): void {
 		const base = this.options.assetsBase;
@@ -752,6 +806,7 @@ export class VinxVm implements ShellDevice {
 			autostart: true,
 		});
 		this.emulator = emulator;
+		emulator.add_listener('emulator-loaded', () => this.gateFramesOnDriver());
 
 		emulator.add_listener('download-progress', (p) => {
 			// One monotonic number out of v86's two progress emitters (see
